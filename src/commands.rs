@@ -214,21 +214,23 @@ pub fn secret_get(
         });
     };
 
-    // The one place outside the TUI that reads a value out.
     let (secret, read) = vault::value(context.client, held, name, version)?;
+    // The one place outside the TUI that reads a value out, and the third
+    // and last call to `Secret::expose` in the crate.
+    let value = secret.expose();
     if json {
         let document = json!({
             "vault": held.name,
             "name": name,
             "version": read,
             "content_type": row.content_type,
-            "value": secret.expose(),
+            "value": value,
         });
         writeln!(out, "{document}").map_err(anyhow::Error::from)?;
     } else {
         // No newline of its own: a value that ends in one keeps it, and one
         // that does not is not given one.
-        out.write_all(secret.expose().as_bytes())
+        out.write_all(value.as_bytes())
             .map_err(anyhow::Error::from)?;
     }
     Ok(())
