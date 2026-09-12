@@ -1,0 +1,589 @@
+//! The pieces of the frame that are not a table: the tab bar, the search
+//! row, the status bar, the scrollbar, and the help modal.
+
+use ratatui::Frame;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+use super::theme::theme;
+use crate::app::keys;
+use crate::app::screen::{TabId, Target};
+use crate::app::shell::{Level, Shell};
+use crate::store::Store;
+use crate::text_input::{TextInput, field_window};
+use crate::timestamp::Timestamp;
+
+/// The frames of the spinner that turns while a refresh runs.
+const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
+/// What the search row says before anything is typed.
+const PLACEHOLDER: &str = "Type / to search, or vault:kv-prod enabled:no expires:<30d";
+
+/// Which spinner frame this instant shows. Driven by the clock rather than by
+/// a counter, so a slow frame does not make the spinner stutter.
+#[must_use]
+pub fn spinner_frame(millis: u128) -> char {
+    SPINNER[(millis / 120) as usize % SPINNER.len()]
+}
+
+/// The tab bar: the numbers, the names, and a badge where a screen has
+/// something to say. Names shorten before any of them is dropped.
+pub fn render_tab_bar(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    active: TabId,
+    badges: &[(TabId, Option<String>)],
+) {
+    let palette = theme();
+    let short = area.width < 44;
+    let mut spans = Vec::new();
+    let mut column = area.x;
+    for tab in TabId::ALL {
+        let badge = badges
+            .iter()
+            .find(|(held, _)| *held == tab)
+            .and_then(|(_, badge)| badge.clone());
+        let name = if short {
+            tab.short_label()
+        } else {
+            tab.label()
+        };
+        let label = format!(" {} {name}", tab.number());
+        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let style = if tab == active {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        spans.push(Span::styled(label, style));
+        let mut hit_width = width;
+        if let Some(badge) = badge {
+            let badge = format!(" {badge}");
+            hit_width += u16::try_from(badge.chars().count()).unwrap_or(0);
+            spans.push(Span::styled(badge, Style::default().fg(palette.warning)));
+        }
+        if column < area.right() {
+            shell.region(
+                Rect::new(column, area.y, hit_width.min(area.right() - column), 1),
+                Target::Tab(tab),
+            );
+        }
+        column += hit_width;
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // The `?` sits at the right end of the same row.
+    if area.width > 2 {
+        let help = Rect::new(area.right() - 2, area.y, 1, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled("?", Style::default().fg(palette.muted))),
+            help,
+        );
+        shell.region(help, Target::Help);
+    }
+}
+
+/// The one-line search field: the `/` glyph, the text, and a `×` to clear it.
+pub fn render_search_row(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    input: &TextInput,
+    focused: bool,
+) {
+    let palette = theme();
+    // `/ ` on the left, ` × ` on the right when there is anything to clear.
+    let clearable = !input.is_empty();
+    let right = if clearable { 3 } else { 0 };
+    let [glyph, field, clear] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(right),
+        ])
+        .areas(area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "/ ",
+            Style::default().fg(if focused {
+                palette.accent
+            } else {
+                palette.muted
+            }),
+        )),
+        glyph,
+    );
+
+    if input.is_empty() && !focused {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                PLACEHOLDER,
+                Style::default().fg(palette.muted),
+            )),
+            field,
+        );
+    } else {
+        let (first, caret) = field_window(input.text(), input.cursor(), field.width);
+        let shown: String = input.text().chars().skip(first).collect();
+        frame.render_widget(
+            Paragraph::new(Span::styled(shown, Style::default().fg(palette.text))),
+            field,
+        );
+        if focused {
+            frame.set_cursor_position((field.x + caret, field.y));
+        }
+    }
+    shell.region(field, Target::SearchField);
+
+    if clearable {
+        frame.render_widget(
+            Paragraph::new(Span::styled(" × ", Style::default().fg(palette.muted))),
+            clear,
+        );
+        shell.region(clear, Target::ClearSearch);
+    }
+}
+
+/// The bottom row: what just happened, or what the keys do, and on the right
+/// what the store holds.
+pub fn render_status_bar(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    hint: &str,
+    store: &Store,
+    millis: u128,
+) {
+    let palette = theme();
+    let (left, style) = match shell.notification() {
+        Some((said, Level::Error)) => (said.to_owned(), Style::default().fg(palette.error)),
+        Some((said, Level::Info)) => (said.to_owned(), Style::default().fg(palette.success)),
+        None => (hint.to_owned(), Style::default().fg(palette.muted)),
+    };
+    let (right, right_style) = store_state(store, millis);
+    let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
+
+    // The right-hand end is the one that cannot be guessed from the keys, so
+    // it keeps its room and the hint is cut to what is left. Two spaces of
+    // gap, so the two never read as one sentence.
+    let (left, right) = if right_width + 3 >= area.width {
+        // No room for both: what is happening beats what the keys do.
+        (String::new(), right)
+    } else {
+        let room = usize::from(area.width - right_width - 3);
+        (truncate(&left, room), right)
+    };
+
+    frame.render_widget(Paragraph::new(Span::styled(left, style)), area);
+    if right_width < area.width {
+        frame.render_widget(
+            Paragraph::new(Span::styled(right, right_style)).alignment(Alignment::Right),
+            Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
+        );
+    }
+}
+
+/// `text` in at most `room` cells, with an ellipsis where something was cut.
+fn truncate(text: &str, room: usize) -> String {
+    if text.chars().count() <= room {
+        return text.to_owned();
+    }
+    if room <= 1 {
+        return String::new();
+    }
+    text.chars().take(room - 1).chain(['…']).collect()
+}
+
+/// The right-hand end of the status bar: what is happening, or what is
+/// wrong, or what was read and when.
+fn store_state(store: &Store, millis: u128) -> (String, Style) {
+    let palette = theme();
+    if store.refreshing {
+        let said = store.progress.clone().unwrap_or_else(|| "reading…".into());
+        return (
+            format!("{} {said}", spinner_frame(millis)),
+            Style::default().fg(palette.info),
+        );
+    }
+    if let Some((who, message)) = store.first_problem() {
+        let said = if who.is_empty() {
+            message.clone()
+        } else {
+            format!("{who}: {message}")
+        };
+        return (format!("! {said}"), Style::default().fg(palette.error));
+    }
+    let age = store.read_at.map_or_else(
+        || "never read".to_owned(),
+        |read_at| match read_at.relative_age(Timestamp::now()).as_str() {
+            "now" => "just now".to_owned(),
+            age => format!("{age} ago"),
+        },
+    );
+    (
+        format!(
+            "● {} vaults · {} secrets · {age}",
+            store.inventory.vaults.len(),
+            store.secrets.len()
+        ),
+        Style::default().fg(palette.muted),
+    )
+}
+
+/// A centred box for a modal, with the screen behind it washed out where the
+/// palette says to.
+pub fn render_modal_frame(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    width: u16,
+    height: u16,
+) -> Rect {
+    let palette = theme();
+    if palette.dim_behind_modals {
+        dim_behind(frame, area);
+    }
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    let modal = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_focused))
+        .title(Line::from(format!(" {title} ")).style(Style::default().fg(palette.accent)));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    inner
+}
+
+/// Washes out what is behind a modal, so the modal is obviously the thing
+/// taking keys.
+pub fn dim_behind(frame: &mut Frame, area: Rect) {
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buffer[(x, y)].set_style(Style::default().add_modifier(Modifier::DIM));
+        }
+    }
+}
+
+/// The help: every key this tab has, then whatever is wrong.
+pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, tab: TabId, store: &Store) {
+    let palette = theme();
+    let mut lines: Vec<Line> = keys::for_tab(tab)
+        .map(|key| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{:<12}", key.keys),
+                    Style::default().fg(palette.accent),
+                ),
+                Span::styled(key.does, Style::default().fg(palette.body)),
+            ])
+        })
+        .collect();
+    if !store.problems.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Problems",
+            Style::default()
+                .fg(palette.header)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (who, message) in &store.problems {
+            let said = if who.is_empty() {
+                message.clone()
+            } else {
+                format!("{who}: {message}")
+            };
+            lines.push(Line::from(Span::styled(
+                said,
+                Style::default().fg(palette.error),
+            )));
+        }
+    }
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let inner = render_modal_frame(frame, area, "Keys", 74, height);
+    shell.region(area, Target::Help);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A one-character scrollbar down the right edge of a pane, drawn only when
+/// there is more content than viewport.
+pub fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    offset: usize,
+    viewport: usize,
+    content: usize,
+) {
+    if content <= viewport || area.height == 0 || area.width == 0 {
+        return;
+    }
+    let palette = theme();
+    let track = area.height as usize;
+    let thumb = ((track * viewport) / content).clamp(1, track);
+    let travel = track.saturating_sub(thumb);
+    let furthest = content - viewport;
+    let at = if travel == 0 || furthest == 0 {
+        0
+    } else {
+        (offset * travel + furthest / 2) / furthest
+    };
+    let buffer = frame.buffer_mut();
+    for row in 0..track {
+        let inside = row >= at && row < at + thumb;
+        buffer[(area.x, area.y + u16::try_from(row).unwrap_or(0))]
+            .set_symbol(if inside { "█" } else { "│" })
+            .set_style(Style::default().fg(palette.scrollbar));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::azure::Inventory;
+    use crate::worker::Event;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn screen(width: u16, height: u16, draw: impl FnOnce(&mut Frame, &mut Shell)) -> String {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                draw(frame, &mut shell);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_tab_bar_names_both_tabs_and_paints_a_badge() {
+        let drawn = screen(80, 1, |frame, shell| {
+            render_tab_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 80, 1),
+                TabId::Secrets,
+                &[(TabId::Secrets, Some("⚠ 3".into()))],
+            );
+        });
+        assert!(drawn.contains("1 Secrets"), "{drawn}");
+        assert!(drawn.contains("⚠ 3"), "{drawn}");
+        assert!(drawn.contains("2 Registries"), "{drawn}");
+        assert!(drawn.trim_end().ends_with('?'), "{drawn}");
+    }
+
+    #[test]
+    fn a_narrow_tab_bar_shortens_the_names_rather_than_dropping_one() {
+        let drawn = screen(40, 1, |frame, shell| {
+            render_tab_bar(frame, shell, Rect::new(0, 0, 40, 1), TabId::Secrets, &[]);
+        });
+        assert!(drawn.contains("1 Sec"), "{drawn}");
+        assert!(drawn.contains("2 Reg"), "{drawn}");
+    }
+
+    #[test]
+    fn a_click_on_a_tab_lands_on_that_tab() {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_tab_bar(
+                    frame,
+                    &mut shell,
+                    Rect::new(0, 0, 80, 1),
+                    TabId::Secrets,
+                    &[],
+                );
+            })
+            .unwrap();
+        assert_eq!(shell.hit(3, 0), Some(&Target::Tab(TabId::Secrets)));
+        assert_eq!(shell.hit(12, 0), Some(&Target::Tab(TabId::Registries)));
+        assert_eq!(shell.hit(78, 0), Some(&Target::Help));
+    }
+
+    #[test]
+    fn the_search_row_shows_the_placeholder_until_something_is_typed() {
+        let drawn = screen(80, 1, |frame, shell| {
+            render_search_row(
+                frame,
+                shell,
+                Rect::new(0, 0, 80, 1),
+                &TextInput::default(),
+                false,
+            );
+        });
+        assert!(drawn.starts_with("/ Type / to search"), "{drawn}");
+        assert!(!drawn.contains('×'), "nothing to clear yet: {drawn}");
+
+        let drawn = screen(80, 1, |frame, shell| {
+            render_search_row(
+                frame,
+                shell,
+                Rect::new(0, 0, 80, 1),
+                &TextInput::new("db-pass"),
+                true,
+            );
+        });
+        assert!(drawn.contains("db-pass"), "{drawn}");
+        assert!(drawn.contains('×'), "{drawn}");
+    }
+
+    #[test]
+    fn the_status_bar_says_the_hint_then_the_notification_then_the_error() {
+        let store = Store::default();
+        let drawn = screen(100, 1, |frame, shell| {
+            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "↑↓ move", &store, 0);
+        });
+        assert!(drawn.contains("↑↓ move"), "{drawn}");
+        assert!(drawn.contains("never read"), "{drawn}");
+
+        let mut shell = Shell::default();
+        shell.set_status("Copied value of db-password (kv-prod)");
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_status_bar(
+                    frame,
+                    &mut shell,
+                    Rect::new(0, 0, 100, 1),
+                    "↑↓ move",
+                    &store,
+                    0,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = (0..100).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(drawn.contains("Copied value of db-password"), "{drawn}");
+        assert!(!drawn.contains("↑↓ move"), "the notification wins: {drawn}");
+    }
+
+    #[test]
+    fn the_two_halves_of_the_status_bar_never_run_into_each_other() {
+        let mut store = Store::default();
+        store.apply(Event::Inventory(Err(
+            "not signed in — run `az login`".into()
+        )));
+        for width in [40, 60, 80, 100, 120] {
+            let drawn = screen(width, 1, |frame, shell| {
+                render_status_bar(
+                    frame,
+                    shell,
+                    Rect::new(0, 0, width, 1),
+                    "↑↓/jk move  / search  s sort  y copy value  v reveal  r refresh  ? help",
+                    &store,
+                    0,
+                );
+            });
+            assert!(
+                drawn.contains("not signed in"),
+                "what is wrong survives every width: {width} {drawn}"
+            );
+            assert!(
+                !drawn.contains("sor!") && !drawn.contains("movе!"),
+                "the hint is cut rather than written over: {width} {drawn}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hint_is_cut_with_an_ellipsis_rather_than_in_the_middle_of_nothing() {
+        assert_eq!(truncate("↑↓/jk move", 20), "↑↓/jk move");
+        assert_eq!(truncate("↑↓/jk move", 6), "↑↓/jk…");
+        assert_eq!(truncate("↑↓/jk move", 1), "");
+        assert_eq!(truncate("", 0), "");
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_spinner_while_reading_and_the_problem_after() {
+        let mut store = Store::default();
+        store.apply(Event::Inventory(Ok(Inventory::default())));
+        store.apply(Event::Progress("reading kv-prod (2/3)…".into()));
+        let drawn = screen(100, 1, |frame, shell| {
+            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "", &store, 0);
+        });
+        assert!(drawn.contains("reading kv-prod (2/3)"), "{drawn}");
+        assert!(drawn.contains(SPINNER[0]), "{drawn}");
+
+        store.apply(Event::Secrets {
+            vault: "kv-prod".into(),
+            result: Err("no permission to read secrets".into()),
+        });
+        store.apply(Event::Idle);
+        let drawn = screen(100, 1, |frame, shell| {
+            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "", &store, 0);
+        });
+        assert!(drawn.contains("! kv-prod: no permission"), "{drawn}");
+    }
+
+    #[test]
+    fn the_help_lists_this_tabs_keys_and_the_problems_under_them() {
+        let mut store = Store::default();
+        store.apply(Event::Inventory(Ok(Inventory::default())));
+        store.apply(Event::Secrets {
+            vault: "kv-prod".into(),
+            result: Err("blocked by the vault firewall".into()),
+        });
+        let drawn = screen(100, 30, |frame, shell| {
+            render_help(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 30),
+                TabId::Secrets,
+                &store,
+            );
+        });
+        assert!(drawn.contains("Keys"), "{drawn}");
+        assert!(drawn.contains("copy the value"), "{drawn}");
+        assert!(!drawn.contains("repository's tags"), "{drawn}");
+        assert!(drawn.contains("Problems"), "{drawn}");
+        assert!(drawn.contains("blocked by the vault firewall"), "{drawn}");
+    }
+
+    #[test]
+    fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
+        let drawn = screen(3, 10, |frame, _| {
+            render_scrollbar(frame, Rect::new(2, 0, 1, 10), 0, 10, 10);
+        });
+        assert!(!drawn.contains('█') && !drawn.contains('│'), "{drawn}");
+
+        let drawn = screen(3, 10, |frame, _| {
+            render_scrollbar(frame, Rect::new(2, 0, 1, 10), 0, 10, 40);
+        });
+        assert!(drawn.contains('█'), "{drawn}");
+        assert_eq!(drawn.lines().next().unwrap().trim_start(), "█", "{drawn}");
+        assert_eq!(drawn.lines().last().unwrap().trim_start(), "│", "{drawn}");
+    }
+
+    #[test]
+    fn the_spinner_turns_with_the_clock() {
+        assert_eq!(spinner_frame(0), SPINNER[0]);
+        assert_eq!(spinner_frame(120), SPINNER[1]);
+        assert_eq!(spinner_frame(480), SPINNER[0], "and comes round again");
+    }
+}

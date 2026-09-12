@@ -8,16 +8,18 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers,
+    Event,
 };
 use crossterm::execute;
 
+use crate::app::App;
+use crate::app::screen::AppAction;
 use crate::azure::auth::AzCli;
 use crate::azure::transport::{Client, Https};
 use crate::cli::{Cli, Command};
 use crate::store::Store;
 use crate::worker::{Request, Worker};
-use crate::{cache, config, doctor, paths, ui};
+use crate::{cache, clipboard, config, desktop, doctor, paths, ui};
 
 /// How often the spinner turns while a refresh is running.
 const SPINNING: Duration = Duration::from_millis(100);
@@ -52,7 +54,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     // The cache is read before the terminal is taken, so the first frame is
     // painted from it rather than after it.
     let cache_path = paths::cache_file(cli.cache.as_deref());
-    let mut store = match (cli.no_cache, cache::load(&cache_path)) {
+    let store = match (cli.no_cache, cache::load(&cache_path)) {
         (false, Some(snapshot)) => Store::from_cache(snapshot),
         _ => Store::default(),
     };
@@ -64,6 +66,9 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     let every = Duration::from_secs(config.azure.refresh.unwrap_or(DEFAULT_REFRESH));
     let mut next_refresh = (!every.is_zero()).then(|| Instant::now() + every);
 
+    let mut app = App::new(store);
+    let started = Instant::now();
+
     let mut terminal = ratatui::init();
     // From here on the terminal is ours, so every way out of this function —
     // an error, a panic, `q` — goes through the guard's `Drop`.
@@ -72,40 +77,49 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
 
     loop {
         terminal
-            .draw(|frame| ui::render(frame, &store))
+            .draw(|frame| app.render(frame, started.elapsed().as_millis()))
             .context("failed to draw")?;
 
-        if event::poll(if store.refreshing { SPINNING } else { RESTING })? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let quit = matches!(key.code, KeyCode::Char('q'))
-                        || (key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('c')));
-                    if quit {
-                        return Ok(());
-                    }
-                    if matches!(key.code, KeyCode::Char('r')) {
-                        worker.send(Request::Refresh);
+        if event::poll(if app.store.refreshing {
+            SPINNING
+        } else {
+            RESTING
+        })? {
+            let action = match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => AppAction::None,
+            };
+            match action {
+                AppAction::Quit => return Ok(()),
+                AppAction::Send(request) => worker.send(request),
+                AppAction::Copy { text, label } => match clipboard::copy(&text) {
+                    // `text` is never in a message: the label says what was
+                    // copied, and nothing says what it was.
+                    Ok(()) => app.shell.set_status(label),
+                    Err(error) => app.shell.set_error(format!("{error:#}")),
+                },
+                AppAction::OpenUrl(url) => {
+                    if let Err(error) = desktop::open_in_browser(&url) {
+                        app.shell.set_error(format!("{error:#}"));
                     }
                 }
-                _ => {}
+                AppAction::None => {}
             }
         }
 
         // Everything the worker has said since the last frame.
         while let Some(event) = worker.try_recv() {
             let idle = matches!(event, crate::worker::Event::Idle);
-            store.apply(event);
+            app.apply(event);
             if idle
                 && !cli.no_cache
-                && let Err(error) = cache::save(&cache_path, &store.snapshot())
+                && let Err(error) = cache::save(&cache_path, &app.store.snapshot())
             {
                 // A cache that will not save is a slower next start, not a
                 // reason to stop.
-                store.problems.push((
-                    String::new(),
-                    format!("could not save the cache: {error:#}"),
-                ));
+                app.shell
+                    .set_error(format!("could not save the cache: {error:#}"));
             }
         }
 

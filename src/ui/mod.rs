@@ -1,7 +1,12 @@
 //! Every frame: the guard for a terminal too small to say anything in, and
 //! the panes on top of it.
 
+pub mod details;
+pub mod registries;
+pub mod secrets;
+pub mod table;
 pub mod theme;
+pub mod widgets;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
