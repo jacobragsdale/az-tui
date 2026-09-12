@@ -17,8 +17,16 @@ use crate::timestamp::Timestamp;
 
 /// The frames of the spinner that turns while a refresh runs.
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
-/// What the search row says before anything is typed.
-const PLACEHOLDER: &str = "Type / to search, or vault:kv-prod enabled:no expires:<30d";
+/// What each tab's search row says before anything is typed. The grammar
+/// differs per tab, and a placeholder naming the other tab's keys is a
+/// worked example of something that will not match.
+#[must_use]
+pub const fn placeholder(tab: TabId) -> &'static str {
+    match tab {
+        TabId::Secrets => "Type / to search, or vault:kv-prod enabled:no expires:<30d",
+        TabId::Registries => "Type / to search, or registry:acrprod updated:<30d",
+    }
+}
 
 /// Which spinner frame this instant shows. Driven by the clock rather than by
 /// a counter, so a slow frame does not make the spinner stutter.
@@ -94,6 +102,7 @@ pub fn render_search_row(
     area: Rect,
     input: &TextInput,
     focused: bool,
+    tab: TabId,
 ) {
     let palette = theme();
     // `/ ` on the left, ` × ` on the right when there is anything to clear.
@@ -123,7 +132,7 @@ pub fn render_search_row(
     if input.is_empty() && !focused {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                PLACEHOLDER,
+                placeholder(tab),
                 Style::default().fg(palette.muted),
             )),
             field,
@@ -434,6 +443,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::default(),
                 false,
+                TabId::Secrets,
             );
         });
         assert!(drawn.starts_with("/ Type / to search"), "{drawn}");
@@ -446,10 +456,26 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::new("db-pass"),
                 true,
+                TabId::Secrets,
             );
         });
         assert!(drawn.contains("db-pass"), "{drawn}");
         assert!(drawn.contains('×'), "{drawn}");
+
+        // Each tab names its own grammar; the other tab's keys are a worked
+        // example of something that will not match.
+        let drawn = screen(80, 1, |frame, shell| {
+            render_search_row(
+                frame,
+                shell,
+                Rect::new(0, 0, 80, 1),
+                &TextInput::default(),
+                false,
+                TabId::Registries,
+            );
+        });
+        assert!(drawn.contains("registry:acrprod"), "{drawn}");
+        assert!(!drawn.contains("vault:"), "{drawn}");
     }
 
     #[test]

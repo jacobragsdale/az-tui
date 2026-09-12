@@ -107,7 +107,7 @@ impl TokenSource for AzCli {
             "tsv",
         ])
         .map_err(|error| {
-            anyhow::Error::new(crate::azure::transport::SignedOut(format!(
+            anyhow::Error::new(crate::azure::transport::NoLogin(format!(
                 "could not get a token for {}: {error:#}",
                 audience.label()
             )))

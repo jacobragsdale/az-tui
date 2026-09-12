@@ -76,6 +76,11 @@ fn exchange(client: &Client, login_server: &str) -> Result<String> {
 /// A refusal on the exchange itself is not a spent token: it is a login with
 /// no role on this registry, which no retry fixes.
 fn explain(login_server: &str, error: anyhow::Error) -> anyhow::Error {
+    // No login at all is not a missing role: it goes through untouched, and
+    // the worker reduces it to the two words that fix it.
+    if super::transport::is_no_login(&error) {
+        return error;
+    }
     let refused = super::transport::api_error(&error)
         .is_some_and(|refusal| refusal.status == 401 || refusal.status == 403)
         || super::transport::is_signed_out(&error);
@@ -493,6 +498,34 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("AcrPull"), "{error}");
+    }
+
+    #[test]
+    fn no_login_at_all_is_not_reported_as_a_missing_role() {
+        use crate::azure::auth::{Audience, FixedTokens};
+        use crate::azure::transport::{Client, NoLogin, is_no_login};
+
+        let tokens = FixedTokens::new();
+        tokens
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::Error::new(NoLogin(
+                "could not get a token for registry".to_owned(),
+            ))));
+        let transport = crate::azure::transport::fake::FakeTransport::answering([]);
+        let client = Client::new(Box::new(tokens), Box::new(transport));
+
+        let error = repositories(&client, &registry()).unwrap_err();
+        assert!(
+            is_no_login(&error),
+            "a missing login must reach the worker as one: {error:#}"
+        );
+        assert!(
+            !format!("{error:#}").contains("AcrPull"),
+            "telling someone to ask for a role they cannot use is worse than useless: {error:#}"
+        );
+        let _ = Audience::ContainerRegistry.resource();
     }
 
     #[test]

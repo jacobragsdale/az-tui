@@ -38,6 +38,7 @@ pub fn render(
         search,
         &screen.input,
         shell.focus == Focus::Search,
+        crate::app::screen::TabId::Secrets,
     );
 
     match Shell::panes(area.width) {
@@ -243,6 +244,7 @@ fn detail_lines(
         lines.push(link_field(
             "Id",
             format!("{}secrets/{}", vault.uri, row.name),
+            width,
         ));
     }
 

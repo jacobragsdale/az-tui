@@ -240,7 +240,10 @@ impl App {
                 self.secrets.refilter(&self.store);
                 self.secrets.tick(&self.store, now)
             }
-            TabId::Registries => None,
+            TabId::Registries => {
+                self.registries.refilter(&self.store);
+                self.registries.tick(&self.store, now)
+            }
         }
     }
 
@@ -255,7 +258,7 @@ impl App {
         if self.secrets.is_ticking() {
             return Duration::from_secs(1);
         }
-        if self.secrets.is_resting() {
+        if self.secrets.is_resting() || self.registries.is_resting() {
             return crate::app::secrets::REST;
         }
         settled
@@ -264,12 +267,14 @@ impl App {
     /// `r`: everything a screen was holding that a refresh makes stale.
     fn on_refresh(&mut self) {
         self.secrets.on_refresh();
+        self.registries.on_refresh();
     }
 
     /// Switching tabs drops a revealed value, like every other way of
     /// looking away from it.
     fn on_tab_switch(&mut self) {
         self.secrets.on_refresh();
+        self.registries.on_refresh();
     }
 
     /// What the status bar says on the left when nothing has just happened.

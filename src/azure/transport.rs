@@ -233,10 +233,37 @@ impl fmt::Display for SignedOut {
 
 impl std::error::Error for SignedOut {}
 
-/// True when this error, or anything it is wrapped in, is a refused login.
+/// There is no login at all: `az` would not mint a token.
+///
+/// Told apart from [`SignedOut`] because they mean different things to a
+/// registry. A registry answering `401` means this login has no role on it,
+/// which is worth naming the role for; `az` answering nothing means there is
+/// no login to have a role, which is worth naming `az login` for. Reading
+/// both as the first one told a user to ask for AcrPull when what they
+/// needed was to sign in.
+#[derive(Debug)]
+pub struct NoLogin(pub String);
+
+impl fmt::Display for NoLogin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoLogin {}
+
+#[must_use]
+pub fn is_no_login(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<NoLogin>())
+}
+
+/// True when this error, or anything it is wrapped in, means the run cannot
+/// go on until somebody signs in — either plane's way of saying so.
 #[must_use]
 pub fn is_signed_out(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<SignedOut>())
+    error
+        .chain()
+        .any(|cause| cause.is::<SignedOut>() || cause.is::<NoLogin>())
 }
 
 /// A plane refused, and said why in its own words.

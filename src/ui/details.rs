@@ -30,11 +30,32 @@ pub fn coloured_field(label: &str, value: impl Into<String>, colour: Color) -> L
     ])
 }
 
-/// A field whose value is a URL, and a key hint on the right of the same
-/// line when there is one.
+/// A field whose value is a URL.
+///
+/// Cut to the width rather than wrapped: a portal link is three lines of
+/// percent-encoded resource id, and `o` is what anybody actually does with
+/// it. The pane is for reading, not for copying by eye.
 #[must_use]
-pub fn link_field(label: &str, url: impl Into<String>) -> Line<'static> {
-    coloured_field(label, url, theme().link)
+pub fn link_field(label: &str, url: impl Into<String>, width: u16) -> Line<'static> {
+    let room = usize::from(width).saturating_sub(LABEL);
+    coloured_field(label, elide(&url.into(), room), theme().link)
+}
+
+/// `text` in at most `room` cells, with an ellipsis where the middle was
+/// taken out — a URL's two ends say more than its first half does.
+#[must_use]
+pub fn elide(text: &str, room: usize) -> String {
+    let count = text.chars().count();
+    if count <= room || room < 8 {
+        return text.chars().take(room.max(1)).collect();
+    }
+    let keep = room - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = text.chars().take(head).collect();
+    out.push('…');
+    out.extend(text.chars().skip(count - tail));
+    out
 }
 
 /// The pane's first line: what this row is.
@@ -162,6 +183,21 @@ mod tests {
         assert!(palette.tag_palette.contains(&first.style.fg.unwrap()));
         assert_eq!(first.content.as_ref(), "env=prod");
         assert_eq!(chip("managed", "").content.as_ref(), "managed");
+    }
+
+    #[test]
+    fn a_link_is_cut_in_the_middle_so_both_its_ends_still_read() {
+        let url = "https://portal.azure.com/#@/resource/subscriptions/s/rg/acrdev";
+        let line = text(&link_field("Portal", url, 44));
+        assert_eq!(line.chars().count(), 44);
+        assert!(line.starts_with("Portal        https://portal"), "{line}");
+        assert!(line.ends_with("acrdev"), "{line}");
+        assert!(line.contains('…'), "{line}");
+
+        let short = text(&link_field("Portal", "https://x/y", 44));
+        assert!(!short.contains('…'), "{short}");
+        assert_eq!(elide("abcdefghij", 20), "abcdefghij");
+        assert_eq!(elide("abcdefghij", 5), "abcde", "too narrow to elide");
     }
 
     #[test]
