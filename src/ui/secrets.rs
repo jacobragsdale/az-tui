@@ -3,20 +3,24 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::details::{LABEL, chip, coloured_field, field, link_field, section, title, with_hint};
 use super::table::{Cell, TableSpec, render_list_table, table_geometry};
 use super::theme::theme;
 use super::widgets::{render_scrollbar, render_search_row};
 use crate::app::screen::Target;
 use crate::app::secrets::{Expiry, SecretsScreen};
-use crate::app::shell::{Focus, Shell};
+use crate::app::shell::{Focus, Panes, Shell};
 use crate::azure::SecretRow;
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
 use crate::search::Highlighter;
 use crate::store::Store;
 use crate::timestamp::Timestamp;
 
-/// Draws the tab: one row for the search box, the table under it.
+/// Draws the tab: one row for the search box, then the table and the details
+/// pane, laid out to fit.
 pub fn render(
     frame: &mut Frame,
     shell: &mut Shell,
@@ -24,7 +28,7 @@ pub fn render(
     store: &Store,
     area: Rect,
 ) {
-    let [search, table] = Layout::default()
+    let [search, body] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(3)])
         .areas(area);
@@ -35,7 +39,30 @@ pub fn render(
         &screen.input,
         shell.focus == Focus::Search,
     );
-    render_table(frame, shell, screen, store, table);
+
+    match Shell::panes(area.width) {
+        Panes::SideBySide => {
+            let [table, details] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(body);
+            render_table(frame, shell, screen, store, table);
+            render_details(frame, shell, screen, store, details);
+        }
+        Panes::Stacked => {
+            let [table, details] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(body);
+            render_table(frame, shell, screen, store, table);
+            render_details(frame, shell, screen, store, details);
+        }
+        // Only one pane fits; `Tab` says which.
+        Panes::One if shell.focus == Focus::Details => {
+            render_details(frame, shell, screen, store, body);
+        }
+        Panes::One => render_table(frame, shell, screen, store, body),
+    }
 }
 
 /// The table itself. The screen has already decided which rows are shown and
@@ -100,6 +127,238 @@ pub fn render_table(
         geometry.visible_rows,
         total,
     );
+}
+
+/// Eight dots, always. A mask that was as long as the value would be telling
+/// people how long the value is.
+const MASK: &str = "••••••••";
+
+/// The details pane for the row under the cursor.
+pub fn render_details(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    screen: &mut SecretsScreen,
+    store: &Store,
+    area: Rect,
+) {
+    let palette = theme();
+    let focused = shell.focus == Focus::Details;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(if focused {
+            palette.border_focused
+        } else {
+            palette.border
+        }))
+        .title(Line::from(" Details ").style(Style::default().fg(palette.accent)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    shell.region(area, Target::Details);
+
+    let Some(row) = screen.selected(store).cloned() else {
+        frame.render_widget(
+            Paragraph::new("Nothing selected").style(Style::default().fg(palette.muted)),
+            inner,
+        );
+        return;
+    };
+
+    let now = Timestamp::now();
+    let lines = detail_lines(screen, store, &row, inner.width, now);
+    screen
+        .details_scroll
+        .set_viewport(usize::from(inner.height), lines.len());
+    let offset = u16::try_from(screen.details_scroll.offset).unwrap_or(0);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
+        inner,
+    );
+}
+
+/// Everything the pane says about one secret, top to bottom.
+fn detail_lines(
+    screen: &SecretsScreen,
+    store: &Store,
+    row: &SecretRow,
+    width: u16,
+    now: Timestamp,
+) -> Vec<Line<'static>> {
+    let palette = theme();
+    let versions = store.versions.get(&(row.vault.clone(), row.name.clone()));
+    let mut lines = vec![title(row.name.clone())];
+
+    let mut said = vec![row.vault.clone(), "secret".to_owned()];
+    said.push(if row.enabled { "enabled" } else { "disabled" }.to_owned());
+    if let Some(Ok(versions)) = versions {
+        said.push(format!("{} versions", versions.len()));
+    }
+    let parts: Vec<&str> = said.iter().map(String::as_str).collect();
+    let mut subtitle = super::details::subtitle(&parts);
+    if !row.enabled {
+        // "disabled" is the one word in that line worth a colour.
+        subtitle = Line::from(
+            subtitle
+                .spans
+                .into_iter()
+                .map(|span| span.style(Style::default().fg(palette.error)))
+                .collect::<Vec<_>>(),
+        );
+    }
+    lines.push(subtitle);
+    lines.push(Line::from(""));
+    lines.extend(value_lines(screen, row, width));
+    lines.push(field(
+        "Content type",
+        row.content_type.clone().unwrap_or_else(|| "—".to_owned()),
+    ));
+    lines.push(stamp_line("Expires", row.expires, now, true));
+    lines.push(stamp_line("Not before", row.not_before, now, false));
+    lines.push(stamp_line("Created", row.created, now, false));
+    lines.push(stamp_line("Updated", row.updated, now, false));
+    if !row.tags.is_empty() {
+        let mut spans = vec![Span::styled(
+            format!("{:<LABEL$}", "Tags"),
+            Style::default().fg(palette.muted),
+        )];
+        for (at, (key, value)) in row.tags.iter().enumerate() {
+            if at > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(chip(key, value));
+        }
+        lines.push(Line::from(spans));
+    }
+    if row.managed {
+        lines.push(field("Managed", "yes — a certificate's backing secret"));
+    }
+    if let Some(vault) = store
+        .inventory
+        .vaults
+        .iter()
+        .find(|vault| vault.name == row.vault)
+    {
+        lines.push(link_field(
+            "Id",
+            format!("{}secrets/{}", vault.uri, row.name),
+        ));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(section("Versions", width));
+    match versions {
+        None => lines.push(Line::from(Span::styled(
+            "reading…",
+            Style::default().fg(palette.muted),
+        ))),
+        Some(Err(message)) => lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(palette.error),
+        ))),
+        Some(Ok(versions)) if versions.is_empty() => lines.push(Line::from(Span::styled(
+            "none",
+            Style::default().fg(palette.muted),
+        ))),
+        Some(Ok(versions)) => {
+            let current = screen.revealed_here(row).map(|held| held.version.clone());
+            for version in versions {
+                let short: String = version.version.chars().take(8).collect();
+                let mut said = format!(
+                    "{short}…  {:<5} {}",
+                    version
+                        .created
+                        .map_or_else(|| "—".to_owned(), |at| at.relative_age(now)),
+                    if version.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                if current.as_deref() == Some(version.version.as_str()) {
+                    said.push_str("  current");
+                }
+                lines.push(Line::from(Span::styled(
+                    said,
+                    Style::default().fg(if version.enabled {
+                        palette.body
+                    } else {
+                        palette.muted
+                    }),
+                )));
+            }
+        }
+    }
+    lines
+}
+
+/// The Value line, and whatever has to go under it.
+fn value_lines(screen: &SecretsScreen, row: &SecretRow, width: u16) -> Vec<Line<'static>> {
+    let palette = theme();
+    let mut lines = Vec::new();
+    if let Some(held) = screen.revealed_here(row) {
+        let value = held.expose();
+        // A multi-line value — a PEM, a JSON blob — shows its first line and
+        // says how much more there is; `y` copies all of it.
+        let first = value.lines().next().unwrap_or("");
+        let extra = held.line_count().saturating_sub(1);
+        let shown = if extra > 0 {
+            format!("{first}  (+{extra} lines)")
+        } else {
+            first.to_owned()
+        };
+        lines.push(with_hint(
+            coloured_field("Value", shown, palette.text),
+            &format!("clears in {}s", held.clears_in(std::time::Instant::now())),
+            width,
+        ));
+        return lines;
+    }
+    if let Some(refusal) = screen.refusal() {
+        lines.push(coloured_field("Value", refusal.clone(), palette.error));
+        return lines;
+    }
+    if screen.is_reading(row) {
+        lines.push(coloured_field("Value", "reading…", palette.muted));
+        return lines;
+    }
+    lines.push(with_hint(
+        coloured_field("Value", MASK, palette.muted),
+        "v · y",
+        width,
+    ));
+    lines
+}
+
+/// `Expires   2027-01-01 · in 12d`, coloured when it is worth a colour.
+fn stamp_line(
+    label: &str,
+    stamp: Option<Timestamp>,
+    now: Timestamp,
+    expiry: bool,
+) -> Line<'static> {
+    let palette = theme();
+    let Some(stamp) = stamp else {
+        return coloured_field(label, "—", palette.muted);
+    };
+    let age = stamp.relative_age(now);
+    if !expiry {
+        return field(label, format!("{} · {age}", stamp.calendar_date()));
+    }
+    match Expiry::of(Some(stamp), now) {
+        Expiry::Expired => coloured_field(
+            label,
+            format!("{} · expired {age} ago", stamp.calendar_date()),
+            palette.error,
+        ),
+        Expiry::Soon => coloured_field(
+            label,
+            format!("{} · in {age}", stamp.calendar_date()),
+            palette.warning,
+        ),
+        _ => field(label, format!("{} · in {age}", stamp.calendar_date())),
+    }
 }
 
 /// One row's cells, in the order the visible columns are in.
@@ -323,6 +582,126 @@ mod tests {
             })
             .expect("a header region");
         assert_eq!(header, "vault");
+    }
+
+    #[test]
+    fn the_details_pane_masks_the_value_until_it_is_revealed() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let (drawn, _) = draw(120, 20, &mut screen, &store);
+        assert!(drawn.contains("Details"), "{drawn}");
+        assert!(drawn.contains(MASK), "eight dots, always: {drawn}");
+        assert!(drawn.contains("v · y"), "{drawn}");
+        assert!(drawn.contains("Content type"), "{drawn}");
+        assert!(drawn.contains("── Versions"), "{drawn}");
+
+        // Reveal it, and the dots give way to the value and a countdown.
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        screen.handle_key(
+            &mut shell,
+            &store,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            Ok((
+                crate::azure::Secret::new("s3cr3t-value"),
+                "8f3a2c1d".to_owned(),
+            )),
+            std::time::Instant::now(),
+        );
+        let (drawn, _) = draw(120, 20, &mut screen, &store);
+        assert!(drawn.contains("s3cr3t-value"), "{drawn}");
+        assert!(!drawn.contains(MASK), "{drawn}");
+        assert!(drawn.contains("clears in"), "{drawn}");
+    }
+
+    #[test]
+    fn a_refusal_takes_the_value_lines_place_and_reads_as_an_error() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        screen.handle_key(
+            &mut shell,
+            &store,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            Err("kv-dev: no permission to read secrets".to_owned()),
+            std::time::Instant::now(),
+        );
+        let (drawn, _) = draw(120, 20, &mut screen, &store);
+        assert!(drawn.contains("no permission to read secrets"), "{drawn}");
+        assert!(!drawn.contains(MASK), "{drawn}");
+        assert!(
+            drawn.contains("api-key"),
+            "the table is otherwise intact: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_versions_read_that_failed_says_so_rather_than_reading_for_ever() {
+        let mut store = stocked();
+        store.apply(Event::Versions {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            result: Err("kv-dev: blocked by the vault firewall".into()),
+        });
+        let mut screen = SecretsScreen::default();
+        let (drawn, _) = draw(120, 20, &mut screen, &store);
+        assert!(drawn.contains("blocked by the vault firewall"), "{drawn}");
+        assert!(!drawn.contains("reading…"), "{drawn}");
+    }
+
+    #[test]
+    fn under_seventy_columns_the_details_pane_waits_for_tab() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let (drawn, _) = draw(60, 16, &mut screen, &store);
+        assert!(
+            !drawn.contains("Details"),
+            "the table gets the room: {drawn}"
+        );
+
+        let mut shell = Shell::default();
+        shell.focus = crate::app::shell::Focus::Details;
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                screen.refilter(&store);
+                render(frame, &mut shell, &mut screen, &store, frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("Details"), "{drawn}");
+        assert!(
+            !drawn.contains("Enabled"),
+            "and the table steps aside: {drawn}"
+        );
     }
 
     #[test]

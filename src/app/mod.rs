@@ -8,6 +8,8 @@ pub mod screen;
 pub mod secrets;
 pub mod shell;
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -194,12 +196,15 @@ impl App {
         }
     }
 
-    /// A worker event, and whatever it changed on the screen looking at it.
-    pub fn apply(&mut self, event: worker::Event) -> Applied {
+    /// A worker event, and whatever it asks the run loop to do next.
+    ///
+    /// `Applied::Value` is the one that does not stay here: it goes to the
+    /// screen that asked for it, which either shows it or copies it and
+    /// keeps nothing either way.
+    pub fn apply(&mut self, event: worker::Event, now: Instant) -> AppAction {
         let secrets_was = self.secrets.cursor_identity(&self.store);
         let registries_was = self.registries.cursor_identity(&self.store);
-        let applied = self.store.apply(event);
-        match applied {
+        match self.store.apply(event) {
             Applied::Secrets => {
                 self.secrets.invalidate();
                 self.secrets.keep_cursor(&self.store, secrets_was);
@@ -208,9 +213,52 @@ impl App {
                 self.registries.invalidate();
                 self.registries.keep_cursor(&self.store, registries_was);
             }
-            _ => {}
+            Applied::Value {
+                vault,
+                name,
+                result,
+            } => {
+                return self.secrets.on_value(
+                    &mut self.shell,
+                    &self.store,
+                    &vault,
+                    &name,
+                    result,
+                    now,
+                );
+            }
+            Applied::Nothing | Applied::Detail | Applied::Status => {}
         }
-        applied
+        AppAction::None
+    }
+
+    /// One turn of the clock: what has run out, and what the cursor has
+    /// settled long enough to be worth asking about.
+    pub fn tick(&mut self, now: Instant) -> Option<worker::Request> {
+        match self.tab {
+            TabId::Secrets => {
+                self.secrets.refilter(&self.store);
+                self.secrets.tick(&self.store, now)
+            }
+            TabId::Registries => None,
+        }
+    }
+
+    /// How long the run loop may sleep: a second while something is counting
+    /// down or being waited for, the rest interval while the cursor has just
+    /// landed somewhere, and whatever the caller wanted otherwise.
+    #[must_use]
+    pub fn poll_for(&self, settled: Duration) -> Duration {
+        if self.store.refreshing {
+            return Duration::from_millis(100);
+        }
+        if self.secrets.is_ticking() {
+            return Duration::from_secs(1);
+        }
+        if self.secrets.is_resting() {
+            return crate::app::secrets::REST;
+        }
+        settled
     }
 
     /// `r`: everything a screen was holding that a refresh makes stale.

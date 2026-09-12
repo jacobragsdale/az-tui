@@ -103,10 +103,15 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Starts the thread. The client is built here but mints nothing until
-    /// the thread asks it to, so a missing `az` never delays the first frame.
+    /// Starts the thread.
+    ///
+    /// The client is built here but mints nothing until the thread asks it
+    /// to, so a missing `az` never delays the first frame. `known` is the
+    /// inventory the cache was painted from: without it a `v` pressed on the
+    /// first frame would be told the vault is not in the subscription, when
+    /// really the refresh behind the frame has not finished yet.
     #[must_use]
-    pub fn start(azure: Azure, client: Client) -> Self {
+    pub fn start(azure: Azure, client: Client, known: Inventory) -> Self {
         let (requests, inbox) = channel();
         let (outbox, events) = channel();
         let handle = std::thread::Builder::new()
@@ -117,8 +122,8 @@ impl Worker {
                     client,
                     inbox,
                     outbox,
-                    vaults: Vec::new(),
-                    registries: Vec::new(),
+                    vaults: known.vaults,
+                    registries: known.registries,
                 }
                 .run();
             })
@@ -240,12 +245,7 @@ impl Loop {
         let inventory = match graph::inventory(&self.client, &self.azure) {
             Ok(inventory) => inventory,
             Err(error) => {
-                let said = if is_signed_out(&error) {
-                    "not signed in — run `az login`".to_owned()
-                } else {
-                    format!("{error:#}")
-                };
-                self.send(Event::Inventory(Err(said)));
+                self.send(Event::Inventory(Err(said(error))));
                 return self.send(Event::Idle);
             }
         };
@@ -434,15 +434,26 @@ impl Loop {
         }
     }
 
+    /// Why a name could not be turned into a host to ask. There are two
+    /// reasons and they want different words: the subscription has not been
+    /// read yet, or it has and the thing is gone.
+    fn cannot_place(&self, name: &str) -> String {
+        if self.vaults.is_empty() && self.registries.is_empty() {
+            format!("{name}: the subscription has not been read yet")
+        } else {
+            format!("{name} is no longer in the subscription")
+        }
+    }
+
     fn with_vault<T>(
         &self,
         name: &str,
         read: impl FnOnce(&Client, &Vault) -> anyhow::Result<T>,
     ) -> Result<T, String> {
         let Some(vault) = self.vaults.iter().find(|vault| vault.name == name) else {
-            return Err(format!("{name} is no longer in the subscription"));
+            return Err(self.cannot_place(name));
         };
-        read(&self.client, vault).map_err(|error| format!("{error:#}"))
+        read(&self.client, vault).map_err(said)
     }
 
     fn with_registry<T>(
@@ -457,8 +468,21 @@ impl Loop {
         else {
             return Err(format!("{name} is no longer in the subscription"));
         };
-        read(&self.client, registry).map_err(|error| format!("{error:#}"))
+        read(&self.client, registry).map_err(said)
     }
+}
+
+/// What the screen shows for one failure.
+///
+/// A signed-out login is the one refusal worth rewording: the CLI answers it
+/// with five lines of its own stack, and what a person needs is the two words
+/// that fix it. Every detail request goes through here, so the Value line and
+/// the versions list say the same thing the status bar does.
+fn said(error: anyhow::Error) -> String {
+    if is_signed_out(&error) {
+        return "not signed in — run `az login`".to_owned();
+    }
+    format!("{error:#}")
 }
 
 #[cfg(test)]
@@ -566,7 +590,7 @@ mod tests {
             Answer::json(json!({ "access_token": "web-token" })),
             Answer::json(json!({ "imageName": "web", "tagCount": 1 })),
         ]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Refresh);
         assert_eq!(
             until_idle(&worker),
@@ -592,7 +616,7 @@ mod tests {
             Answer::json(json!({ "access_token": "a" })),
             Answer::json(json!({ "repositories": [] })),
         ]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Refresh);
         let said = until_idle(&worker);
         assert!(said.contains(&"secrets(kv-a,err)".to_owned()), "{said:?}");
@@ -604,7 +628,7 @@ mod tests {
     fn a_signed_out_login_stops_the_refresh_and_says_so_once() {
         let (client, transport, _) =
             fake_client([Answer::status(401, "{}"), Answer::status(401, "{}")]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Refresh);
         assert_eq!(
             until_idle(&worker),
@@ -631,7 +655,7 @@ mod tests {
             Answer::json(json!({ "access_token": "web-token" })),
             Answer::json(json!({ "imageName": "web" })),
         ]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         // The ask lands while the catalog call is still in flight, which is
         // the moment this test is about: the fill has not started, and the
         // refresh has to notice the request before it does. Sending it from
@@ -673,7 +697,7 @@ mod tests {
             Answer::json(json!({ "access_token": "a" })),
             Answer::json(json!({ "repositories": [] })),
         ]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Refresh);
         worker.send(Request::Refresh);
         worker.send(Request::Refresh);
@@ -691,7 +715,7 @@ mod tests {
     #[test]
     fn a_detail_for_something_the_inventory_does_not_hold_is_an_answer_not_a_hang() {
         let (client, _, _) = fake_client([]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Versions {
             vault: "kv-gone".into(),
             name: "x".into(),
@@ -702,9 +726,93 @@ mod tests {
     }
 
     #[test]
+    fn a_detail_that_fails_for_want_of_a_login_says_the_two_words_that_fix_it() {
+        let (client, _, _) = fake_client([Answer::status(401, "{}"), Answer::status(401, "{}")]);
+        let known = Inventory {
+            vaults: vec![crate::azure::Vault {
+                id: "/vaults/kv-a".into(),
+                name: "kv-a".into(),
+                subscription_id: "s".into(),
+                resource_group: "rg".into(),
+                location: "eastus".into(),
+                sku: "standard".into(),
+                uri: "https://kv-a.vault.azure.net/".into(),
+            }],
+            registries: Vec::new(),
+        };
+        let worker = Worker::start(Azure::default(), client, known);
+        worker.send(Request::Value {
+            vault: "kv-a".into(),
+            name: "one".into(),
+            version: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let message = loop {
+            if let Some(Event::Value {
+                result: Err(message),
+                ..
+            }) = worker.try_recv()
+            {
+                break message;
+            }
+            assert!(Instant::now() < deadline, "no answer");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(message, "not signed in — run `az login`");
+    }
+
+    #[test]
+    fn a_detail_asked_for_before_the_first_refresh_reaches_the_host_the_cache_named() {
+        // The shape of a cache-first start with no login: the app knows the
+        // vault, the worker has read nothing yet, and `v` must still go out.
+        let (client, transport, _) = fake_client([Answer::json(json!({
+            "value": "s3cr3t",
+            "id": "https://kv-a.vault.azure.net/secrets/one/v1",
+        }))]);
+        let known = Inventory {
+            vaults: vec![crate::azure::Vault {
+                id: "/vaults/kv-a".into(),
+                name: "kv-a".into(),
+                subscription_id: "s".into(),
+                resource_group: "rg".into(),
+                location: "eastus".into(),
+                sku: "standard".into(),
+                uri: "https://kv-a.vault.azure.net/".into(),
+            }],
+            registries: Vec::new(),
+        };
+        let worker = Worker::start(Azure::default(), client, known);
+        worker.send(Request::Value {
+            vault: "kv-a".into(),
+            name: "one".into(),
+            version: None,
+        });
+        let mut seen = Vec::new();
+        pump_until(&worker, &mut seen, "value(one)");
+        assert_eq!(seen, ["value(one)"]);
+        assert_eq!(
+            transport.urls(),
+            ["https://kv-a.vault.azure.net/secrets/one?api-version=7.4"]
+        );
+    }
+
+    #[test]
+    fn a_name_the_worker_cannot_place_says_which_of_the_two_reasons_it_is() {
+        let (client, _, _) = fake_client([]);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        worker.send(Request::Versions {
+            vault: "kv-gone".into(),
+            name: "x".into(),
+        });
+        let mut seen = Vec::new();
+        pump_until(&worker, &mut seen, "versions(x)");
+        assert_eq!(seen, ["versions(x)"]);
+    }
+
+    #[test]
     fn dropping_the_worker_stops_the_thread() {
         let (client, _, _) = fake_client([]);
-        let worker = Worker::start(Azure::default(), client);
+        let worker = Worker::start(Azure::default(), client, Inventory::default());
         worker.send(Request::Stop);
         // `Drop` sends another Stop and joins; a thread that ignored the
         // first would hang this test rather than fail it.

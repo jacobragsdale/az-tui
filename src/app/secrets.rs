@@ -8,10 +8,12 @@
 
 use std::collections::HashMap;
 
+use std::time::{Duration, Instant};
+
 use super::cursor::ListCursor;
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
-use crate::azure::SecretRow;
+use crate::azure::{Secret, SecretRow};
 use crate::columns::{ColumnId, SECRET_COLUMNS, TableLayout};
 use crate::filter::{self, Query, When};
 use crate::store::Store;
@@ -20,6 +22,16 @@ use crate::timestamp::Timestamp;
 
 /// Inside this many days, an expiry is worth a colour and a badge.
 pub const EXPIRING_SOON: i64 = 30;
+
+/// How long a revealed value stays on screen. Long enough to read one off
+/// and type it somewhere, short enough that a walked-away-from terminal is
+/// not showing a production password.
+pub const REVEAL_FOR: Duration = Duration::from_secs(60);
+
+/// How long the cursor has to sit on a row before its versions are asked
+/// for. Holding `j` down across four hundred rows must not be four hundred
+/// requests.
+pub const REST: Duration = Duration::from_millis(150);
 
 /// The `key:` filters this tab knows. Everything else typed is a word.
 pub const SCHEMA: &[&str] = &[
@@ -234,6 +246,67 @@ pub fn default_layout() -> TableLayout {
     TableLayout::new(SECRET_COLUMNS)
 }
 
+/// A value, on screen, and when it got there.
+///
+/// **This is the one field in the crate that holds a [`Secret`].** It is
+/// dropped when the cursor moves, on `r`, on a tab switch, on `v` again, and
+/// sixty seconds after it arrived — and it goes with the `App` on quit, which
+/// is why there is nothing here that could remember it for next time.
+pub struct Revealed {
+    pub vault: String,
+    pub name: String,
+    /// The version the vault actually handed over.
+    pub version: String,
+    value: Secret,
+    at: Instant,
+}
+
+impl Revealed {
+    /// The value, for the one line that is about to draw it or the one key
+    /// that is about to copy it.
+    ///
+    /// This and the blind-copy arm of [`SecretsScreen::on_value`] are the
+    /// only two calls to [`Secret::expose`] in the crate outside the tests —
+    /// a grep for that method name over `src/` is the audit — and this one
+    /// funnels the two places that draw and copy a value already on screen.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.value.expose()
+    }
+
+    /// How many lines the value has, without reading it out.
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.value.line_count()
+    }
+
+    /// Whole seconds until it goes.
+    #[must_use]
+    pub fn clears_in(&self, now: Instant) -> u64 {
+        REVEAL_FOR
+            .saturating_sub(now.saturating_duration_since(self.at))
+            .as_secs()
+    }
+
+    #[must_use]
+    pub fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) >= REVEAL_FOR
+    }
+}
+
+impl std::fmt::Debug for Revealed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Goes through `Secret`'s, so `format!("{app:?}")` cannot print one.
+        formatter
+            .debug_struct("Revealed")
+            .field("vault", &self.vault)
+            .field("name", &self.name)
+            .field("version", &self.version)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
 /// The Secrets tab.
 pub struct SecretsScreen {
     pub cursor: ListCursor,
@@ -258,6 +331,32 @@ pub struct SecretsScreen {
     built_for: Option<(String, ColumnId, bool, usize)>,
     /// The width the columns were last solved at, which is what `s` walks.
     available: u16,
+    /// The one place a value lives. See [`Revealed`].
+    revealed: Option<Revealed>,
+    /// A value request that has gone out and not come back, and whether it
+    /// was `y` rather than `v` that sent it.
+    reading: Option<Reading>,
+    /// What the vault said when it would not hand one over. Cleared when the
+    /// cursor moves.
+    refusal: Option<String>,
+    /// Where the cursor is and when it got there, for the rest interval that
+    /// gates the versions request.
+    rested: Option<(usize, Instant)>,
+    /// The rows whose versions have already been asked for this run, so a
+    /// cursor coming back to one costs nothing.
+    asked: std::collections::HashSet<(String, String)>,
+    /// How far down the details pane is scrolled.
+    pub details_scroll: super::cursor::ScrollState,
+}
+
+/// A value request in flight.
+#[derive(Debug)]
+struct Reading {
+    vault: String,
+    name: String,
+    /// `y` sent it, so the answer goes to the clipboard rather than the
+    /// screen. `v` sent it otherwise.
+    copy: bool,
 }
 
 impl Default for SecretsScreen {
@@ -274,6 +373,12 @@ impl Default for SecretsScreen {
             ordered_for: None,
             built_for: None,
             available: 0,
+            revealed: None,
+            reading: None,
+            refusal: None,
+            rested: None,
+            asked: std::collections::HashSet::new(),
+            details_scroll: super::cursor::ScrollState::default(),
         }
     }
 }
@@ -436,6 +541,29 @@ impl SecretsScreen {
     ) -> AppAction {
         use crossterm::event::KeyCode;
         let count = self.visible.len();
+        // `j` and `k` scroll the details pane when that is what has focus,
+        // so a long value or a long list of versions can be read.
+        if shell.focus == Focus::Details {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.details_scroll.scroll_by(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.details_scroll.scroll_by(-1);
+                }
+                KeyCode::PageDown => {
+                    self.details_scroll
+                        .scroll_by(i32::try_from(self.details_scroll.page_step()).unwrap_or(1));
+                }
+                KeyCode::PageUp => {
+                    self.details_scroll
+                        .scroll_by(-i32::try_from(self.details_scroll.page_step()).unwrap_or(1));
+                }
+                _ => return self.acting_key(shell, store, key),
+            }
+            return AppAction::None;
+        }
+        let before = self.cursor.index;
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.cursor.move_by(1, count),
             KeyCode::Char('k') | KeyCode::Up => self.cursor.move_by(-1, count),
@@ -445,12 +573,37 @@ impl SecretsScreen {
             KeyCode::End => self.cursor.move_by(isize::MAX, count),
             KeyCode::Char('s') => self.next_sort(),
             KeyCode::Char('S') => self.descending = !self.descending,
-            KeyCode::Char('o') => {
-                return self.open_in_portal(shell, store);
-            }
-            _ => {}
+            _ => return self.acting_key(shell, store, key),
+        }
+        if self.cursor.index != before {
+            self.cursor_moved();
+            self.details_scroll.scroll_to(0);
         }
         AppAction::None
+    }
+
+    /// The keys that act on the row rather than move to it. They work from
+    /// either pane, because which pane has focus is not what `y` is about.
+    fn acting_key(
+        &mut self,
+        shell: &mut Shell,
+        store: &Store,
+        key: crossterm::event::KeyEvent,
+    ) -> AppAction {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Char('v') | KeyCode::Enter => self.reveal(store),
+            KeyCode::Char('y') => self.copy_value(shell, store),
+            KeyCode::Char('Y') => {
+                self.selected(store)
+                    .map_or(AppAction::None, |row| AppAction::Copy {
+                        text: row.name.clone(),
+                        label: format!("Copied the name {} ({})", row.name, row.vault),
+                    })
+            }
+            KeyCode::Char('o') => self.open_in_portal(shell, store),
+            _ => AppAction::None,
+        }
     }
 
     pub fn handle_click(
@@ -473,7 +626,12 @@ impl SecretsScreen {
         AppAction::None
     }
 
-    pub fn handle_wheel(&mut self, _shell: &mut Shell, _target: Option<Target>, delta: i32) {
+    pub fn handle_wheel(&mut self, _shell: &mut Shell, target: Option<Target>, delta: i32) {
+        if target == Some(Target::Details) {
+            self.details_scroll.scroll_by(delta);
+            return;
+        }
+        let before = self.cursor.index;
         self.cursor.scroll.scroll_by(delta);
         // The cursor follows the viewport rather than being left behind it,
         // so what `v` acts on is always something on screen.
@@ -483,6 +641,9 @@ impl SecretsScreen {
             .cursor
             .index
             .clamp(first, last.min(self.visible.len().saturating_sub(1)));
+        if self.cursor.index != before {
+            self.cursor_moved();
+        }
     }
 
     /// The vault's secrets blade in the portal.
@@ -515,13 +676,197 @@ impl SecretsScreen {
             return "Esc/Enter keep the filter  Esc again clears it  Ctrl-U empties the box"
                 .to_owned();
         }
-        "↑↓/jk move  / search  s sort  y copy value  v reveal  r refresh  ? help".to_owned()
+        "↑↓/jk move  / search  v reveal  y copy value  Y copy name  s sort  r refresh  ? help"
+            .to_owned()
     }
 
-    /// `r`, or a tab switch: whatever the screen was holding that is now
-    /// older than the rows under it.
+    // ── Reveal, copy, and the rest timer ────────────────────────────────
+
+    /// Whether a value for this row has been asked for and not come back.
+    #[must_use]
+    pub fn is_reading(&self, row: &SecretRow) -> bool {
+        self.reading
+            .as_ref()
+            .is_some_and(|held| held.vault == row.vault && held.name == row.name && !held.copy)
+    }
+
+    /// The revealed value, if it is this row's.
+    #[must_use]
+    pub fn revealed_here(&self, row: &SecretRow) -> Option<&Revealed> {
+        self.revealed
+            .as_ref()
+            .filter(|held| held.vault == row.vault && held.name == row.name)
+    }
+
+    #[must_use]
+    pub const fn refusal(&self) -> Option<&String> {
+        self.refusal.as_ref()
+    }
+
+    /// `v` or `Enter`: show it, or hide it if it is already showing.
+    fn reveal(&mut self, store: &Store) -> AppAction {
+        let Some(row) = self.selected(store) else {
+            return AppAction::None;
+        };
+        if self.revealed_here(row).is_some() {
+            self.revealed = None;
+            return AppAction::None;
+        }
+        let (vault, name) = (row.vault.clone(), row.name.clone());
+        self.refusal = None;
+        self.reading = Some(Reading {
+            vault: vault.clone(),
+            name: name.clone(),
+            copy: false,
+        });
+        AppAction::Send(crate::worker::Request::Value {
+            vault,
+            name,
+            version: None,
+        })
+    }
+
+    /// `y`: copy the value without showing it. A value already on screen is
+    /// copied at once and nothing is asked for.
+    fn copy_value(&mut self, shell: &mut Shell, store: &Store) -> AppAction {
+        let Some(row) = self.selected(store) else {
+            return AppAction::None;
+        };
+        if let Some(held) = self.revealed_here(row) {
+            return AppAction::Copy {
+                // The one other place a value is read out. Nothing about it
+                // reaches the label.
+                text: held.expose().to_owned(),
+                label: format!("Copied value of {} ({})", held.name, held.vault),
+            };
+        }
+        let (vault, name) = (row.vault.clone(), row.name.clone());
+        self.refusal = None;
+        self.reading = Some(Reading {
+            vault: vault.clone(),
+            name: name.clone(),
+            copy: true,
+        });
+        shell.set_status(format!("reading {name}…"));
+        AppAction::Send(crate::worker::Request::Value {
+            vault,
+            name,
+            version: None,
+        })
+    }
+
+    /// A value has come back. It is kept only if the cursor is still on the
+    /// row that asked; a value for a row somebody has left is dropped on the
+    /// floor rather than shown next to the wrong name.
+    pub fn on_value(
+        &mut self,
+        shell: &mut Shell,
+        store: &Store,
+        vault: &str,
+        name: &str,
+        result: Result<(Secret, String), String>,
+        now: Instant,
+    ) -> AppAction {
+        let Some(asked) = self
+            .reading
+            .take()
+            .filter(|held| held.vault == vault && held.name == name)
+        else {
+            return AppAction::None;
+        };
+        let still_here = self
+            .selected(store)
+            .is_some_and(|row| row.vault == vault && row.name == name);
+        match result {
+            Err(message) => {
+                if asked.copy {
+                    shell.set_error(message.clone());
+                }
+                if still_here {
+                    self.refusal = Some(message);
+                }
+                AppAction::None
+            }
+            // The second and last call to `Secret::expose`: `y` pressed with
+            // nothing on screen, copying blind, which is the common case.
+            Ok((secret, _version)) if asked.copy => AppAction::Copy {
+                text: secret.expose().to_owned(),
+                label: format!("Copied value of {name} ({vault})"),
+            },
+            Ok((secret, version)) => {
+                if !still_here {
+                    // Nothing keeps it. It is dropped here, unread.
+                    return AppAction::None;
+                }
+                self.revealed = Some(Revealed {
+                    vault: vault.to_owned(),
+                    name: name.to_owned(),
+                    version,
+                    value: secret,
+                    at: now,
+                });
+                AppAction::None
+            }
+        }
+    }
+
+    /// One turn of the clock: drops a value that has run out, and asks for
+    /// the versions of a row the cursor has settled on.
+    pub fn tick(&mut self, store: &Store, now: Instant) -> Option<crate::worker::Request> {
+        if self.revealed.as_ref().is_some_and(|held| held.expired(now)) {
+            self.revealed = None;
+        }
+        let row = self.selected(store)?;
+        let (vault, name) = (row.vault.clone(), row.name.clone());
+        let here = self.cursor.index;
+        match self.rested {
+            Some((at, since)) if at == here => {
+                if now.saturating_duration_since(since) < REST {
+                    return None;
+                }
+            }
+            _ => {
+                self.rested = Some((here, now));
+                return None;
+            }
+        }
+        let key = (vault.clone(), name.clone());
+        if store.versions.contains_key(&key) || !self.asked.insert(key) {
+            return None;
+        }
+        Some(crate::worker::Request::Versions { vault, name })
+    }
+
+    /// Whether the run loop should wake every second: something is counting
+    /// down, or something is being waited for.
+    #[must_use]
+    pub const fn is_ticking(&self) -> bool {
+        self.revealed.is_some() || self.reading.is_some()
+    }
+
+    /// Whether the cursor has landed somewhere whose versions are not in yet,
+    /// so the loop should come back at the rest interval rather than sit on
+    /// a quarter-second poll.
+    #[must_use]
+    pub const fn is_resting(&self) -> bool {
+        self.rested.is_some()
+    }
+
+    /// Moving the cursor takes the value off the screen with it, and clears
+    /// whatever the last row refused with.
+    fn cursor_moved(&mut self) {
+        self.revealed = None;
+        self.refusal = None;
+    }
+
+    /// `r`, or a tab switch: the value goes. Rows that are about to be read
+    /// again should not be sitting next to a value read before them, and a
+    /// tab switch is looking away.
     pub fn on_refresh(&mut self) {
-        // Step 07 drops the revealed value here. Nothing else is held.
+        self.revealed = None;
+        self.reading = None;
+        self.refusal = None;
+        self.asked.clear();
     }
 }
 
@@ -906,6 +1251,272 @@ mod tests {
             worst < std::time::Duration::from_millis(200),
             "even a debug build should not be this slow: {worst:?}"
         );
+    }
+
+    // ── Reveal, copy, and the rest interval ─────────────────────────────
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn press(
+        screen: &mut SecretsScreen,
+        shell: &mut Shell,
+        store: &Store,
+        code: char,
+    ) -> AppAction {
+        screen.handle_key(shell, store, key(crossterm::event::KeyCode::Char(code)))
+    }
+
+    fn value(name: &str) -> Result<(Secret, String), String> {
+        Ok((Secret::new(format!("{name}-value")), "v1".to_owned()))
+    }
+
+    #[test]
+    fn v_asks_once_shows_the_value_and_lets_it_go_at_sixty_seconds() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        let row = screen.selected(&store).unwrap().clone();
+        assert_eq!(row.name, "api-key");
+
+        let action = press(&mut screen, &mut shell, &store, 'v');
+        assert!(
+            matches!(&action, AppAction::Send(crate::worker::Request::Value { name, .. }) if name == "api-key"),
+            "{action:?}"
+        );
+        assert!(screen.is_reading(&row));
+
+        let clock = Instant::now();
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            value("api-key"),
+            clock,
+        );
+        let held = screen.revealed_here(&row).expect("a value");
+        assert_eq!(held.expose(), "api-key-value");
+        assert_eq!(held.version, "v1");
+        assert_eq!(held.clears_in(clock), 60);
+        assert_eq!(held.clears_in(clock + Duration::from_secs(13)), 47);
+
+        // One second short of a minute it is still there; at a minute it is
+        // not.
+        screen.tick(&store, clock + Duration::from_secs(59));
+        assert!(screen.revealed_here(&row).is_some());
+        screen.tick(&store, clock + REVEAL_FOR);
+        assert!(screen.revealed_here(&row).is_none());
+    }
+
+    #[test]
+    fn v_again_hides_it_and_so_does_moving_r_and_a_tab_switch() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        let row = screen.selected(&store).unwrap().clone();
+        let show = |screen: &mut SecretsScreen, shell: &mut Shell| {
+            press(screen, shell, &store, 'v');
+            screen.on_value(
+                shell,
+                &store,
+                "kv-dev",
+                "api-key",
+                value("api-key"),
+                Instant::now(),
+            );
+        };
+
+        show(&mut screen, &mut shell);
+        press(&mut screen, &mut shell, &store, 'v');
+        assert!(screen.revealed_here(&row).is_none(), "v again hides it");
+
+        show(&mut screen, &mut shell);
+        press(&mut screen, &mut shell, &store, 'j');
+        assert!(screen.revealed.is_none(), "moving the cursor drops it");
+
+        screen.cursor.focus(0);
+        show(&mut screen, &mut shell);
+        screen.on_refresh();
+        assert!(screen.revealed.is_none(), "r and a tab switch drop it");
+    }
+
+    #[test]
+    fn a_value_for_a_row_the_cursor_has_left_is_dropped_on_the_floor() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        press(&mut screen, &mut shell, &store, 'v');
+        press(&mut screen, &mut shell, &store, 'j');
+
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            value("api-key"),
+            Instant::now(),
+        );
+        assert!(screen.revealed.is_none(), "it belonged to the row before");
+    }
+
+    #[test]
+    fn y_without_a_reveal_asks_and_copies_on_arrival_and_with_one_copies_at_once() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+
+        let action = press(&mut screen, &mut shell, &store, 'y');
+        assert!(matches!(action, AppAction::Send(_)), "{action:?}");
+        let action = screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            value("api-key"),
+            Instant::now(),
+        );
+        match action {
+            AppAction::Copy { text, label } => {
+                assert_eq!(text, "api-key-value");
+                assert_eq!(label, "Copied value of api-key (kv-dev)");
+                assert!(!label.contains("api-key-value"), "the label never says it");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            screen.revealed.is_none(),
+            "copying blind does not put it on the screen"
+        );
+
+        // With one already showing, `y` copies it and sends nothing.
+        press(&mut screen, &mut shell, &store, 'v');
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            value("api-key"),
+            Instant::now(),
+        );
+        let action = press(&mut screen, &mut shell, &store, 'y');
+        assert!(matches!(action, AppAction::Copy { .. }), "{action:?}");
+    }
+
+    #[test]
+    fn a_refusal_shows_under_value_and_goes_when_the_cursor_does() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        press(&mut screen, &mut shell, &store, 'v');
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            Err("kv-dev: no permission to read secrets".to_owned()),
+            Instant::now(),
+        );
+        assert_eq!(
+            screen.refusal().map(String::as_str),
+            Some("kv-dev: no permission to read secrets")
+        );
+        press(&mut screen, &mut shell, &store, 'j');
+        assert!(screen.refusal().is_none());
+    }
+
+    #[test]
+    fn holding_j_down_across_ten_rows_asks_for_one_rows_versions_not_ten() {
+        // Deeper than the ten presses, so the cursor never hits the end and
+        // starts resting there.
+        let mut store = stocked();
+        store.apply(crate::worker::Event::Secrets {
+            vault: "kv-dev".into(),
+            result: Ok((0..20)
+                .map(|n| row("kv-dev", &format!("secret-{n:02}")))
+                .collect()),
+        });
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+
+        let mut clock = Instant::now();
+        let mut asked = 0;
+        for _ in 0..10 {
+            press(&mut screen, &mut shell, &store, 'j');
+            // A key every 40 ms, which is a held-down key.
+            clock += Duration::from_millis(40);
+            if screen.tick(&store, clock).is_some() {
+                asked += 1;
+            }
+        }
+        assert_eq!(asked, 0, "nothing rested long enough to be worth asking");
+
+        // Let go, and the row under the cursor is asked about — once.
+        clock += REST;
+        let request = screen.tick(&store, clock);
+        let here = screen.selected(&store).unwrap().name.clone();
+        assert!(
+            matches!(&request, Some(crate::worker::Request::Versions { name, .. }) if *name == here),
+            "{request:?} for {here}"
+        );
+        clock += REST;
+        assert!(
+            screen.tick(&store, clock).is_none(),
+            "asked once per row per run"
+        );
+    }
+
+    #[test]
+    fn the_debug_of_the_whole_screen_never_contains_a_value() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+        press(&mut screen, &mut shell, &store, 'v');
+        screen.on_value(
+            &mut shell,
+            &store,
+            "kv-dev",
+            "api-key",
+            Ok((Secret::new("hunter2"), "v1".to_owned())),
+            Instant::now(),
+        );
+        let printed = format!("{:?}", screen.revealed.as_ref().unwrap());
+        assert!(printed.contains("api-key"), "{printed}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+    }
+
+    #[test]
+    fn capital_y_copies_the_name_and_o_opens_the_vaults_blade() {
+        let store = stocked();
+        let mut screen = SecretsScreen::default();
+        let mut shell = Shell::default();
+        screen.refilter(&store);
+
+        match press(&mut screen, &mut shell, &store, 'Y') {
+            AppAction::Copy { text, label } => {
+                assert_eq!(text, "api-key");
+                assert!(label.contains("kv-dev"), "{label}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match press(&mut screen, &mut shell, &store, 'o') {
+            AppAction::OpenUrl(url) => {
+                assert!(
+                    url.starts_with("https://portal.azure.com/#@/resource/vaults/kv-dev"),
+                    "{url}"
+                );
+                assert!(url.ends_with("/secrets"), "{url}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -21,8 +21,6 @@ use crate::store::Store;
 use crate::worker::{Request, Worker};
 use crate::{cache, clipboard, config, desktop, doctor, paths, ui};
 
-/// How often the spinner turns while a refresh is running.
-const SPINNING: Duration = Duration::from_millis(100);
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
 /// Seconds between background refreshes when nothing says otherwise.
@@ -60,7 +58,10 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     };
 
     let client = Client::new(Box::new(AzCli), Box::new(Https::new()));
-    let worker = Worker::start(config.azure.clone(), client);
+    // The worker starts knowing whatever the cache knew, so a key pressed on
+    // the first frame reaches the right host without waiting for the refresh
+    // behind it.
+    let worker = Worker::start(config.azure.clone(), client, store.inventory.clone());
     worker.send(Request::Refresh);
 
     let every = Duration::from_secs(config.azure.refresh.unwrap_or(DEFAULT_REFRESH));
@@ -80,38 +81,24 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             .draw(|frame| app.render(frame, started.elapsed().as_millis()))
             .context("failed to draw")?;
 
-        if event::poll(if app.store.refreshing {
-            SPINNING
-        } else {
-            RESTING
-        })? {
+        if event::poll(app.poll_for(RESTING))? {
             let action = match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => AppAction::None,
             };
-            match action {
-                AppAction::Quit => return Ok(()),
-                AppAction::Send(request) => worker.send(request),
-                AppAction::Copy { text, label } => match clipboard::copy(&text) {
-                    // `text` is never in a message: the label says what was
-                    // copied, and nothing says what it was.
-                    Ok(()) => app.shell.set_status(label),
-                    Err(error) => app.shell.set_error(format!("{error:#}")),
-                },
-                AppAction::OpenUrl(url) => {
-                    if let Err(error) = desktop::open_in_browser(&url) {
-                        app.shell.set_error(format!("{error:#}"));
-                    }
-                }
-                AppAction::None => {}
+            if act(&mut app, &worker, action) {
+                return Ok(());
             }
         }
 
         // Everything the worker has said since the last frame.
         while let Some(event) = worker.try_recv() {
             let idle = matches!(event, crate::worker::Event::Idle);
-            app.apply(event);
+            let action = app.apply(event, Instant::now());
+            if act(&mut app, &worker, action) {
+                return Ok(());
+            }
             if idle
                 && !cli.no_cache
                 && let Err(error) = cache::save(&cache_path, &app.store.snapshot())
@@ -123,6 +110,12 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             }
         }
 
+        // What has run out, and what the cursor has settled on long enough
+        // to be worth asking about.
+        if let Some(request) = app.tick(Instant::now()) {
+            worker.send(request);
+        }
+
         if let Some(due) = next_refresh
             && Instant::now() >= due
         {
@@ -130,6 +123,28 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             next_refresh = Some(Instant::now() + every);
         }
     }
+}
+
+/// Does what a screen asked for. Returns true when the run is over.
+///
+/// The clipboard is the one place a value leaves the program, and the status
+/// it sets names only what was copied — never what it was.
+fn act(app: &mut App, worker: &Worker, action: AppAction) -> bool {
+    match action {
+        AppAction::Quit => return true,
+        AppAction::Send(request) => worker.send(request),
+        AppAction::Copy { text, label } => match clipboard::copy(&text) {
+            Ok(()) => app.shell.set_status(label),
+            Err(error) => app.shell.set_error(format!("{error:#}")),
+        },
+        AppAction::OpenUrl(url) => {
+            if let Err(error) = desktop::open_in_browser(&url) {
+                app.shell.set_error(format!("{error:#}"));
+            }
+        }
+        AppAction::None => {}
+    }
+    false
 }
 
 struct TerminalRestore;

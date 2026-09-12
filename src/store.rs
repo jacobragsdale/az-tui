@@ -42,9 +42,12 @@ pub struct Store {
     /// Every vault's secrets, concatenated in the inventory's order.
     pub secrets: Vec<SecretRow>,
     pub repositories: Vec<Repository>,
-    pub versions: HashMap<(String, String), Vec<SecretVersion>>,
-    pub tags: HashMap<(String, String), Vec<Tag>>,
-    pub manifests: HashMap<(String, String, String), Manifest>,
+    /// Read once per row per run. The error is kept as well as the answer:
+    /// a pane that only knows "not here yet" says `reading…` for ever after
+    /// a vault refuses, which is the wrong half of the truth.
+    pub versions: HashMap<(String, String), Result<Vec<SecretVersion>, String>>,
+    pub tags: HashMap<(String, String), Result<Vec<Tag>, String>>,
+    pub manifests: HashMap<(String, String, String), Result<Manifest, String>>,
     /// `(vault or registry, message)`, rebuilt over a refresh rather than
     /// appended to for ever.
     pub problems: Vec<(String, String)>,
@@ -183,16 +186,10 @@ impl Store {
                 vault,
                 name,
                 result,
-            } => match result {
-                Ok(versions) => {
-                    self.versions.insert((vault, name), versions);
-                    Applied::Detail
-                }
-                Err(message) => {
-                    self.problem(vault, message);
-                    Applied::Status
-                }
-            },
+            } => {
+                self.versions.insert((vault, name), result);
+                Applied::Detail
+            }
             // Straight through. Nothing here keeps it.
             Event::Value {
                 vault,
@@ -207,31 +204,19 @@ impl Store {
                 registry,
                 repo,
                 result,
-            } => match result {
-                Ok(tags) => {
-                    self.tags.insert((registry, repo), tags);
-                    Applied::Detail
-                }
-                Err(message) => {
-                    self.problem(registry, message);
-                    Applied::Status
-                }
-            },
+            } => {
+                self.tags.insert((registry, repo), result);
+                Applied::Detail
+            }
             Event::Manifest {
                 registry,
                 repo,
                 digest,
                 result,
-            } => match result {
-                Ok(manifest) => {
-                    self.manifests.insert((registry, repo, digest), manifest);
-                    Applied::Detail
-                }
-                Err(message) => {
-                    self.problem(registry, message);
-                    Applied::Status
-                }
-            },
+            } => {
+                self.manifests.insert((registry, repo, digest), result);
+                Applied::Detail
+            }
             Event::Progress(said) => {
                 self.progress = Some(said);
                 Applied::Status
@@ -386,6 +371,25 @@ mod tests {
             result: Ok(vec![secret("kv-a", "one")]),
         });
         assert!(!store.stale.contains("kv-a"));
+    }
+
+    #[test]
+    fn a_detail_that_failed_is_kept_as_a_failure_rather_than_as_nothing() {
+        let mut store = stocked();
+        store.apply(Event::Versions {
+            vault: "kv-a".into(),
+            name: "one".into(),
+            result: Err("kv-a: no permission to read secrets".into()),
+        });
+        let held = store.versions.get(&("kv-a".to_owned(), "one".to_owned()));
+        assert!(
+            matches!(held, Some(Err(message)) if message.contains("no permission")),
+            "otherwise the pane says `reading…` for ever: {held:?}"
+        );
+        assert!(
+            store.problems.is_empty(),
+            "one row's refusal is that row's business, not the whole tab's"
+        );
     }
 
     #[test]
