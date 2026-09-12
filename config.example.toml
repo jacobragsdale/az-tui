@@ -1,0 +1,45 @@
+# az-tui — every key is optional, and so is this whole file.
+# It lives at $XDG_CONFIG_HOME/az-tui/config.toml, or
+# ~/.config/az-tui/config.toml when that is unset (on macOS too).
+#
+# A flag beats an AZ_TUI_* variable, which beats this file.
+
+[azure]
+# Only read these subscriptions. Left out: every subscription `az` can see.
+# subscriptions = ["00000000-0000-0000-0000-000000000000"]
+
+# Only read these key vaults, in this order. Left out: every vault found.
+# A name that is not found is listed by `az-tui doctor`, not an error.
+# vaults = ["kv-dev", "kv-qa", "kv-prod"]
+
+# Only read these container registries, in this order. Left out: all of them.
+# registries = ["acrdev", "acrqa", "acrprod"]
+
+# Seconds between background refreshes. 0 leaves `r` as the only refresh.
+# refresh = 300
+
+[theme]
+# terminal · terminal-light · mono · custom
+# preset = "terminal"
+
+# A palette in the `theme` tool's vocabulary — the same table ticket-tui
+# reads, so one file themes both. `preset = "custom"` is implied when this
+# table is here and no preset is named.
+# [theme.custom]
+# name = "neon-void"
+# appearance = "dark"      # dark · light
+# bg = "#05060a"
+# bg_deep = "#000000"
+# surface = "#0b0d14"
+# overlay = "#171b28"
+# fg = "#dfe6ff"
+# subtle = "#aab4dd"
+# muted = "#626c9c"
+# accent = "#c07cff"
+# red = "#ff5f87"
+# green = "#4ef5a4"
+# yellow = "#ffd75f"
+# blue = "#61a8ff"
+# cyan = "#4fe8ff"
+# orange = "#ff9e5e"
+# teal = "#29e0c8"
