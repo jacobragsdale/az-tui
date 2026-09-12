@@ -30,8 +30,11 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Some(Command::Doctor) => {
-            println!("doctor: not built yet");
-            Ok(())
+            if crate::doctor::run(&config.azure)? {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
         }
         None => tui(),
     }
