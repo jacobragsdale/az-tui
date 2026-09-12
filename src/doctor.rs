@@ -12,7 +12,7 @@ use anyhow::Result;
 
 use crate::azure::auth::{self, Audience, AzCli, TokenSource};
 use crate::azure::transport::{Client, Https};
-use crate::azure::{Inventory, graph, missing};
+use crate::azure::{Inventory, graph, missing, vault};
 use crate::config::Azure;
 
 /// Runs every check, printing as it goes. Exit 0 when everything answered.
@@ -102,6 +102,15 @@ pub fn run(azure: &Azure) -> Result<bool> {
                 registry.location, registry.resource_group, registry.login_server
             ),
         )?;
+    }
+
+    // What each plane actually answers, which is the half of the check ARM
+    // cannot do for you: a vault can be listed by Resource Graph and still
+    // refuse every data-plane call.
+    for vault in &inventory.vaults {
+        let (said, answered) = vault::doctor_line(&client, vault);
+        line(&mut out, &vault.name, &said)?;
+        ok &= answered;
     }
     if !report_missing(&mut out, &inventory, azure)? {
         ok = false;

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -239,6 +239,51 @@ pub fn is_signed_out(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<SignedOut>())
 }
 
+/// A plane refused, and said why in its own words.
+///
+/// Carried as a type rather than a formatted string so a caller can ask what
+/// the status and the code were without parsing the message back apart —
+/// which is how "a `403` naming `ForbiddenByFirewall`" gets told from "a
+/// `403` naming nothing" a few frames later.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: u16,
+    pub url: String,
+    /// `error.code`, its `innererror.code`, and a registry's `errors[0].code`
+    /// — whichever of the three the body carried.
+    pub codes: Vec<String>,
+    pub message: String,
+}
+
+impl ApiError {
+    #[must_use]
+    pub fn has_code(&self, code: &str) -> bool {
+        self.codes
+            .iter()
+            .any(|held| held.eq_ignore_ascii_case(code))
+    }
+}
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} answered {}: {}",
+            self.url, self.status, self.message
+        )
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+/// The refusal this error carries, if it is one.
+#[must_use]
+pub fn api_error(error: &anyhow::Error) -> Option<&ApiError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ApiError>())
+}
+
 /// The client every read in the crate goes through.
 ///
 // ponytail: one concrete type with two boxed seams rather than
@@ -358,16 +403,25 @@ impl Client {
             ))));
         }
         if THROTTLED.contains(&status) {
-            bail!(
-                "Azure is still throttling {url} (HTTP {status}): {}",
-                failure_message(&response.body)
-            );
+            // The wait has already been taken once; a second refusal is the
+            // service saying to come back later, not to ask again now.
+            return Err(anyhow::Error::new(ApiError {
+                status,
+                url: url.clone(),
+                codes: failure_codes(&response.body),
+                message: format!(
+                    "Azure is still throttling this: {}",
+                    failure_message(&response.body)
+                ),
+            }));
         }
         if !(200..300).contains(&status) {
-            bail!(
-                "{url} answered {status}: {}",
-                failure_message(&response.body)
-            );
+            return Err(anyhow::Error::new(ApiError {
+                status,
+                url: url.clone(),
+                codes: failure_codes(&response.body),
+                message: failure_message(&response.body),
+            }));
         }
         if response.body.trim().is_empty() {
             return Ok(Value::Null);

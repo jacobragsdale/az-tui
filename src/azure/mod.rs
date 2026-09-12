@@ -7,13 +7,17 @@
 //! by discipline. A grep for the three write verbs over `src/` is the audit,
 //! and it comes back empty.
 
+pub mod acr;
 pub mod auth;
 pub mod graph;
 pub mod transport;
+pub mod vault;
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use crate::timestamp::Timestamp;
 
 /// One key vault, as Resource Graph lists it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -44,6 +48,78 @@ pub struct Registry {
     pub login_server: String,
 }
 
+/// One secret in one vault, as a listing describes it. A listing never
+/// carries the value, which is the point of listing one.
+///
+// ponytail: secrets only. Keys and certificates list the same way (`GET keys`,
+// `GET certificates`, 25 to a page) and would come in as a `kind` column here
+// and a third schema in `filter`; nobody asked for them in v1.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SecretRow {
+    /// The vault's name, which is the row's first column.
+    pub vault: String,
+    /// The last path segment of the item's `id`.
+    pub name: String,
+    pub enabled: bool,
+    pub created: Option<Timestamp>,
+    pub updated: Option<Timestamp>,
+    /// `attributes.exp`.
+    pub expires: Option<Timestamp>,
+    /// `attributes.nbf`.
+    pub not_before: Option<Timestamp>,
+    pub content_type: Option<String>,
+    /// Sorted by key, so a row's tags read the same on every refresh.
+    pub tags: Vec<(String, String)>,
+    /// A certificate's backing secret, which the vault manages itself.
+    pub managed: bool,
+}
+
+/// One version of one secret. Read on demand, never cached to disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretVersion {
+    pub version: String,
+    pub enabled: bool,
+    pub created: Option<Timestamp>,
+    pub updated: Option<Timestamp>,
+    pub expires: Option<Timestamp>,
+}
+
+/// One repository in a registry. The counts and the stamps are `None` until
+/// the attributes call fills them in: a catalog listing is names and nothing
+/// else.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Repository {
+    pub registry: String,
+    pub name: String,
+    pub tag_count: Option<u64>,
+    pub manifest_count: Option<u64>,
+    pub created: Option<Timestamp>,
+    pub updated: Option<Timestamp>,
+}
+
+/// One tag, and the manifest it points at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tag {
+    pub name: String,
+    pub digest: String,
+    pub created: Option<Timestamp>,
+    pub updated: Option<Timestamp>,
+}
+
+/// One manifest, by what it weighs and what it runs on. A multi-arch index
+/// names no architecture, and the UI prints `index` for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Manifest {
+    pub digest: String,
+    /// Bytes, as the registry counts them.
+    pub size: Option<u64>,
+    pub architecture: Option<String>,
+    pub os: Option<String>,
+    pub created: Option<Timestamp>,
+    /// Every tag pointing at this manifest.
+    pub tags: Vec<String>,
+}
+
 /// Everything the login can reach that this program knows about.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Inventory {
@@ -56,7 +132,7 @@ pub struct Inventory {
 /// Neither `Debug` nor `Display` will print it, so it cannot reach a log
 /// line, an error, a panic message or the cache by accident. [`Secret::expose`]
 /// is the one way to read it and is meant to be conspicuous at the call site;
-/// `grep -rn 'expose()' src/` is the audit.
+/// a grep for that method name over `src/` is the audit.
 ///
 /// It deliberately derives no `Serialize`: a value that cannot be serialised
 /// cannot be written to the cache or the session however hard someone tries.
