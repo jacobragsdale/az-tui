@@ -56,6 +56,76 @@ pub struct Cli {
 pub enum Command {
     /// Check the login, the tokens and what the subscriptions hold.
     Doctor,
+
+    /// One line per secret: vault, name, enabled, expires, updated.
+    ///
+    /// Never prints a value; `secret get` is the one command that does.
+    Secrets {
+        /// The same grammar as `/` in the TUI.
+        query: Option<String>,
+        /// Only this vault. Repeat for more.
+        #[arg(long = "vault", value_name = "NAME")]
+        vaults: Vec<String>,
+        #[arg(long)]
+        json: bool,
+        /// Read Azure rather than the cache.
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// One secret's value. The only command that prints one.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+
+    /// One line per repository: registry, repository, tags, updated.
+    Repos {
+        /// The same grammar as `/` in the TUI.
+        query: Option<String>,
+        /// Only this registry. Repeat for more.
+        #[arg(long = "registry", value_name = "NAME")]
+        registries: Vec<String>,
+        #[arg(long)]
+        json: bool,
+        /// Read Azure rather than the cache.
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// One line per tag of one repository, newest first.
+    Tags {
+        /// The repository, as the catalog names it.
+        repo: String,
+        /// Which registry, when more than one holds a repository by this
+        /// name.
+        #[arg(long, value_name = "NAME")]
+        registry: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Print one secret's value.
+    ///
+    /// This is the one command in az-tui that prints a value. It goes to
+    /// stdout with no trailing newline of its own, so `$(az-tui secret get
+    /// NAME)` is the value byte for byte.
+    Get {
+        /// The secret's name, as the vault lists it.
+        name: String,
+        /// Which vault, when more than one holds a secret by this name.
+        #[arg(long, value_name = "NAME")]
+        vault: Option<String>,
+        /// A version other than the current one.
+        #[arg(long, value_name = "ID")]
+        version: Option<String>,
+        /// `{"vault","name","version","content_type","value"}`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {

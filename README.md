@@ -72,6 +72,40 @@ acrprod       183 repositories (0.9 s)
 
 It exits 0 when everything answered and 1 otherwise, so it works in a script.
 
+## From a shell
+
+The same reads without the screen, for scripts and agents. Each reads the
+cache when it is younger than the refresh interval and Azure otherwise.
+
+```console
+az-tui secrets [QUERY] [--vault NAME]... [--json] [--refresh]
+az-tui secret get NAME [--vault NAME] [--version ID] [--json]
+az-tui repos [QUERY] [--registry NAME]... [--json]
+az-tui tags REPO [--registry NAME] [--json]
+az-tui doctor
+```
+
+`QUERY` is the same grammar as `/` in the TUI.
+
+```console
+$ az-tui secrets 'expires:<30d enabled:yes'
+kv-prod          tls-cert-pem      enabled  12d        3d
+$ az-tui secrets db --json | jq length
+3
+$ az-tui secret get db-password --vault kv-prod | wc -c
+24
+$ az-tui tags payments-api --json | jq -r '.[0].pull'
+acrprod.azurecr.io/payments-api:1.42.0
+```
+
+`secret get` is the one command that prints a value. It writes it to stdout
+with no trailing newline of its own, so `$(az-tui secret get NAME)` is the
+value byte for byte, and a value that ends in a newline keeps it. A name that
+is in more than one vault is an error listing them rather than a guess.
+
+Exit codes: **0** it worked, **1** a read failed, **2** the arguments were
+wrong.
+
 ## Keys
 
 | Key | Does |

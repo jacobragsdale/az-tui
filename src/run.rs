@@ -1,7 +1,7 @@
 //! The terminal loop: take the terminal, drain the worker, draw, read a key,
 //! give the terminal back — on every exit path, including a panic.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -16,10 +16,10 @@ use crate::app::App;
 use crate::app::screen::AppAction;
 use crate::azure::auth::AzCli;
 use crate::azure::transport::{Client, Https};
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, SecretCommand};
 use crate::store::Store;
 use crate::worker::{Request, Worker};
-use crate::{cache, clipboard, config, desktop, doctor, paths, session, ui};
+use crate::{cache, clipboard, commands, config, desktop, doctor, paths, session, ui};
 
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
@@ -30,7 +30,7 @@ const DEFAULT_REFRESH: u64 = 300;
 const SETTLE: Duration = Duration::from_millis(500);
 
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let config_path = paths::config_file(cli.config.as_deref());
     let config = cli.merge(config::load(&config_path)?);
     let (theme, _label) = cli
@@ -39,16 +39,80 @@ pub fn run() -> Result<()> {
         .with_context(|| format!("resolving the theme (config: {})", config_path.display()))?;
     ui::theme::set_theme(theme);
 
-    match cli.command {
+    match cli.command.take() {
         Some(Command::Doctor) => {
             if doctor::run(&config.azure)? {
                 Ok(())
             } else {
-                std::process::exit(1)
+                std::process::exit(commands::FAILED)
             }
         }
+        Some(command) => shell(&cli, &config, command),
         None => tui(&cli, config),
     }
+}
+
+/// One subcommand, on the calling thread. Every failure exits with the code
+/// the plan gives it rather than with an error up the stack, so a script can
+/// tell "nothing matched" from "you asked wrong".
+fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
+    let client = Client::new(Box::new(AzCli), Box::new(Https::new()));
+    let cache_path = paths::cache_file(cli.cache.as_deref());
+    let context = commands::Context {
+        azure: &config.azure,
+        client: &client,
+        cache: (!cli.no_cache).then_some(cache_path.as_path()),
+    };
+    let mut out = io::stdout().lock();
+    let done = match command {
+        Command::Doctor => unreachable!("handled above"),
+        Command::Secrets {
+            query,
+            vaults,
+            json,
+            refresh,
+        } => commands::secrets(&mut out, &context, query.as_deref(), &vaults, json, refresh),
+        Command::Secret {
+            command:
+                SecretCommand::Get {
+                    name,
+                    vault,
+                    version,
+                    json,
+                },
+        } => commands::secret_get(
+            &mut out,
+            &context,
+            &name,
+            vault.as_deref(),
+            version.as_deref(),
+            json,
+        ),
+        Command::Repos {
+            query,
+            registries,
+            json,
+            refresh,
+        } => commands::repos(
+            &mut out,
+            &context,
+            query.as_deref(),
+            &registries,
+            json,
+            refresh,
+        ),
+        Command::Tags {
+            repo,
+            registry,
+            json,
+        } => commands::tags(&mut out, &context, &repo, registry.as_deref(), json),
+    };
+    out.flush()?;
+    if let Err(failure) = done {
+        eprintln!("error: {}", failure.message);
+        std::process::exit(failure.code);
+    }
+    Ok(())
 }
 
 fn tui(cli: &Cli, config: config::Config) -> Result<()> {
