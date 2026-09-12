@@ -19,12 +19,15 @@ use crate::azure::transport::{Client, Https};
 use crate::cli::{Cli, Command};
 use crate::store::Store;
 use crate::worker::{Request, Worker};
-use crate::{cache, clipboard, config, desktop, doctor, paths, ui};
+use crate::{cache, clipboard, config, desktop, doctor, paths, session, ui};
 
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
 /// Seconds between background refreshes when nothing says otherwise.
 const DEFAULT_REFRESH: u64 = 300;
+/// How long a layout has to stop changing before it is written. Holding `s`
+/// through six columns is one save, not six.
+const SETTLE: Duration = Duration::from_millis(500);
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -68,6 +71,12 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     let mut next_refresh = (!every.is_zero()).then(|| Instant::now() + every);
 
     let mut app = App::new(store);
+    // Before the first frame, so nothing is drawn in a layout that is about
+    // to change.
+    let session_path = paths::session_file();
+    app.restore(&session::Session::load(&session_path));
+    let mut saved = serde_json::to_string(&app.session()).unwrap_or_default();
+    let mut settling: Option<Instant> = None;
     let started = Instant::now();
 
     let mut terminal = ratatui::init();
@@ -88,6 +97,8 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
                 _ => AppAction::None,
             };
             if act(&mut app, &worker, action) {
+                // The layout goes with the run, settle timer or not.
+                let _ = app.session().save(&session_path);
                 return Ok(());
             }
         }
@@ -114,6 +125,23 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
         // to be worth asking about.
         if let Some(request) = app.tick(Instant::now()) {
             worker.send(request);
+        }
+
+        // The layout, once it has stopped moving.
+        let now = serde_json::to_string(&app.session()).unwrap_or_default();
+        if now == saved {
+            settling = None;
+        } else {
+            let due = *settling.get_or_insert_with(|| Instant::now() + SETTLE);
+            if Instant::now() >= due {
+                settling = None;
+                saved = now;
+                if let Err(error) = app.session().save(&session_path) {
+                    // A layout that will not save is worth saying once.
+                    app.shell
+                        .set_error(format!("could not save the session: {error:#}"));
+                }
+            }
         }
 
         if let Some(due) = next_refresh

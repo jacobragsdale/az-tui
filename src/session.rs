@@ -21,8 +21,10 @@ const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
+    /// Stamped by [`Session::save`]; a file of any other value is ignored on
+    /// the way in.
     #[serde(default)]
-    version: u32,
+    pub version: u32,
     /// `"secrets"` or `"registries"`. An unknown name falls back to the
     /// first tab.
     #[serde(default)]

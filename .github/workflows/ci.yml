@@ -37,3 +37,7 @@ jobs:
         env:
           AZ_TUI_THEME: mono
       - run: cargo build --release
+      # The README tells people to install it this way, so the install path
+      # is proven rather than assumed.
+      - run: cargo install --path . --locked --root ${{ runner.temp }}/install
+      - run: ${{ runner.temp }}/install/bin/az-tui --version
