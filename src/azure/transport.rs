@@ -676,10 +676,16 @@ pub mod fake {
         }
     }
 
+    /// Called with every request on its way out, before the answer comes
+    /// back. A test that has to land something in another thread's queue at
+    /// an exact moment does it here rather than by sleeping and hoping.
+    type Watcher = Arc<dyn Fn(&Request) + Send + Sync>;
+
     #[derive(Clone, Default)]
     pub struct FakeTransport {
         answers: Arc<Mutex<VecDeque<Answer>>>,
         sent: Arc<Mutex<Vec<Request>>>,
+        watcher: Arc<Mutex<Option<Watcher>>>,
     }
 
     impl FakeTransport {
@@ -687,7 +693,13 @@ pub mod fake {
             Self {
                 answers: Arc::new(Mutex::new(answers.into_iter().collect())),
                 sent: Arc::new(Mutex::new(Vec::new())),
+                watcher: Arc::new(Mutex::new(None)),
             }
+        }
+
+        /// Runs `watch` on every request as it goes out.
+        pub fn watch(&self, watch: impl Fn(&Request) + Send + Sync + 'static) {
+            *self.watcher.lock().unwrap() = Some(Arc::new(watch));
         }
 
         /// Every request it was handed, in order.
@@ -715,6 +727,10 @@ pub mod fake {
 
     impl Transport for FakeTransport {
         fn send(&self, request: Request) -> Result<Response> {
+            let watcher = self.watcher.lock().unwrap().clone();
+            if let Some(watch) = watcher {
+                watch(&request);
+            }
             let answer = self.answers.lock().unwrap().pop_front();
             self.sent.lock().unwrap().push(request.clone());
             let answer = answer.with_context(|| {

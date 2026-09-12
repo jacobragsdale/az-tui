@@ -90,6 +90,11 @@ impl TokenSource for AzCli {
         az(&["account", "show", "--query", "tenantId", "-o", "tsv"]).ok()
     }
 
+    /// A mint that fails is the same condition a `401` is — there is no
+    /// usable login — so it is the same error type. Otherwise the worker
+    /// would show three lines of the CLI's stack where "run `az login`"
+    /// belongs, and would go on asking every vault in turn for a token it
+    /// cannot get.
     fn token(&self, audience: &Audience) -> Result<String> {
         az(&[
             "account",
@@ -101,6 +106,12 @@ impl TokenSource for AzCli {
             "-o",
             "tsv",
         ])
+        .map_err(|error| {
+            anyhow::Error::new(crate::azure::transport::SignedOut(format!(
+                "could not get a token for {}: {error:#}",
+                audience.label()
+            )))
+        })
     }
 }
 
