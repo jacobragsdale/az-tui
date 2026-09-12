@@ -73,14 +73,13 @@ impl App {
                 self.shell.help_open = true;
                 AppAction::None
             }
-            KeyCode::Char('q') | KeyCode::Esc if !self.shell.help_open => {
-                if key.code == KeyCode::Esc {
-                    // Esc out of the table clears the query rather than
-                    // quitting; only `q` quits.
-                    self.clear_query();
-                    return AppAction::None;
-                }
-                AppAction::Quit
+            KeyCode::Char('q') => AppAction::Quit,
+            // Esc out of the table clears the query rather than quitting:
+            // Esc left the box keeping the filter, and this is the second
+            // press that takes it off.
+            KeyCode::Esc => {
+                self.clear_query();
+                AppAction::None
             }
             KeyCode::Char('r') => {
                 self.on_refresh();

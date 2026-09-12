@@ -844,12 +844,15 @@ impl SecretsScreen {
         self.revealed.is_some() || self.reading.is_some()
     }
 
-    /// Whether the cursor has landed somewhere whose versions are not in yet,
-    /// so the loop should come back at the rest interval rather than sit on
-    /// a quarter-second poll.
+    /// Whether the cursor has landed somewhere in the last [`REST`], so the
+    /// loop comes back in time to ask about it.
+    ///
+    /// It closes when the window does. Left open, the loop would wake six
+    /// times a second for the rest of the run over a cursor that stopped
+    /// moving minutes ago.
     #[must_use]
-    pub const fn is_resting(&self) -> bool {
-        self.rested.is_some()
+    pub fn is_resting(&self) -> bool {
+        self.rested.is_some_and(|(_, since)| since.elapsed() < REST)
     }
 
     /// Moving the cursor takes the value off the screen with it, and clears

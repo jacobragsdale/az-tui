@@ -366,9 +366,12 @@ impl RegistriesScreen {
         }
     }
 
+    /// Whether the cursor has landed somewhere in the last [`REST`], so the
+    /// loop comes back in time to ask about it. It closes when the window
+    /// does, rather than leaving the loop awake for the rest of the run.
     #[must_use]
-    pub const fn is_resting(&self) -> bool {
-        self.rested.is_some()
+    pub fn is_resting(&self) -> bool {
+        self.rested.is_some_and(|(_, since)| since.elapsed() < REST)
     }
 
     /// A refresh, or a tab switch. Nothing here is secret, so only the
