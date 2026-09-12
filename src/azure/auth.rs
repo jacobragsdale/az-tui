@@ -17,6 +17,19 @@ use anyhow::{Context, Result, bail};
 pub enum Audience {
     Arm,
     Vault,
+    /// The audience a registry's *own* token is minted for by the CLI, which
+    /// is then traded for the registry's refresh and access tokens. Not the
+    /// ARM audience: a registry accepts an ARM-scoped token only while its
+    /// `azureADAuthenticationAsArmPolicy` is enabled, which the documentation
+    /// recommends turning off, so a hardened registry would answer 401. This
+    /// is what `az acr` itself asks for.
+    ContainerRegistry,
+    /// One registry's data plane, signed for the one thing about to be read.
+    /// The token is not minted by the CLI at all — see [`super::acr`].
+    Acr {
+        login_server: String,
+        scope: String,
+    },
 }
 
 impl Audience {
@@ -26,13 +39,22 @@ impl Audience {
         match self {
             Self::Arm => "https://management.azure.com/",
             Self::Vault => "https://vault.azure.net",
+            Self::ContainerRegistry | Self::Acr { .. } => "https://containerregistry.azure.net",
         }
     }
 
     /// What the client caches this audience's token under.
     #[must_use]
     pub fn cache_key(&self) -> String {
-        self.resource().to_owned()
+        match self {
+            // One access token per registry per scope: a catalog listing and
+            // a repository's tags are signed for different things.
+            Self::Acr {
+                login_server,
+                scope,
+            } => format!("acr:{login_server}:{scope}"),
+            other => other.resource().to_owned(),
+        }
     }
 
     /// What an error calls it.
@@ -41,6 +63,8 @@ impl Audience {
         match self {
             Self::Arm => "arm",
             Self::Vault => "vault",
+            Self::ContainerRegistry => "registry",
+            Self::Acr { .. } => "acr",
         }
     }
 }
@@ -49,12 +73,23 @@ impl Audience {
 /// strings instead of shelling out to `az`.
 pub trait TokenSource: Send {
     fn token(&self, audience: &Audience) -> Result<String>;
+
+    /// The tenant the login is in, for the one form field that wants it.
+    /// `None` is legal — the registry exchange declares `tenant` optional —
+    /// and is what a test hands back.
+    fn tenant(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The real thing: the Azure CLI's login.
 pub struct AzCli;
 
 impl TokenSource for AzCli {
+    fn tenant(&self) -> Option<String> {
+        az(&["account", "show", "--query", "tenantId", "-o", "tsv"]).ok()
+    }
+
     fn token(&self, audience: &Audience) -> Result<String> {
         az(&[
             "account",
@@ -194,7 +229,31 @@ mod tests {
     fn the_arm_audience_keeps_its_trailing_slash_and_the_vault_one_has_none() {
         assert_eq!(Audience::Arm.resource(), "https://management.azure.com/");
         assert_eq!(Audience::Vault.resource(), "https://vault.azure.net");
+        assert_eq!(
+            Audience::ContainerRegistry.resource(),
+            "https://containerregistry.azure.net",
+            "not the ARM audience: a hardened registry refuses that one"
+        );
         assert_ne!(Audience::Arm.cache_key(), Audience::Vault.cache_key());
+    }
+
+    #[test]
+    fn a_registry_token_is_cached_per_registry_and_per_scope() {
+        let catalog = Audience::Acr {
+            login_server: "acr.azurecr.io".into(),
+            scope: "registry:catalog:*".into(),
+        };
+        let repository = Audience::Acr {
+            login_server: "acr.azurecr.io".into(),
+            scope: "repository:api:metadata_read".into(),
+        };
+        let elsewhere = Audience::Acr {
+            login_server: "other.azurecr.io".into(),
+            scope: "registry:catalog:*".into(),
+        };
+        assert_ne!(catalog.cache_key(), repository.cache_key());
+        assert_ne!(catalog.cache_key(), elsewhere.cache_key());
+        assert_ne!(catalog.cache_key(), Audience::Arm.cache_key());
     }
 
     #[test]

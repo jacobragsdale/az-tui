@@ -298,6 +298,12 @@ pub struct Client {
     /// plane says it is spent. A CLI token lasts about an hour; a running TUI
     /// outlives that.
     cached: RefCell<HashMap<String, String>>,
+    /// One refresh token per registry, by login server. The exchange that
+    /// mints one costs a round trip and the token it mints is good for every
+    /// scope that registry is asked for, for about three hours.
+    refresh_tokens: RefCell<HashMap<String, String>>,
+    /// The tenant, asked for once and only when something needs it.
+    tenant: RefCell<Option<Option<String>>>,
     /// How long the last refusal asked to be left alone, until something
     /// reads it.
     throttled: Cell<Option<Duration>>,
@@ -322,6 +328,8 @@ impl Client {
             tokens,
             transport,
             cached: RefCell::new(HashMap::new()),
+            refresh_tokens: RefCell::new(HashMap::new()),
+            tenant: RefCell::new(None),
             throttled: Cell::new(None),
             sleep,
         }
@@ -334,8 +342,38 @@ impl Client {
     }
 
     /// Forgets the token for one audience, so the next call mints afresh.
+    ///
+    /// A registry's access token is minted from its refresh token, so
+    /// forgetting one has to forget the other: otherwise the retry trades a
+    /// spent refresh token for another spent access token.
     pub fn forget(&self, audience: &Audience) {
         self.cached.borrow_mut().remove(&audience.cache_key());
+        if let Audience::Acr { login_server, .. } = audience {
+            self.refresh_tokens.borrow_mut().remove(login_server);
+        }
+    }
+
+    /// The tenant the login is in, asked for at most once a run.
+    pub fn tenant(&self) -> Option<String> {
+        let mut held = self.tenant.borrow_mut();
+        held.get_or_insert_with(|| self.tokens.tenant()).clone()
+    }
+
+    /// The refresh token one registry issued, or the one it issues now.
+    pub(crate) fn registry_refresh_token(
+        &self,
+        login_server: &str,
+        mint: impl FnOnce() -> Result<String>,
+    ) -> Result<String> {
+        let held = self.refresh_tokens.borrow().get(login_server).cloned();
+        if let Some(held) = held {
+            return Ok(held);
+        }
+        let minted = mint()?;
+        self.refresh_tokens
+            .borrow_mut()
+            .insert(login_server.to_owned(), minted.clone());
+        Ok(minted)
     }
 
     /// One signed call, and the JSON it answered with.
@@ -367,13 +405,30 @@ impl Client {
         self.attempt(&request)
     }
 
+    /// This audience's token, minted on first use. Public because the
+    /// registry exchange needs a CLI token as a *value* in a form body rather
+    /// than as a header.
+    pub fn bearer(&self, audience: &Audience) -> Result<String> {
+        self.token(audience)
+    }
+
     /// This audience's token, minted on first use.
     fn token(&self, audience: &Audience) -> Result<String> {
         let key = audience.cache_key();
-        if let Some(held) = self.cached.borrow().get(&key) {
-            return Ok(held.clone());
+        // Cloned out before the mint below, which may itself reach back into
+        // this cache: a borrow held across it would panic at runtime.
+        let held = self.cached.borrow().get(&key).cloned();
+        if let Some(held) = held {
+            return Ok(held);
         }
-        let minted = self.tokens.token(audience)?;
+        // A registry does not take a CLI token: it trades one for its own.
+        let minted = match audience {
+            Audience::Acr {
+                login_server,
+                scope,
+            } => super::acr::mint(self, login_server, scope)?,
+            other => self.tokens.token(other)?,
+        };
         self.cached.borrow_mut().insert(key, minted.clone());
         Ok(minted)
     }
