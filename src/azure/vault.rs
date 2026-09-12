@@ -15,6 +15,14 @@ use super::transport::{Client, Request, api_error};
 use super::{Secret, SecretRow, SecretVersion, Vault};
 use crate::timestamp::Timestamp;
 
+/// The data-plane version every call here is asked at.
+///
+// ponytail: 7.4. Key Vault has since moved to date-based versioning and
+// `2025-07-01` is what the REST reference documents; 7.4 is no longer in the
+// spec repository but no retirement has been announced, it is the version
+// deployed everywhere including the sovereign clouds, and none of the four
+// shapes read below changed between them. Bump this one constant if a vault
+// ever refuses it — there is nothing else to change.
 const API_VERSION: &str = "7.4";
 /// The most items a listing may ask for. The service refuses more: this is
 /// its cap, not ours, and it is why a vault with 500 secrets is 20 round

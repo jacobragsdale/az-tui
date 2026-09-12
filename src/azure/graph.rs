@@ -3,26 +3,36 @@
 //! the whole reason Resource Graph exists, and it is why the first frame
 //! costs one round trip instead of dozens.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use super::auth::Audience;
-use super::transport::{Client, Request};
+use super::transport::{Client, Request, api_error};
 use super::{Inventory, Registry, Vault, allowed};
 use crate::config::Azure;
 
-const URL: &str = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01";
+/// The current stable Resource Graph version. The plan named `2021-03-01`,
+/// which still answers; this is the version the REST reference documents
+/// today and the one the `$`-prefixed option keys below are specified in.
+const URL: &str = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2024-04-01";
 
 /// The two resource types the tabs know, with the fields each needs projected
-/// under one name. `sku` sits in a different place for the two providers and
-/// `coalesce` picks whichever is there.
+/// under one name.
+///
+/// A registry keeps its SKU at the top level and a vault keeps its inside
+/// `properties`, so `coalesce` picks whichever is there — with each arm cast
+/// first, because both are `dynamic` until they are.
+///
+/// The sort names `id` as well as `name`: a skip token paging over a
+/// non-unique sort column can hand back a row twice and miss another, which
+/// is Resource Graph's own warning about paging.
 const QUERY: &str = r"resources
 | where type in~ ('microsoft.keyvault/vaults', 'microsoft.containerregistry/registries')
 | project id, name, type, subscriptionId, resourceGroup, location,
-          sku = tostring(coalesce(sku.name, properties.sku.name)),
+          sku = coalesce(tostring(sku.name), tostring(properties.sku.name)),
           loginServer = tostring(properties.loginServer),
           vaultUri = tostring(properties.vaultUri)
-| order by name asc";
+| order by name asc, id asc";
 
 const VAULT_TYPE: &str = "microsoft.keyvault/vaults";
 const REGISTRY_TYPE: &str = "microsoft.containerregistry/registries";
@@ -34,6 +44,7 @@ const PAGE: usize = 1000;
 pub fn inventory(client: &Client, azure: &Azure) -> Result<Inventory> {
     let mut inventory = Inventory::default();
     let mut skip: Option<String> = None;
+    let mut truncated = false;
     loop {
         let answer = client
             .call(
@@ -48,6 +59,12 @@ pub fn inventory(client: &Client, azure: &Azure) -> Result<Inventory> {
                 _ => {}
             }
         }
+        // A truncated answer carries no skip token, so paging cannot
+        // recover the rest; the tables would simply be short and nobody
+        // would know why.
+        if answer["resultTruncated"] == json!("true") || answer["resultTruncated"] == json!(true) {
+            truncated = true;
+        }
         let next = text(&answer["$skipToken"]);
         // A repeated token would page for ever; absent or unchanged is the
         // end of the answer either way.
@@ -57,6 +74,13 @@ pub fn inventory(client: &Client, azure: &Azure) -> Result<Inventory> {
             inventory.registries = allowed(inventory.registries, &azure.registries, |registry| {
                 registry.name.as_str()
             });
+            if truncated {
+                bail!(
+                    "Resource Graph truncated the answer at {} vaults and {} registries; name the subscriptions in config.toml to narrow it",
+                    inventory.vaults.len(),
+                    inventory.registries.len()
+                );
+            }
             return Ok(inventory);
         }
         skip = next;
@@ -68,7 +92,13 @@ pub fn inventory(client: &Client, azure: &Azure) -> Result<Inventory> {
 /// which is what an empty list means everywhere else in the configuration
 /// too. An empty *array* would mean the opposite, and answer nothing.
 fn body(azure: &Azure, skip: Option<&str>) -> Value {
-    let mut body = json!({ "query": QUERY, "options": { "$top": PAGE } });
+    // `resultFormat` is set rather than left to the default: the REST
+    // reference and the guidance page disagree about which default applies,
+    // and `objectArray` is the shape the rows are read in below.
+    let mut body = json!({
+        "query": QUERY,
+        "options": { "$top": PAGE, "resultFormat": "objectArray" },
+    });
     let named: Vec<&String> = azure
         .subscriptions
         .iter()
@@ -83,10 +113,19 @@ fn body(azure: &Azure, skip: Option<&str>) -> Value {
     body
 }
 
-/// The one refusal worth rewording: it reads as an argument error and is
-/// really "this login has nothing".
+/// The one refusal worth rewording: it reads as an argument error, or as a
+/// bare `403`, and is really "this login has nothing to look at".
+///
+/// Resource Graph answers `403` when none of the subscriptions in scope are
+/// ones the caller has rights to, and some tenants answer a `400` naming
+/// `NoValidSubscriptionsInQueryRequest` instead. Both mean the same thing and
+/// neither is worth showing raw.
 fn explain(error: anyhow::Error) -> anyhow::Error {
-    if format!("{error:#}").contains("NoValidSubscriptionsInQueryRequest") {
+    let signed_out_of_everything = api_error(&error).is_some_and(|refusal| {
+        refusal.status == 403 || refusal.has_code("NoValidSubscriptionsInQueryRequest")
+    }) || format!("{error:#}")
+        .contains("NoValidSubscriptionsInQueryRequest");
+    if signed_out_of_everything {
         return error.context("the login can see no subscriptions; run `az account list`");
     }
     error
@@ -237,6 +276,42 @@ mod tests {
         assert_eq!(names, ["kv-prod", "kv-dev"]);
         assert_eq!(inventory.registries.len(), 1);
         assert_eq!(inventory.registries[0].name, "acrprod");
+    }
+
+    #[test]
+    fn a_truncated_answer_is_said_out_loud_rather_than_shown_short() {
+        let (client, _, _) = fake_client([Answer::json(json!({
+            "data": [row("Microsoft.KeyVault/vaults", "kv-a")],
+            "resultTruncated": "true",
+        }))]);
+        let error = format!("{:#}", inventory(&client, &Azure::default()).unwrap_err());
+        assert!(error.contains("truncated"), "{error}");
+        assert!(error.contains("config.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_forbidden_answer_means_the_login_can_reach_nothing() {
+        let (client, _, _) = fake_client([Answer::status(
+            403,
+            r#"{"error":{"code":"Forbidden","message":"no rights"}}"#,
+        )]);
+        let error = format!("{:#}", inventory(&client, &Azure::default()).unwrap_err());
+        assert!(error.contains("az account list"), "{error}");
+    }
+
+    #[test]
+    fn the_query_sorts_on_a_unique_column_too_and_asks_for_object_rows() {
+        let (client, transport, _) = fake_client([Answer::json(json!({ "data": [] }))]);
+        inventory(&client, &Azure::default()).unwrap();
+        let body = sent_body(&transport.sent()[0]);
+        assert!(
+            body["query"]
+                .as_str()
+                .unwrap()
+                .contains("order by name asc, id asc"),
+            "paging over a non-unique sort column duplicates and drops rows"
+        );
+        assert_eq!(body["options"]["resultFormat"], json!("objectArray"));
     }
 
     #[test]

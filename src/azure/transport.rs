@@ -383,7 +383,7 @@ impl Client {
     fn attempt(&self, request: &Request) -> Result<Value> {
         let response = self.transport.send(request.clone())?;
         let response = if THROTTLED.contains(&response.status) {
-            let wait = retry_after(response.header("Retry-After"), OffsetDateTime::now_utc());
+            let wait = throttle_wait(&response, OffsetDateTime::now_utc());
             self.note_throttle(wait);
             (self.sleep)(wait);
             self.transport.send(request.clone())?
@@ -484,6 +484,40 @@ pub fn failure_codes(text: &str) -> Vec<String> {
     .filter_map(|value| value.as_str())
     .map(str::to_owned)
     .collect()
+}
+
+/// How long to leave a throttled answer alone.
+///
+/// ARM and a container registry say so in `Retry-After`. Resource Graph does
+/// not: it says when the quota window resets, in `x-ms-user-quota-resets-after`
+/// and as `hh:mm:ss`. Key Vault says nothing at all and the default applies.
+#[must_use]
+pub fn throttle_wait(response: &Response, now: OffsetDateTime) -> Duration {
+    if let Some(header) = response.header("Retry-After") {
+        return retry_after(Some(header), now);
+    }
+    if let Some(clock) = response
+        .header("x-ms-user-quota-resets-after")
+        .and_then(hms_seconds)
+    {
+        return retry_after(Some(&clock.to_string()), now);
+    }
+    DEFAULT_RETRY_AFTER
+}
+
+/// `hh:mm:ss` as whole seconds. Resource Graph's quota header is a duration
+/// written as a clock, which no other Azure header does.
+fn hms_seconds(raw: &str) -> Option<u64> {
+    let parts: Vec<u64> = raw
+        .trim()
+        .split(':')
+        .map(|part| part.trim().parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    match parts[..] {
+        [hours, minutes, seconds] => Some(hours * 3600 + minutes * 60 + seconds),
+        [minutes, seconds] => Some(minutes * 60 + seconds),
+        _ => None,
+    }
 }
 
 /// The wait a throttled answer asks for: `Retry-After` as whole seconds, or
@@ -770,6 +804,47 @@ mod tests {
             MIN_RETRY_AFTER,
             "a date already past is still worth a breath"
         );
+    }
+
+    #[test]
+    fn resource_graphs_quota_clock_is_read_when_there_is_no_retry_after() {
+        let now = datetime!(2026-09-11 20:00:00 UTC);
+        let response = |headers: Vec<(&str, &str)>| Response {
+            status: 429,
+            headers: headers
+                .into_iter()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect(),
+            body: String::new(),
+        };
+        assert_eq!(
+            throttle_wait(&response(vec![("Retry-After", "12")]), now),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            throttle_wait(
+                &response(vec![("x-ms-user-quota-resets-after", "00:00:04")]),
+                now
+            ),
+            Duration::from_secs(4),
+            "Resource Graph writes a clock, not a count of seconds"
+        );
+        assert_eq!(
+            throttle_wait(
+                &response(vec![("x-ms-user-quota-resets-after", "01:02:03")]),
+                now
+            ),
+            MAX_RETRY_AFTER,
+            "a clock past the cap is still capped"
+        );
+        assert_eq!(hms_seconds("01:02:03"), Some(3723));
+        assert_eq!(hms_seconds("02:30"), Some(150), "a two-part clock is mm:ss");
+        assert_eq!(
+            throttle_wait(&response(vec![]), now),
+            Duration::from_secs(30),
+            "Key Vault says nothing, so the default applies"
+        );
+        assert_eq!(hms_seconds("nope"), None);
     }
 
     #[test]
