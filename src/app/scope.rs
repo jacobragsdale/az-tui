@@ -710,6 +710,12 @@ impl ScopeScreen {
         self.pending = None;
         self.owners.clear();
         self.owner_pending = None;
+        self.look_away();
+    }
+
+    /// Leaving the tab: a value on screen goes, and one on its way is not
+    /// wanted when it lands.
+    pub fn look_away(&mut self) {
         self.revealed = None;
         self.reading_secret = None;
         self.refusal = None;
@@ -1113,12 +1119,18 @@ impl ScopeScreen {
         match &mut self.modal {
             None => None,
             Some(Modal::Confirm { verb, .. }) => {
-                let yes = matches!(
-                    (&*verb, key.code),
-                    (_, KeyCode::Enter)
-                        | (Verb::Restart(_), KeyCode::Char('x'))
-                        | (Verb::Rollout(_), KeyCode::Char('X'))
-                );
+                // With a modifier it is not the key: Ctrl-X asks nothing.
+                let plain = key
+                    .modifiers
+                    .difference(crossterm::event::KeyModifiers::SHIFT)
+                    .is_empty();
+                let yes = plain
+                    && matches!(
+                        (&*verb, key.code),
+                        (_, KeyCode::Enter)
+                            | (Verb::Restart(_), KeyCode::Char('x'))
+                            | (Verb::Rollout(_), KeyCode::Char('X'))
+                    );
                 if yes {
                     self.confirm(shell, scope)
                 } else {

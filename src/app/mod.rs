@@ -200,6 +200,15 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return AppAction::Quit;
         }
+        // Alt on a character is crossterm folding an Esc and the key that
+        // followed it out of one read: the Esc first, then the key on its own,
+        // each through the whole dispatch.
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && let KeyCode::Char(_) = key.code
+        {
+            let _ = self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            return self.handle_key(KeyEvent::new(key.code, key.modifiers - KeyModifiers::ALT));
+        }
         if self.shell.help_open {
             // The help takes every key: the one thing it can do is close.
             self.shell.help_open = false;
@@ -223,6 +232,11 @@ impl App {
         }
         if self.shell.focus == Focus::PaneSearch {
             return self.key_in_pane_search(key);
+        }
+        // Ctrl-anything is not the bare key: Ctrl-Q does not quit and Ctrl-X
+        // does not restart. The boxes above take their own Ctrl bindings.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return AppAction::None;
         }
         let pane_open = self
             .screens
@@ -604,6 +618,9 @@ impl App {
         if self.tab == tab || tab >= self.tabs.len() {
             return AppAction::None;
         }
+        if let Some(screen) = self.screens.get_mut(self.tab).and_then(Screen::scope_mut) {
+            screen.look_away();
+        }
         self.tab = tab;
         self.shell.focus = Focus::Table;
         self.on_azure_refresh();
@@ -949,10 +966,15 @@ impl App {
     pub fn tick(&mut self, now: Instant) -> Vec<AppAction> {
         let tab = self.tab;
         let mut actions = Vec::new();
+        // Every scope screen, not the open one alone: a value a hidden tab
+        // still holds runs out on the same clock.
+        for screen in self.screens.iter_mut().filter_map(Screen::scope_mut) {
+            screen.tick_reveal(now);
+        }
         {
             let store = &self.store.azure;
             match self.screens.get_mut(tab) {
-                Some(Screen::Scope(screen)) => screen.tick_reveal(now),
+                Some(Screen::Scope(_)) => {}
                 Some(Screen::Secrets(screen)) => {
                     screen.refilter(store);
                     actions.extend(screen.tick(store, now).map(AppAction::Azure));
@@ -2972,5 +2994,74 @@ pub(crate) mod tests {
                 .iter()
                 .any(|column| column.id == ColumnId::Namespace && column.visible)
         );
+    }
+
+    #[test]
+    fn a_modifier_makes_it_another_key_and_a_folded_esc_is_taken_first() {
+        let mut app = stocked();
+        // Ctrl-anything is not the bare key.
+        for letter in ['q', 'x', 'd', 'r', 's'] {
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL)),
+                AppAction::None,
+                "ctrl-{letter}"
+            );
+        }
+        assert_eq!(app.tab, 0);
+        assert!(app.screens[0].scope().unwrap().modal.is_none());
+        // Esc and 3 from one read arrive as Alt-3: the search box closes,
+        // then the tab switches.
+        app.shell.focus = Focus::Search;
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        assert_eq!(app.shell.focus, Focus::Table);
+        assert_eq!(app.tab, 2);
+        // The restart prompt takes the plain x and not Ctrl-X.
+        app.tab = 0;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.screens[0].scope().unwrap().modal.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(
+            app.screens[0].scope().unwrap().modal.is_none(),
+            "dismissed, not confirmed"
+        );
+    }
+
+    #[test]
+    fn a_revealed_value_and_a_read_on_its_way_go_with_the_tab() {
+        let mut app = stocked();
+        press(&mut app, KeyCode::Char('s'));
+        app.screens[0]
+            .scope_mut()
+            .unwrap()
+            .refilter(&app.store.scopes[0]);
+        let object = ObjectRef {
+            kind: "secret".to_owned(),
+            namespace: "dev".to_owned(),
+            name: "db".to_owned(),
+        };
+        press(&mut app, KeyCode::Char('v'));
+        app.apply_kube(Event::SecretValue {
+            scope: 0,
+            object: object.clone(),
+            key: "password".to_owned(),
+            copy: false,
+            value: Ok(Secret::new("hunter2")),
+        });
+        assert!(draw(&mut app).contains("hunter2"));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('1'));
+        assert!(!draw(&mut app).contains("hunter2"), "gone with the tab");
+        // A reply that lands after the switch is not wanted either.
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('2'));
+        app.apply_kube(Event::SecretValue {
+            scope: 0,
+            object,
+            key: "password".to_owned(),
+            copy: false,
+            value: Ok(Secret::new("hunter2")),
+        });
+        press(&mut app, KeyCode::Char('1'));
+        assert!(!draw(&mut app).contains("hunter2"), "dropped on the floor");
     }
 }
