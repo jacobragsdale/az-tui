@@ -3,15 +3,16 @@
 //!
 //! Lifted from ticket-tui, with its per-screen `ColumnId` trait collapsed into
 //! one enum. There, every screen brings its own column type and `TableLayout`
-//! is generic over it; here the three tables — secrets, repositories, and one
-//! repository's tags — share `Updated` and `Created`, and the table is handed
-//! rows that are already painted, so nothing downstream ever matches on a
-//! column type. One enum and three ordered slices of it is the whole of it:
-//! no trait, no generic parameter to thread through `TableSpec`, and one
-//! `spec()` match rather than six trait methods per screen. What a column
-//! *starts out* visible as belongs to the table and not to the column —
-//! `Created` opens hidden on secrets and shown on tags — so the slices carry
-//! that, and everything else rides on the variant.
+//! is generic over it; here every table — secrets, repositories, one
+//! repository's tags, and the four AKS lists — shares what it can (`Name`,
+//! `Updated`, `Created`), and the table is handed rows that are already
+//! painted, so nothing downstream ever matches on a column type. One enum and
+//! one ordered slice per table is the whole of it: no trait, no generic
+//! parameter to thread through `TableSpec`, and one `spec()` match rather
+//! than six trait methods per screen. What a column *starts out* visible as
+//! belongs to the table and not to the column — `Created` opens hidden on
+//! secrets and shown on tags — so the slices carry that, and everything else
+//! rides on the variant.
 
 use ratatui::layout::{Alignment, Constraint};
 
@@ -37,11 +38,14 @@ pub const MIN_COLUMN_WIDTH: u16 = 3;
 /// whatever took the room is worth less than what lost it.
 pub const MIN_FLEXIBLE_WIDTH: u16 = 24;
 
-/// Every column any of the three tables offers.
+/// Every column any table offers.
 ///
 /// The variants are shared where the columns are: a repository's tags say
 /// when they were updated in the same words, and with the same header, as a
-/// secret does.
+/// secret does, and a pod's name column is a secret's. Where two tables want
+/// the same header with a different shape — a Key Vault secret's content
+/// type at 14 cells, a kubernetes event's type pinned at 8 — they are two
+/// variants with two session keys.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ColumnId {
     // Both flat tables open with this: the environment read off the vault's
@@ -61,10 +65,29 @@ pub enum ColumnId {
     // The Registries table, showing one repository's tags.
     Tag,
     Digest,
-    // Every table says when a row last changed, and can be asked when it
-    // first appeared.
+    // Every Azure table says when a row last changed, and can be asked when
+    // it first appeared.
     Updated,
     Created,
+    // The AKS lists. Pods, and the namespace of anything on a tab over every
+    // namespace.
+    Namespace,
+    Ready,
+    Status,
+    Restarts,
+    Age,
+    Node,
+    Ip,
+    Owner,
+    Image,
+    // Events, and a kubernetes secret's type.
+    K8sType,
+    Reason,
+    Object,
+    Count,
+    Message,
+    // ConfigMaps and Secrets.
+    Keys,
 }
 
 /// What one column is: what the session file calls it, what its header says,
@@ -143,7 +166,7 @@ impl ColumnSpec {
 impl ColumnId {
     /// Every column there is, which is what a key out of the session file is
     /// resolved against.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 29] = [
         Self::Env,
         Self::Vault,
         Self::Name,
@@ -158,6 +181,21 @@ impl ColumnId {
         Self::Digest,
         Self::Updated,
         Self::Created,
+        Self::Namespace,
+        Self::Ready,
+        Self::Status,
+        Self::Restarts,
+        Self::Age,
+        Self::Node,
+        Self::Ip,
+        Self::Owner,
+        Self::Image,
+        Self::K8sType,
+        Self::Reason,
+        Self::Object,
+        Self::Count,
+        Self::Message,
+        Self::Keys,
     ];
 
     #[must_use]
@@ -181,6 +219,22 @@ impl ColumnId {
             Self::Digest => ColumnSpec::fixed("digest", "Digest", 20),
             Self::Updated => ColumnSpec::fixed("updated", "Updated", 8),
             Self::Created => ColumnSpec::fixed("created", "Created", 8),
+            Self::Namespace => ColumnSpec::fixed("ns", "Namespace", 14),
+            Self::Ready => ColumnSpec::count("ready", "Ready", 5),
+            // Wide enough for `CreateContainerConfigError` and its glyph.
+            Self::Status => ColumnSpec::pinned("status", "Status", 20),
+            Self::Restarts => ColumnSpec::count("restarts", "\u{21bb}", 3),
+            Self::Age => ColumnSpec::count("age", "Age", 5),
+            Self::Node => ColumnSpec::fixed("node", "Node", 24),
+            Self::Ip => ColumnSpec::fixed("ip", "IP", 15),
+            Self::Owner => ColumnSpec::fixed("owner", "Owner", 24),
+            Self::Image => ColumnSpec::fixed("image", "Image", 32),
+            Self::K8sType => ColumnSpec::pinned("kube_type", "Type", 8),
+            Self::Reason => ColumnSpec::pinned("reason", "Reason", 18),
+            Self::Object => ColumnSpec::pinned("object", "Object", 30),
+            Self::Count => ColumnSpec::count("count", "\u{00d7}", 4),
+            Self::Message => ColumnSpec::flexible("message", "Message", 20),
+            Self::Keys => ColumnSpec::count("keys", "Keys", 4),
         }
     }
 
@@ -269,12 +323,58 @@ pub const TAG_COLUMNS: &[ColumnConfig] = &[
     ColumnConfig::shown(ColumnId::Updated),
 ];
 
+/// The Pods table, in the order it opens with. The namespace is on the tab,
+/// so its column opens hidden and is turned on for a tab over every
+/// namespace.
+pub const POD_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Name),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Ready),
+    ColumnConfig::shown(ColumnId::Status),
+    ColumnConfig::shown(ColumnId::Restarts),
+    ColumnConfig::shown(ColumnId::Age),
+    ColumnConfig::hidden(ColumnId::Owner),
+    ColumnConfig::hidden(ColumnId::Node),
+    ColumnConfig::hidden(ColumnId::Ip),
+    ColumnConfig::hidden(ColumnId::Image),
+];
+
+/// The Events table: newest first, the message taking the room.
+pub const EVENT_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Age),
+    ColumnConfig::shown(ColumnId::K8sType),
+    ColumnConfig::shown(ColumnId::Reason),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Object),
+    ColumnConfig::shown(ColumnId::Count),
+    ColumnConfig::shown(ColumnId::Message),
+];
+
+/// The ConfigMaps table.
+pub const CONFIGMAP_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Name),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::Keys),
+    ColumnConfig::shown(ColumnId::Age),
+];
+
+/// A namespace's Secrets table — the kubernetes kind, not Key Vault's, which
+/// is [`SECRET_COLUMNS`].
+pub const K8S_SECRET_COLUMNS: &[ColumnConfig] = &[
+    ColumnConfig::shown(ColumnId::Name),
+    ColumnConfig::hidden(ColumnId::Namespace),
+    ColumnConfig::shown(ColumnId::K8sType),
+    ColumnConfig::shown(ColumnId::Keys),
+    ColumnConfig::shown(ColumnId::Age),
+];
+
 /// One table's columns as they stand: what it opened with, plus whatever the
 /// session file or the user has done to them since.
 ///
 // ponytail: nothing edits a layout in v1 — there is no Columns overlay, so
-// `visible` and `width` only ever move when step 09 restores them, which it
-// does by writing `columns` directly. An overlay would want ticket-tui's
+// `visible` and `width` only ever move when the session restores them, which
+// it does by writing `columns` directly, and when a tab over every namespace
+// turns `Namespace` on. An overlay would want ticket-tui's
 // `toggle_visible`/`move_column`/`resize` back, and they are three matches on
 // `pinned` away.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -283,12 +383,18 @@ pub struct TableLayout {
 }
 
 impl TableLayout {
-    /// A table opened at its defaults, which are one of the three slices
-    /// above.
+    /// A table opened at its defaults, which are one of the slices above.
     #[must_use]
     pub fn new(defaults: &[ColumnConfig]) -> Self {
         Self {
             columns: defaults.to_vec(),
+        }
+    }
+
+    /// Turns one column on or off, if the table has it.
+    pub fn set_visible(&mut self, id: ColumnId, visible: bool) {
+        if let Some(column) = self.columns.iter_mut().find(|column| column.id == id) {
+            column.visible = visible;
         }
     }
 
@@ -446,6 +552,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_table_too_narrow_for_anything_keeps_the_name_and_the_status() {
+        let pods = TableLayout::new(POD_COLUMNS);
+        let cramped = TableLayout::available_width(MIN_WIDTH_INNER);
+        let columns = pods.visible_columns(cramped);
+        assert_eq!(ids(&columns), vec![ColumnId::Name, ColumnId::Status]);
+        assert!(flexible_width(&columns, cramped) > 0);
+        assert_eq!(
+            ids(&pods.visible_columns(0)),
+            vec![ColumnId::Name, ColumnId::Status],
+            "a table with no room at all still says what its rows are"
+        );
+    }
+
+    #[test]
+    fn each_kinds_table_keeps_its_own_pinned_columns() {
+        let pods = TableLayout::new(POD_COLUMNS);
+        for pane in [140_u16, 110, 90, 70, 55] {
+            let available = TableLayout::available_width(pane - 2);
+            let columns = pods.visible_columns(available);
+            let visible = ids(&columns);
+            assert_eq!(visible[0], ColumnId::Name, "the pinned columns stay");
+            assert!(visible.contains(&ColumnId::Status), "{pane}: {visible:?}");
+            assert!(
+                flexible_width(&columns, available) >= MIN_FLEXIBLE_WIDTH,
+                "{pane} left the name {} wide with {visible:?}",
+                flexible_width(&columns, available)
+            );
+        }
+        assert_eq!(
+            ids(&pods.visible_columns(TableLayout::available_width(158))),
+            vec![
+                ColumnId::Name,
+                ColumnId::Ready,
+                ColumnId::Status,
+                ColumnId::Restarts,
+                ColumnId::Age,
+            ],
+            "a wide enough table keeps every column it opened with"
+        );
+
+        assert_eq!(
+            ids(&TableLayout::new(EVENT_COLUMNS).visible_columns(200)),
+            vec![
+                ColumnId::Age,
+                ColumnId::K8sType,
+                ColumnId::Reason,
+                ColumnId::Object,
+                ColumnId::Count,
+                ColumnId::Message,
+            ]
+        );
+        assert_eq!(
+            ids(&TableLayout::new(EVENT_COLUMNS).visible_columns(0)),
+            vec![
+                ColumnId::K8sType,
+                ColumnId::Reason,
+                ColumnId::Object,
+                ColumnId::Message
+            ],
+            "an event keeps what says which it is"
+        );
+        assert_eq!(
+            ids(&TableLayout::new(K8S_SECRET_COLUMNS).visible_columns(200)),
+            vec![
+                ColumnId::Name,
+                ColumnId::K8sType,
+                ColumnId::Keys,
+                ColumnId::Age
+            ]
+        );
+        assert_eq!(CONFIGMAP_COLUMNS.len(), 4);
+    }
+
     /// The smallest table the app draws at all, from `ui::MIN_WIDTH`, less
     /// its border.
     const MIN_WIDTH_INNER: u16 = crate::ui::MIN_WIDTH - 2;
@@ -507,6 +687,24 @@ mod tests {
             ],
             "and it comes back where it always was"
         );
+
+        let mut pods = TableLayout::new(POD_COLUMNS);
+        assert!(
+            !ids(&pods.visible_columns(200)).contains(&ColumnId::Namespace),
+            "nobody asked for it"
+        );
+        pods.set_visible(ColumnId::Namespace, true);
+        assert_eq!(
+            ids(&pods.visible_columns(200))[..2],
+            [ColumnId::Name, ColumnId::Namespace],
+            "and it comes back where it always was"
+        );
+        pods.set_visible(ColumnId::Vault, true);
+        assert_eq!(
+            pods.columns.len(),
+            POD_COLUMNS.len(),
+            "a column the table lacks is not added"
+        );
     }
 
     #[test]
@@ -530,9 +728,12 @@ mod tests {
             );
         }
         assert_eq!(ColumnId::from_key("state"), None, "an older build's column");
-        // The two that could have collided: the tag itself and how many of
-        // them a repository has.
+        // The three that could have collided: the tag itself and how many of
+        // them a repository has; a Key Vault secret's content type and a
+        // kubernetes event's or secret's type.
         assert_ne!(ColumnId::Tag.key(), ColumnId::Tags.key());
+        assert_ne!(ColumnId::Type.key(), ColumnId::K8sType.key());
+        assert_eq!(ColumnId::Type.label(), ColumnId::K8sType.label());
     }
 
     #[test]
