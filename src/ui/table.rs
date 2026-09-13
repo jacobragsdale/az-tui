@@ -84,7 +84,7 @@ pub struct Cell {
     pub text: String,
     pub style: Style,
     /// The characters the query matched, counted in `char`s from the start of
-    /// `text`, as `nucleo` hands them back. They are painted in
+    /// `text`, as `search::Query::indices` hands them back. They are painted in
     /// `theme().search_match` so a hit reads from across the table.
     pub matches: Vec<u32>,
 }
@@ -378,7 +378,7 @@ fn focused_block<'a>(title: impl Into<Line<'a>>, focused: bool) -> Block<'a> {
 /// in `base`.
 ///
 /// The indices are `char` positions and they arrive sorted, which is what
-/// `nucleo` produces; one pass over the string is enough, and runs of
+/// `search::Query::indices` produces; one pass over the string is enough, and runs of
 /// neighbouring characters come out as one span rather than one each.
 #[must_use]
 pub fn highlight_line(text: &str, indices: &[u32], base: Style, matched: Style) -> Line<'static> {

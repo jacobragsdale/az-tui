@@ -71,8 +71,7 @@ fn render_table(
         Level::Repositories => REPOSITORY_SCHEMA,
         Level::Tags { .. } => TAG_SCHEMA,
     };
-    let mut highlighter =
-        Query::new(&crate::filter::Query::parse(screen.input().text(), schema).words);
+    let highlighter = Query::new(&crate::filter::Query::parse(screen.input().text(), schema).words);
 
     let title = screen.title();
     let status = screen.status(store);
@@ -93,13 +92,7 @@ fn render_table(
             screen.visible()[window]
                 .iter()
                 .map(|at| {
-                    repository_cells(
-                        &store.repositories[*at],
-                        &columns,
-                        store,
-                        &mut highlighter,
-                        now,
-                    )
+                    repository_cells(&store.repositories[*at], &columns, store, &highlighter, now)
                 })
                 .collect()
         }
@@ -108,7 +101,7 @@ fn render_table(
             match screen.tags_of(store) {
                 Some(Ok(tags)) => screen.tag_visible()[window]
                     .iter()
-                    .map(|at| tag_cells(&tags[*at], &columns, &mut highlighter, now))
+                    .map(|at| tag_cells(&tags[*at], &columns, &highlighter, now))
                     .collect(),
                 // Nothing read yet, or it refused; the details pane says
                 // which, and the table is simply empty.
@@ -156,7 +149,7 @@ fn repository_cells(
     row: &crate::azure::Repository,
     columns: &[ColumnConfig],
     store: &AzureStore,
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let palette = theme();
@@ -191,7 +184,7 @@ fn repository_cells(
 fn tag_cells(
     tag: &crate::azure::Tag,
     columns: &[ColumnConfig],
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let base = Style::default();

@@ -43,7 +43,7 @@ fn row_style(pod: &Pod) -> Style {
 pub fn cells(
     pod: &Pod,
     columns: &[ColumnConfig],
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let base = row_style(pod);

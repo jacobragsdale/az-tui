@@ -11,7 +11,6 @@ repository = "https://github.com/jacobragsdale/az-tui"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-nucleo-matcher = "0.3"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

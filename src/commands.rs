@@ -124,7 +124,7 @@ pub fn secrets(
     let (rows, failed) = read_secrets(context, only, refresh)?;
     let now = Timestamp::now();
     let parsed = Query::parse(query.unwrap_or_default(), crate::app::secrets::SCHEMA);
-    let mut words = crate::search::Query::new(&parsed.words);
+    let words = crate::search::Query::new(&parsed.words);
     let shown: Vec<&SecretRow> = rows
         .iter()
         .filter(|row| {
@@ -263,7 +263,7 @@ pub fn repos(
         query.unwrap_or_default(),
         crate::app::registries::REPOSITORY_SCHEMA,
     );
-    let mut words = crate::search::Query::new(&parsed.words);
+    let words = crate::search::Query::new(&parsed.words);
     let shown: Vec<&Repository> = rows
         .iter()
         .filter(|row| {

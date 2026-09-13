@@ -423,9 +423,12 @@ pub fn render_help(
     }
     // Wrapped, and sized to what the wrapping makes of it: a refusal names
     // the role that would fix it in its second half, which a cut line lost.
+    // Counted at the width the frame will actually get: a terminal under
+    // eighty columns wraps more, and a box sized for eighty cuts the end.
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let height = u16::try_from(paragraph.line_count(WIDTH - 2) + 2).unwrap_or(u16::MAX);
-    let inner = render_modal_frame(frame, area, "Keys", WIDTH, height);
+    let width = WIDTH.min(area.width.saturating_sub(2)).max(3);
+    let height = u16::try_from(paragraph.line_count(width - 2) + 2).unwrap_or(u16::MAX);
+    let inner = render_modal_frame(frame, area, "Keys", width, height);
     shell.region(area, Target::Help);
     frame.render_widget(paragraph, inner);
 }
@@ -853,6 +856,21 @@ mod tests {
         assert!(!drawn.contains("60 seconds"), "{drawn}");
         assert!(drawn.contains("reason:"), "{drawn}");
         assert!(drawn.contains("Unable to connect"), "{drawn}");
+    }
+
+    #[test]
+    fn the_help_fits_a_narrow_terminal_and_still_reaches_the_problems() {
+        let drawn = screen(60, 40, |frame, shell| {
+            render_help(
+                frame,
+                shell,
+                Rect::new(0, 0, 60, 40),
+                Section::Secrets,
+                &["kv-prod: blocked by the vault firewall".to_owned()],
+            );
+        });
+        assert!(drawn.contains("Problems"), "{drawn}");
+        assert!(drawn.contains("vault firewall"), "{drawn}");
     }
 
     #[test]

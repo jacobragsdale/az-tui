@@ -17,7 +17,7 @@ use crate::timestamp::{Timestamp, age};
 pub fn configmap_cells(
     held: &ConfigMap,
     columns: &[ColumnConfig],
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     columns
@@ -37,7 +37,7 @@ pub fn configmap_cells(
 pub fn secret_cells(
     held: &SecretMeta,
     columns: &[ColumnConfig],
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let palette = theme();

@@ -390,7 +390,7 @@ impl SecretsScreen {
 
         let now = Timestamp::now();
         let parsed = Query::parse(self.input.text(), SCHEMA);
-        let mut words = crate::search::Query::new(&parsed.words);
+        let words = crate::search::Query::new(&parsed.words);
         self.visible = self
             .sorted
             .iter()

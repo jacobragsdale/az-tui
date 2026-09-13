@@ -26,8 +26,25 @@ pub const fn pane_width(area: Rect) -> u16 {
     area.width.saturating_sub(2)
 }
 
+/// How many rows each of `lines` takes once wrapped to `width`: what the
+/// scroll and the click regions count in, since the paragraph scrolls in
+/// rows and not in lines.
+#[must_use]
+pub fn visual_rows(lines: &[Line<'static>], width: u16) -> Vec<usize> {
+    lines
+        .iter()
+        .map(|line| {
+            Paragraph::new(vec![line.clone()])
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1)
+        })
+        .collect()
+}
+
 /// The pane itself: its frame, and `lines` scrolled inside it. Both tabs
 /// draw theirs through here, so the pane looks the same whatever it says.
+/// Answers with the rows each line took, for a caller placing regions.
 pub fn render_pane(
     frame: &mut Frame,
     shell: &mut Shell,
@@ -35,7 +52,7 @@ pub fn render_pane(
     focused: bool,
     scroll: &mut ScrollState,
     lines: Vec<Line<'static>>,
-) {
+) -> Vec<usize> {
     let palette = theme();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -50,7 +67,8 @@ pub fn render_pane(
     frame.render_widget(block, area);
     shell.region(area, Target::Details);
 
-    scroll.set_viewport(usize::from(inner.height), lines.len());
+    let rows = visual_rows(&lines, inner.width);
+    scroll.set_viewport(usize::from(inner.height), rows.iter().sum());
     let offset = u16::try_from(scroll.offset).unwrap_or(0);
     frame.render_widget(
         Paragraph::new(lines)
@@ -58,6 +76,7 @@ pub fn render_pane(
             .scroll((offset, 0)),
         inner,
     );
+    rows
 }
 
 /// One line in `muted`, for a pane with nothing to show yet.
@@ -292,5 +311,34 @@ mod tests {
             "kv-prod · secret · enabled"
         );
         assert_eq!(title("x").spans[0].style.add_modifier, Modifier::BOLD);
+    }
+
+    #[test]
+    fn a_wrapped_line_counts_its_rows_so_the_tail_can_be_reached() {
+        use crate::app::shell::Shell;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let lines: Vec<Line<'static>> = std::iter::once(Line::from("x".repeat(100)))
+            .chain((1..7).map(|n| Line::from(format!("line {n}"))))
+            .chain(std::iter::once(Line::from("LAST")))
+            .collect();
+        let mut scroll = ScrollState::default();
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
+        let mut draw = |scroll: &mut ScrollState| {
+            terminal
+                .draw(|frame| {
+                    shell.begin_frame();
+                    render_pane(frame, &mut shell, frame.area(), true, scroll, lines.clone());
+                })
+                .unwrap();
+            crate::ui::screen_text(terminal.backend().buffer())
+        };
+        draw(&mut scroll);
+        assert_eq!(scroll.content, 4 + 7, "the long line is four rows of 28");
+        scroll.scroll_to(usize::MAX);
+        let drawn = draw(&mut scroll);
+        assert!(drawn.contains("LAST"), "{drawn}");
     }
 }

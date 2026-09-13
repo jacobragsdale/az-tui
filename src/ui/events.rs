@@ -26,7 +26,7 @@ fn row_style(event: &K8sEvent) -> Style {
 pub fn cells(
     event: &K8sEvent,
     columns: &[ColumnConfig],
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let base = row_style(event);

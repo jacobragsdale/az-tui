@@ -234,7 +234,7 @@ impl RegistriesScreen {
         self.built_for = Some(key);
         let now = Timestamp::now();
         let parsed = Query::parse(self.repositories.input.text(), REPOSITORY_SCHEMA);
-        let mut words = crate::search::Query::new(&parsed.words);
+        let words = crate::search::Query::new(&parsed.words);
         self.visible = self
             .sorted
             .iter()
@@ -265,7 +265,7 @@ impl RegistriesScreen {
         self.tag_built_for = Some(key);
         let now = Timestamp::now();
         let parsed = Query::parse(self.tags.input.text(), TAG_SCHEMA);
-        let mut words = crate::search::Query::new(&parsed.words);
+        let words = crate::search::Query::new(&parsed.words);
         let mut visible: Vec<usize> = (0..tags.len())
             .filter(|at| {
                 let tag = &tags[*at];

@@ -60,8 +60,7 @@ pub fn render_table(
     let columns = screen.layout.visible_columns(available);
 
     let now = Timestamp::now();
-    let mut highlighter =
-        Query::new(&crate::filter::Query::parse(screen.input.text(), SCHEMA).words);
+    let highlighter = Query::new(&crate::filter::Query::parse(screen.input.text(), SCHEMA).words);
 
     // `window` is what records the viewport on the cursor, so a page and an
     // End know how far to move; taking a slice by hand would leave the
@@ -71,7 +70,7 @@ pub fn render_table(
     let first = window.start;
     let shown: Vec<Vec<Cell>> = screen.visible()[window]
         .iter()
-        .map(|at| row_cells(&store.secrets[*at], &columns, store, &mut highlighter, now))
+        .map(|at| row_cells(&store.secrets[*at], &columns, store, &highlighter, now))
         .collect();
 
     let hovered = None;
@@ -304,7 +303,7 @@ fn stamp_line(
 }
 
 /// The environment read off `name`, or a dash where it names none.
-pub fn env_cell(name: &str, base: Style, highlighter: &mut Query) -> Cell {
+pub fn env_cell(name: &str, base: Style, highlighter: &Query) -> Cell {
     let env = Env::of(name).map_or("\u{2014}", Env::label);
     Cell::styled(env.to_owned(), base).matched(highlighter.indices(env))
 }
@@ -314,7 +313,7 @@ fn row_cells(
     row: &SecretRow,
     columns: &[ColumnConfig],
     store: &AzureStore,
-    highlighter: &mut Query,
+    highlighter: &Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let palette = theme();

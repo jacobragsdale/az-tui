@@ -40,6 +40,18 @@ impl TextInput {
         self.cursor
     }
 
+    /// The text before the caret and the text after it, for a renderer that
+    /// draws the caret where it is rather than at the end.
+    #[must_use]
+    pub fn split_at_cursor(&self) -> (&str, &str) {
+        let at = self
+            .text
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.text.len(), |(at, _)| at);
+        self.text.split_at(at)
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()

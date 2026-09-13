@@ -34,11 +34,13 @@ pub fn render_text_pane(
     // The filter narrows what is painted, never what is held. Indices rather
     // than references, so the scroll state can move while they are held.
     let filter = screen.pane_filter.text().to_owned();
+    let (head, tail) = screen.pane_filter.split_at_cursor();
+    let (head, tail) = (head.to_owned(), tail.to_owned());
     let shown: Vec<usize> = if filter.is_empty() {
         (0..lines.len()).collect()
     } else {
         let words: Vec<String> = filter.split_whitespace().map(str::to_owned).collect();
-        let mut query = crate::search::Query::new(&words);
+        let query = crate::search::Query::new(&words);
         (0..lines.len())
             .filter(|at| query.matches(&lines[*at]))
             .collect()
@@ -62,7 +64,7 @@ pub fn render_text_pane(
             ""
         };
         block = block.title_bottom(
-            Line::from(format!(" / {filter}{caret} · {}/{total} ", shown.len())).style(
+            Line::from(format!(" / {head}{caret}{tail} · {}/{total} ", shown.len())).style(
                 Style::default().fg(if shell.focus == Focus::PaneSearch {
                     palette.accent
                 } else {

@@ -44,7 +44,10 @@ pub fn render_modal(frame: &mut Frame, shell: &mut Shell, modal: &Modal, area: R
                 Line::from(vec![
                     Span::styled("Replicas  ", Style::default().fg(palette.muted)),
                     Span::styled(
-                        format!("[ {}\u{258f}]", input.text()),
+                        {
+                            let (head, tail) = input.split_at_cursor();
+                            format!("[ {head}\u{258f}{tail}]")
+                        },
                         Style::default()
                             .fg(palette.text)
                             .add_modifier(Modifier::BOLD),
@@ -107,4 +110,41 @@ pub fn render_modal(frame: &mut Frame, shell: &mut Shell, modal: &Modal, area: R
         Paragraph::new(Span::styled(hint, Style::default().fg(palette.muted))),
         keys,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kube::ObjectRef;
+    use crate::text_input::TextInput;
+    use crate::ui::screen_text;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn the_scale_field_draws_the_caret_where_it_is() {
+        let mut input = TextInput::new("12");
+        input.move_left();
+        input.insert_char('3');
+        assert_eq!(input.text(), "132");
+        let modal = Modal::Scale {
+            object: ObjectRef {
+                kind: "deployment".into(),
+                namespace: "dev".into(),
+                name: "orders".into(),
+            },
+            input,
+            current: None,
+        };
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_modal(frame, &mut shell, &modal, frame.area());
+            })
+            .unwrap();
+        let drawn = screen_text(terminal.backend().buffer());
+        assert!(drawn.contains("[ 13\u{258f}2]"), "{drawn}");
+    }
 }

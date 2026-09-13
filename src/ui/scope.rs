@@ -71,7 +71,7 @@ fn render_table(
         Kind::ConfigMaps => ConfigMap::SCHEMA,
         Kind::Secrets => SecretMeta::SCHEMA,
     };
-    let mut highlighter = Query::new(&crate::filter::Query::parse(list.input.text(), schema).words);
+    let highlighter = Query::new(&crate::filter::Query::parse(list.input.text(), schema).words);
 
     // `window` is what records the viewport on the cursor, so a page and an
     // End know how far to move.
@@ -81,13 +81,13 @@ fn render_table(
     let shown: Vec<Vec<Cell>> = list.visible()[window]
         .iter()
         .map(|at| match kind {
-            Kind::Pods => pods::cells(&data.pods.rows[*at], &columns, &mut highlighter, now),
-            Kind::Events => events::cells(&data.events.rows[*at], &columns, &mut highlighter, now),
+            Kind::Pods => pods::cells(&data.pods.rows[*at], &columns, &highlighter, now),
+            Kind::Events => events::cells(&data.events.rows[*at], &columns, &highlighter, now),
             Kind::ConfigMaps => {
-                config::configmap_cells(&data.configmaps.rows[*at], &columns, &mut highlighter, now)
+                config::configmap_cells(&data.configmaps.rows[*at], &columns, &highlighter, now)
             }
             Kind::Secrets => {
-                config::secret_cells(&data.secrets.rows[*at], &columns, &mut highlighter, now)
+                config::secret_cells(&data.secrets.rows[*at], &columns, &highlighter, now)
             }
         })
         .collect();
@@ -225,8 +225,7 @@ fn render_details(
     }
 
     if !screen.pane_open {
-        let count = lines.len();
-        render_pane(
+        let rows = render_pane(
             frame,
             shell,
             area,
@@ -234,7 +233,7 @@ fn render_details(
             &mut screen.details_scroll,
             lines,
         );
-        register_regions(shell, area, screen, have_row, key_rows, count);
+        register_regions(shell, area, screen, have_row, key_rows, &rows);
         return;
     }
     // The details take what they need up to just under half; the pane
@@ -244,7 +243,7 @@ fn render_details(
     let top = wanted.min(area.height * 45 / 100).max(5.min(area.height));
     let [details, pane] =
         Layout::vertical([Constraint::Length(top), Constraint::Min(4)]).areas(area);
-    render_pane(
+    let rows = render_pane(
         frame,
         shell,
         details,
@@ -252,21 +251,22 @@ fn render_details(
         &mut screen.details_scroll,
         lines,
     );
-    register_regions(shell, details, screen, have_row, key_rows, count);
+    register_regions(shell, details, screen, have_row, key_rows, &rows);
     render_text_pane(frame, shell, screen, data, pane);
 }
 
 /// The toolbar's buttons and the key rows, as regions: each button stands
-/// for the key it names; each key row puts the details cursor on it. Lines
-/// are counted from the top of the pane less its scroll, so a wrapped line
-/// above would put a region a row off — the lines above them are short.
+/// for the key it names; each key row puts the details cursor on it. Each
+/// line is placed at the row it starts on once the lines above have
+/// wrapped, less the scroll, so a long name above the keys does not put
+/// every region a row off.
 fn register_regions(
     shell: &mut Shell,
     area: Rect,
     screen: &ScopeScreen,
     have_row: bool,
     key_rows: Option<usize>,
-    line_count: usize,
+    rows: &[usize],
 ) {
     if !have_row || area.height < 3 {
         return;
@@ -278,8 +278,16 @@ fn register_regions(
         area.height.saturating_sub(2),
     );
     let offset = screen.details_scroll.offset;
+    let starts: Vec<usize> = rows
+        .iter()
+        .scan(0, |start, height| {
+            let here = *start;
+            *start += height;
+            Some(here)
+        })
+        .collect();
     let row_of = |line: usize| -> Option<u16> {
-        let visible = line.checked_sub(offset)?;
+        let visible = starts.get(line)?.checked_sub(offset)?;
         let y = inner.y.saturating_add(u16::try_from(visible).ok()?);
         (y < inner.bottom()).then_some(y)
     };
@@ -294,7 +302,7 @@ fn register_regions(
         }
     }
     if let Some(first) = key_rows {
-        for at in 0..line_count.saturating_sub(first) {
+        for at in 0..rows.len().saturating_sub(first) {
             if let Some(y) = row_of(first + at) {
                 shell.region(Rect::new(inner.x, y, inner.width, 1), Target::KeyRow(at));
             }
@@ -544,5 +552,31 @@ mod tests {
             "the table gets the room: {drawn}"
         );
         assert!(drawn.contains("orders-api"), "{drawn}");
+    }
+
+    #[test]
+    fn a_key_row_under_a_name_that_wraps_is_where_the_key_is_drawn() {
+        let mut data = data();
+        let long = format!("sh.helm.release.v1.{}.v3", "orders-".repeat(12));
+        data.configmaps.rows = vec![
+            ConfigMap::from_json(&serde_json::json!({
+                "metadata": {"name": long, "namespace": "dev"},
+                "data": {"LOG_LEVEL": "info"}
+            }))
+            .unwrap(),
+        ];
+        let mut screen = ScopeScreen::new(false);
+        screen.set_kind(Kind::ConfigMaps);
+        let (drawn, shell, buffer) = draw(120, 24, &mut screen, &data);
+        let key_line = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("› LOG_LEVEL")
+            })
+            .unwrap_or_else(|| panic!("the key row: {drawn}"));
+        let region = shell.find(&Target::KeyRow(0)).expect("a key row region");
+        assert_eq!(region.y, key_line, "{drawn}");
     }
 }

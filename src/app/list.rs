@@ -331,7 +331,7 @@ impl ListState {
         self.built_for = Some(key);
 
         let parsed = Query::parse(self.input.text(), T::SCHEMA);
-        let mut words = crate::search::Query::new(&parsed.words);
+        let words = crate::search::Query::new(&parsed.words);
         self.visible = self
             .sorted
             .iter()
