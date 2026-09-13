@@ -40,6 +40,9 @@ pub enum Request {
         vault: String,
         name: String,
         version: Option<String>,
+        /// `y` asked, so the answer is for the clipboard. Echoed back on the
+        /// event so the screen routes each answer by what asked for it.
+        copy: bool,
     },
     Tags {
         registry: String,
@@ -84,6 +87,7 @@ pub enum Event {
     Value {
         vault: String,
         name: String,
+        copy: bool,
         result: Result<(Secret, String), String>,
     },
     Tags {
@@ -463,6 +467,7 @@ impl Loop {
                 vault: name,
                 name: secret,
                 version,
+                copy,
             } => {
                 let result = self.with_vault(&name, |client, vault| {
                     vault::value(client, vault, &secret, version.as_deref())
@@ -470,6 +475,7 @@ impl Loop {
                 self.send(Event::Value {
                     vault: name,
                     name: secret,
+                    copy,
                     result,
                 });
             }
@@ -767,6 +773,7 @@ mod tests {
                     vault: "kv-a".to_owned(),
                     name: "one".to_owned(),
                     version: None,
+                    copy: false,
                 });
             }
         });
@@ -843,6 +850,7 @@ mod tests {
             vault: "kv-a".into(),
             name: "one".into(),
             version: None,
+            copy: false,
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let message = loop {
@@ -882,6 +890,7 @@ mod tests {
             vault: "kv-a".into(),
             name: "one".into(),
             version: None,
+            copy: false,
         });
         let mut seen = Vec::new();
         pump_until(&worker, &mut seen, "value(one)");

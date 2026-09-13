@@ -133,7 +133,8 @@ pub struct App {
     following: Option<LogFollow>,
     /// Where the cursor is on a scope tab and when it got there, for the
     /// rest interval that gates the owner read.
-    rested: Option<(usize, usize, Instant)>,
+    /// The pod the cursor is on, by tab and identity, and when it got there.
+    rested: Option<(usize, String, Instant)>,
 }
 
 impl App {
@@ -792,9 +793,20 @@ impl App {
                     screen.keep_cursor(&self.store.azure, registries_was);
                 }
             }
+            azure::Applied::Inventory => {
+                if let Some(screen) = self.screens.iter_mut().find_map(Screen::secrets_mut) {
+                    screen.invalidate();
+                    screen.keep_cursor(&self.store.azure, secrets_was);
+                }
+                if let Some(screen) = self.screens.iter_mut().find_map(Screen::registries_mut) {
+                    screen.invalidate();
+                    screen.keep_cursor(&self.store.azure, registries_was);
+                }
+            }
             azure::Applied::Value {
                 vault,
                 name,
+                copy,
                 result,
             } => {
                 let shell = &mut self.shell;
@@ -804,7 +816,13 @@ impl App {
                     .iter_mut()
                     .find_map(Screen::secrets_mut)
                     .map_or(AppAction::None, |screen| {
-                        screen.on_value(shell, store, &vault, &name, result, now)
+                        screen.on_value(
+                            shell,
+                            store,
+                            secrets::Reading { vault, name, copy },
+                            result,
+                            now,
+                        )
                     });
             }
             // A repository's tags re-read with the same count would otherwise
@@ -1009,10 +1027,12 @@ impl App {
             .screens
             .get(tab)
             .and_then(Screen::scope)
-            .map(|screen| (tab, screen.list().cursor.index));
-        match (self.rested, here) {
-            (Some((t, c, since)), Some(here)) if (t, c) == here => {
-                if now.saturating_duration_since(since) >= REST
+            .zip(self.store.scopes.get(tab))
+            .and_then(|(screen, data)| screen.selected_name(data))
+            .map(|name| (tab, name));
+        match (&self.rested, here) {
+            (Some((t, c, since)), Some((tab_now, name))) if (*t, c) == (tab_now, &name) => {
+                if now.saturating_duration_since(*since) >= REST
                     && let Some((_, screen, data, _)) = self.scope_parts()
                     && let Some(request) = screen.owner_request(tab, data)
                 {
@@ -1030,6 +1050,7 @@ impl App {
     #[must_use]
     pub fn is_resting(&self) -> bool {
         self.rested
+            .as_ref()
             .is_some_and(|(_, _, since)| since.elapsed() < REST)
     }
 
@@ -3063,5 +3084,57 @@ pub(crate) mod tests {
         });
         press(&mut app, KeyCode::Char('1'));
         assert!(!draw(&mut app).contains("hunter2"), "dropped on the floor");
+    }
+
+    #[test]
+    fn an_inventory_that_drops_a_registry_keeps_the_registries_cursor_by_identity() {
+        use crate::azure::{Inventory, Registry, Repository};
+        use crate::timestamp::ts;
+        let registry = |name: &str| Registry {
+            id: format!("/registries/{name}"),
+            name: name.to_owned(),
+            resource_group: "rg".into(),
+            location: "eastus".into(),
+            login_server: format!("{name}.azurecr.io"),
+        };
+        let mut app = azure_only_with(crate::app::registries::tests::stocked());
+        app.tab = 1;
+        // A newer repository in the other registry sorts above payments-api.
+        app.apply_azure(
+            worker::Event::Repositories {
+                registry: "acrdev".into(),
+                result: Ok(vec![Repository {
+                    registry: "acrdev".into(),
+                    name: "scratch".into(),
+                    tag_count: Some(1),
+                    manifest_count: Some(1),
+                    created: None,
+                    updated: Some(ts("2026-09-12T18:00:00Z")),
+                }]),
+            },
+            Instant::now(),
+        );
+        let screen = app.screens[1].registries_mut().unwrap();
+        screen.refilter(&app.store.azure);
+        screen.repositories.cursor.focus(1);
+        assert_eq!(
+            registries(&app, 1)
+                .selected_repository(&app.store.azure)
+                .unwrap()
+                .name,
+            "payments-api"
+        );
+        app.apply_azure(
+            worker::Event::Inventory(Ok(Inventory {
+                vaults: Vec::new(),
+                registries: vec![registry("acrprod")],
+            })),
+            Instant::now(),
+        );
+        let selected = registries(&app, 1)
+            .selected_repository(&app.store.azure)
+            .unwrap();
+        assert_eq!(selected.name, "payments-api", "the row, not the index");
+        assert_eq!(registries(&app, 1).repositories.cursor.index, 0);
     }
 }

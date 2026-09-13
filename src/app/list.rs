@@ -7,6 +7,7 @@
 use std::cmp::Ordering;
 
 use super::cursor::ListCursor;
+use super::flip;
 use crate::columns::{ColumnId, TableLayout, columns_for};
 use crate::filter::{self, Query};
 use crate::kube::{ConfigMap, K8sEvent, Kind, Pod, SecretMeta};
@@ -27,7 +28,9 @@ pub trait Row {
     /// the haystack's job.
     fn passes(&self, query: &Query) -> bool;
     /// This row against another by one column, before the name breaks ties.
-    fn compare(&self, other: &Self, by: ColumnId) -> Ordering;
+    /// The column's order, turned when `descending`. A row with nothing in
+    /// the column sorts last whichever way it is turned.
+    fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering;
     /// What tells this row from every other, for putting the cursor back
     /// after a read.
     fn identity(&self) -> String;
@@ -42,9 +45,9 @@ pub fn cmp_ignore_ascii_case(left: &str, right: &str) -> Ordering {
 
 /// Newest first: a later stamp sorts before an earlier one, and a missing
 /// one last whichever way the column is turned.
-fn newest_first(left: Option<Timestamp>, right: Option<Timestamp>) -> Ordering {
+fn newest_first(left: Option<Timestamp>, right: Option<Timestamp>, descending: bool) -> Ordering {
     match (left, right) {
-        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(left), Some(right)) => flip(right.cmp(&left), descending),
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (None, None) => Ordering::Equal,
@@ -85,16 +88,18 @@ impl Row for Pod {
         })
     }
 
-    fn compare(&self, other: &Self, by: ColumnId) -> Ordering {
+    fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
+        if by == ColumnId::Age {
+            return newest_first(self.created, other.created, descending);
+        }
         let text = |left: &str, right: &str| cmp_ignore_ascii_case(left, right);
-        match by {
+        let ordering = match by {
             ColumnId::Namespace => text(&self.key.namespace, &other.key.namespace),
             // How much of a pod is up first, then how big it is: `0/1` before
             // `1/2` before `2/2`.
             ColumnId::Ready => self.ready.cmp(&other.ready),
             ColumnId::Status => text(&self.status, &other.status),
             ColumnId::Restarts => self.restarts.cmp(&other.restarts),
-            ColumnId::Age => newest_first(self.created, other.created),
             ColumnId::Node => text(&self.node, &other.node),
             ColumnId::Ip => text(&self.ip, &other.ip),
             ColumnId::Owner => text(self.owner_name(), other.owner_name()),
@@ -103,7 +108,8 @@ impl Row for Pod {
                 other.containers.first().map_or("", |c| c.image.as_str()),
             ),
             _ => Ordering::Equal,
-        }
+        };
+        flip(ordering, descending)
     }
 
     fn identity(&self) -> String {
@@ -138,17 +144,20 @@ impl Row for K8sEvent {
         })
     }
 
-    fn compare(&self, other: &Self, by: ColumnId) -> Ordering {
+    fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
+        if by == ColumnId::Age {
+            return newest_first(self.last, other.last, descending);
+        }
         let text = |left: &str, right: &str| cmp_ignore_ascii_case(left, right);
-        match by {
-            ColumnId::Age => newest_first(self.last, other.last),
+        let ordering = match by {
             ColumnId::K8sType => text(&self.kind, &other.kind),
             ColumnId::Reason => text(&self.reason, &other.reason),
             ColumnId::Object => text(&self.object.name, &other.object.name),
             ColumnId::Count => other.count.cmp(&self.count),
             ColumnId::Message => text(&self.message, &other.message),
             _ => Ordering::Equal,
-        }
+        };
+        flip(ordering, descending)
     }
 
     fn identity(&self) -> String {
@@ -181,13 +190,16 @@ impl Row for ConfigMap {
         })
     }
 
-    fn compare(&self, other: &Self, by: ColumnId) -> Ordering {
-        match by {
+    fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
+        if by == ColumnId::Age {
+            return newest_first(self.created, other.created, descending);
+        }
+        let ordering = match by {
             ColumnId::Namespace => cmp_ignore_ascii_case(&self.namespace, &other.namespace),
             ColumnId::Keys => other.data.len().cmp(&self.data.len()),
-            ColumnId::Age => newest_first(self.created, other.created),
             _ => Ordering::Equal,
-        }
+        };
+        flip(ordering, descending)
     }
 
     fn identity(&self) -> String {
@@ -221,14 +233,17 @@ impl Row for SecretMeta {
         })
     }
 
-    fn compare(&self, other: &Self, by: ColumnId) -> Ordering {
-        match by {
+    fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
+        if by == ColumnId::Age {
+            return newest_first(self.created, other.created, descending);
+        }
+        let ordering = match by {
             ColumnId::Namespace => cmp_ignore_ascii_case(&self.namespace, &other.namespace),
             ColumnId::K8sType => cmp_ignore_ascii_case(&self.kind, &other.kind),
             ColumnId::Keys => other.keys.len().cmp(&self.keys.len()),
-            ColumnId::Age => newest_first(self.created, other.created),
             _ => Ordering::Equal,
-        }
+        };
+        flip(ordering, descending)
     }
 
     fn identity(&self) -> String {
@@ -335,12 +350,7 @@ impl ListState {
         self.sorted = (0..rows.len()).collect();
         let (by, descending) = (self.sort, self.descending);
         self.sorted.sort_by(|a, b| {
-            let ordering = rows[*a].compare(&rows[*b], by);
-            let ordering = if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
+            let ordering = rows[*a].compare(&rows[*b], by, descending);
             ordering.then_with(|| cmp_ignore_ascii_case(&rows[*a].identity(), &rows[*b].identity()))
         });
     }
@@ -657,5 +667,34 @@ mod tests {
         list.sort_by(ColumnId::Keys, ColumnId::Name);
         list.refilter(&maps);
         assert_eq!(list.visible(), [1, 0], "the most keys first");
+    }
+
+    #[test]
+    fn an_event_with_no_stamp_sorts_last_whichever_way_age_is_turned() {
+        let stamped = K8sEvent::from_json(&serde_json::json!({
+            "metadata": {"name": "a", "namespace": "dev"},
+            "lastTimestamp": "2026-09-12T10:00:00Z", "type": "Normal", "reason": "Pulled",
+            "involvedObject": {"kind": "Pod", "name": "p1"}, "message": "pulled"
+        }))
+        .unwrap();
+        let unstamped = K8sEvent::from_json(&serde_json::json!({
+            "metadata": {"name": "z", "namespace": "dev"},
+            "type": "Normal", "reason": "Pulled",
+            "involvedObject": {"kind": "Pod", "name": "p2"}, "message": "no stamp at all"
+        }))
+        .unwrap();
+        assert!(unstamped.last.is_none());
+        let rows = vec![unstamped, stamped];
+        let mut list = ListState::new(Kind::Events, K8sEvent::DEFAULT_SORT);
+        list.refilter(&rows);
+        assert_eq!(list.visible(), [1, 0], "newest first, the unstamped last");
+        list.sort_by(ColumnId::Age, ColumnId::Age);
+        assert!(list.descending);
+        list.refilter(&rows);
+        assert_eq!(
+            list.visible(),
+            [1, 0],
+            "turned round, the unstamped is still last"
+        );
     }
 }

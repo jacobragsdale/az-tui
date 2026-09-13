@@ -25,14 +25,18 @@ pub enum Applied {
     Secrets,
     /// The rows of the Registries table moved.
     Repositories,
+    /// The inventory arrived: both tables may have lost rows.
+    Inventory,
     /// Something the details pane shows arrived.
     Detail,
     /// The status bar changed and nothing else.
     Status,
-    /// A value, on its way to the one screen that asked for it.
+    /// A value, on its way to the one screen that asked for it, and whether
+    /// `y` asked, so it goes to the clipboard rather than the screen.
     Value {
         vault: String,
         name: String,
+        copy: bool,
         result: Result<(Secret, String), String>,
     },
 }
@@ -163,7 +167,7 @@ impl AzureStore {
                     vaults.contains(name.as_str()) || registries.contains(name.as_str())
                 });
                 self.inventory = inventory;
-                Applied::Secrets
+                Applied::Inventory
             }
             Event::Inventory(Err(message)) => {
                 self.refreshing = false;
@@ -245,10 +249,12 @@ impl AzureStore {
             Event::Value {
                 vault,
                 name,
+                copy,
                 result,
             } => Applied::Value {
                 vault,
                 name,
+                copy,
                 result,
             },
             Event::Tags {
@@ -271,7 +277,10 @@ impl AzureStore {
             Event::Idle => {
                 self.refreshing = false;
                 self.progress = None;
-                if self.read_something {
+                // A vault or registry that would not answer leaves its old
+                // rows standing, and a stamp saying "just now" over them
+                // would have the shell trust the cache for rows nobody read.
+                if self.read_something && self.stale.is_empty() {
                     self.read_at = Some(Timestamp::now());
                 }
                 Applied::Status
@@ -486,6 +495,7 @@ mod tests {
         let applied = store.apply(Event::Value {
             vault: "kv-a".into(),
             name: "one".into(),
+            copy: false,
             result: Ok((Secret::new("hunter2"), "v1".into())),
         });
         match applied {
@@ -635,5 +645,44 @@ mod tests {
         store.apply(Event::Inventory(Err("not signed in".into())));
         store.apply(Event::Idle);
         assert_eq!(store.read_at, Some(first));
+    }
+
+    #[test]
+    fn a_vault_that_would_not_answer_leaves_the_stamp_where_it_was() {
+        let mut store = stocked();
+        store.apply(Event::Idle);
+        let first = store.read_at.expect("a read");
+        let inventory = || {
+            Event::Inventory(Ok(Inventory {
+                vaults: vec![vault("kv-a"), vault("kv-b")],
+                registries: vec![registry("acra")],
+            }))
+        };
+        store.apply(inventory());
+        store.apply(Event::Secrets {
+            vault: "kv-a".into(),
+            result: Ok(vec![secret("kv-a", "one")]),
+        });
+        store.apply(Event::Secrets {
+            vault: "kv-b".into(),
+            result: Err("kv-b: firewall".into()),
+        });
+        store.apply(Event::Idle);
+        assert_eq!(store.read_at, Some(first), "kv-b's rows are the old read's");
+        assert!(store.stale.contains("kv-b"));
+
+        // The refresh after it answers is the one that moves the stamp.
+        store.apply(inventory());
+        store.apply(Event::Secrets {
+            vault: "kv-a".into(),
+            result: Ok(vec![secret("kv-a", "one")]),
+        });
+        store.apply(Event::Secrets {
+            vault: "kv-b".into(),
+            result: Ok(vec![secret("kv-b", "three")]),
+        });
+        store.apply(Event::Idle);
+        assert!(store.stale.is_empty());
+        assert!(store.read_at >= Some(first));
     }
 }

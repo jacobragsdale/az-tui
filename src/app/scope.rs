@@ -188,10 +188,10 @@ pub struct ScopeScreen {
     // ── Secrets ────────────────────────────────────────────────────────
     /// The one place a value lives. See [`Revealed`].
     revealed: Option<Revealed>,
-    /// A value request out and not yet back: the object, the key, and
+    /// The value requests out and not yet back: the object, the key, and
     /// whether `y` sent it, so the answer goes to the clipboard rather than
-    /// the screen.
-    reading_secret: Option<(ObjectRef, String, bool)>,
+    /// the screen. `y` and `v` on the same key can both be waiting.
+    reading_secret: Vec<(ObjectRef, String, bool)>,
     /// What the cluster said when it would not hand one over. Cleared when
     /// the cursor moves.
     refusal: Option<String>,
@@ -236,7 +236,7 @@ impl ScopeScreen {
             owners: HashMap::new(),
             owner_pending: None,
             revealed: None,
-            reading_secret: None,
+            reading_secret: Vec::new(),
             refusal: None,
         }
     }
@@ -717,7 +717,7 @@ impl ScopeScreen {
     /// wanted when it lands.
     pub fn look_away(&mut self) {
         self.revealed = None;
-        self.reading_secret = None;
+        self.reading_secret.clear();
         self.refusal = None;
     }
 
@@ -743,7 +743,8 @@ impl ScopeScreen {
             return None;
         }
         self.refusal = None;
-        self.reading_secret = Some((object.clone(), key.clone(), false));
+        self.reading_secret
+            .push((object.clone(), key.clone(), false));
         Some(Request::SecretValue {
             scope,
             object,
@@ -787,7 +788,8 @@ impl ScopeScreen {
                     };
                 }
                 self.refusal = None;
-                self.reading_secret = Some((object.clone(), key.clone(), true));
+                self.reading_secret
+                    .push((object.clone(), key.clone(), true));
                 shell.set_status(format!("Reading {key}\u{2026}"));
                 AppAction::Kube(Request::SecretValue {
                     scope,
@@ -813,14 +815,16 @@ impl ScopeScreen {
         value: Result<Secret, String>,
     ) -> AppAction {
         let now = Instant::now();
-        let asked = self
+        let Some(at) = self
             .reading_secret
-            .as_ref()
-            .is_some_and(|(held, held_key, _)| *held == object && *held_key == key);
-        if !asked {
+            .iter()
+            .position(|(held, held_key, held_copy)| {
+                *held == object && *held_key == key && *held_copy == copy
+            })
+        else {
             return AppAction::None;
-        }
-        self.reading_secret = None;
+        };
+        self.reading_secret.remove(at);
         let still_here = self.kind == Kind::Secrets
             && self.selected_object(data).as_ref() == Some(&object)
             && self.selected_key(data).as_deref() == Some(key.as_str());
@@ -871,9 +875,9 @@ impl ScopeScreen {
         let Some(object) = self.selected_object(data) else {
             return false;
         };
-        self.reading_secret.as_ref().is_some_and(|(held, key, _)| {
-            *held == object && Some(key) == self.selected_key(data).as_ref()
-        })
+        self.reading_secret
+            .iter()
+            .any(|(held, key, _)| *held == object && Some(key) == self.selected_key(data).as_ref())
     }
 
     #[must_use]
@@ -925,7 +929,7 @@ impl ScopeScreen {
     /// down or being waited for.
     #[must_use]
     pub const fn is_ticking(&self) -> bool {
-        self.revealed.is_some() || self.reading_secret.is_some()
+        self.revealed.is_some() || !self.reading_secret.is_empty()
     }
 
     /// The `kubectl` line that does by hand what the pane shows: what `Y`

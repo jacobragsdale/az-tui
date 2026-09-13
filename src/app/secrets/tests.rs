@@ -422,8 +422,11 @@ fn v_asks_once_shows_the_value_and_lets_it_go_at_sixty_seconds() {
     screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: false,
+        },
         value("api-key"),
         clock,
     );
@@ -453,8 +456,11 @@ fn v_again_hides_it_and_so_does_moving_r_and_a_tab_switch() {
         screen.on_value(
             shell,
             &store,
-            "kv-dev",
-            "api-key",
+            Reading {
+                vault: "kv-dev".into(),
+                name: "api-key".into(),
+                copy: false,
+            },
             value("api-key"),
             Instant::now(),
         );
@@ -486,8 +492,11 @@ fn a_value_for_a_row_the_cursor_has_left_is_dropped_on_the_floor() {
     screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: false,
+        },
         value("api-key"),
         Instant::now(),
     );
@@ -506,8 +515,11 @@ fn y_without_a_reveal_asks_and_copies_on_arrival_and_with_one_copies_at_once() {
     let action = screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: true,
+        },
         value("api-key"),
         Instant::now(),
     );
@@ -529,8 +541,11 @@ fn y_without_a_reveal_asks_and_copies_on_arrival_and_with_one_copies_at_once() {
     screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: false,
+        },
         value("api-key"),
         Instant::now(),
     );
@@ -548,8 +563,11 @@ fn a_refusal_shows_under_value_and_goes_when_the_cursor_does() {
     screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: false,
+        },
         Err("kv-dev: no permission to read secrets".to_owned()),
         Instant::now(),
     );
@@ -613,8 +631,11 @@ fn the_debug_of_the_whole_screen_never_contains_a_value() {
     screen.on_value(
         &mut shell,
         &store,
-        "kv-dev",
-        "api-key",
+        Reading {
+            vault: "kv-dev".into(),
+            name: "api-key".into(),
+            copy: false,
+        },
         Ok((Secret::new("hunter2"), "v1".to_owned())),
         Instant::now(),
     );
@@ -684,16 +705,22 @@ fn an_answer_for_a_row_the_cursor_left_does_not_cancel_the_ask_on_the_new_one() 
     screen.on_value(
         &mut shell,
         &store,
-        &first.vault,
-        &first.name,
+        Reading {
+            vault: first.vault.clone(),
+            name: first.name.clone(),
+            copy: false,
+        },
         Ok((Secret::new("a"), "v1".into())),
         Instant::now(),
     );
     screen.on_value(
         &mut shell,
         &store,
-        &second.vault,
-        &second.name,
+        Reading {
+            vault: second.vault.clone(),
+            name: second.name.clone(),
+            copy: false,
+        },
         Ok((Secret::new("b"), "v2".into())),
         Instant::now(),
     );
@@ -714,8 +741,11 @@ fn a_click_on_another_row_takes_a_revealed_value_off_the_screen() {
     screen.on_value(
         &mut shell,
         &store,
-        &row.vault,
-        &row.name,
+        Reading {
+            vault: row.vault.clone(),
+            name: row.name.clone(),
+            copy: false,
+        },
         Ok((Secret::new("x"), "v".into())),
         Instant::now(),
     );
@@ -794,4 +824,69 @@ fn capital_s_walks_the_columns_and_capital_r_turns_the_sort_over() {
         before.first(),
         "the rows turned over"
     );
+}
+
+#[test]
+fn y_then_v_before_the_answer_copies_and_then_shows() {
+    let store = stocked();
+    let mut screen = SecretsScreen::default();
+    let mut shell = Shell::default();
+    screen.refilter(&store);
+    let row = screen.selected(&store).unwrap().clone();
+    press(&mut screen, &mut shell, &store, 'y');
+    press(&mut screen, &mut shell, &store, 'v');
+    assert!(screen.is_reading(&row));
+    let first = screen.on_value(
+        &mut shell,
+        &store,
+        Reading {
+            vault: row.vault.clone(),
+            name: row.name.clone(),
+            copy: true,
+        },
+        value(&row.name),
+        Instant::now(),
+    );
+    assert!(matches!(first, AppAction::Copy { .. }), "{first:?}");
+    assert!(
+        screen.revealed_here(&row).is_none(),
+        "the y did not show it"
+    );
+    assert!(screen.is_reading(&row), "the v is still out");
+    let second = screen.on_value(
+        &mut shell,
+        &store,
+        Reading {
+            vault: row.vault.clone(),
+            name: row.name.clone(),
+            copy: false,
+        },
+        value(&row.name),
+        Instant::now(),
+    );
+    assert_eq!(second, AppAction::None);
+    assert!(screen.revealed_here(&row).is_some(), "and the v showed it");
+}
+
+#[test]
+fn a_keystroke_in_the_search_box_is_not_the_cursor_resting_on_the_row_it_lands_on() {
+    let store = stocked();
+    let mut screen = SecretsScreen::default();
+    screen.refilter(&store);
+    let clock = Instant::now();
+    assert_eq!(screen.selected(&store).unwrap().name, "api-key");
+    assert!(screen.tick(&store, clock).is_none(), "just landed");
+    assert!(
+        matches!(screen.tick(&store, clock + REST), Some(crate::worker::Request::Versions { name, .. }) if name == "api-key"),
+        "rested"
+    );
+    // The query puts another row under the same index.
+    screen.input.set_text("db-pass");
+    screen.refilter(&store);
+    assert_eq!(screen.selected(&store).unwrap().name, "db-password");
+    assert!(
+        screen.tick(&store, clock + REST * 2).is_none(),
+        "a new row under the cursor is a landing, not a rest"
+    );
+    assert!(screen.tick(&store, clock + REST * 3).is_some());
 }

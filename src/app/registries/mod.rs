@@ -61,8 +61,10 @@ pub struct RegistriesScreen {
     /// The last repository opened, so coming straight back into it keeps its
     /// cursor and its query while opening a different one does not.
     was: Level,
-    /// Where the cursor is and when it landed, for the rest interval.
-    rested: Option<(usize, Instant)>,
+    /// The row under the cursor and when it landed, for the rest interval.
+    /// By identity, as `asked` is keyed: a keystroke in the search box puts
+    /// another row under the same index.
+    rested: Option<((String, String, String), Instant)>,
     /// What has been asked for this run, so coming back to a row is free.
     asked: HashSet<(String, String, String)>,
     pub details_scroll: ScrollState,
@@ -312,47 +314,52 @@ impl RegistriesScreen {
     /// One turn of the clock: what the cursor has settled on long enough to
     /// be worth asking about.
     pub fn tick(&mut self, store: &AzureStore, now: Instant) -> Option<Request> {
-        let here = self.table().cursor.index;
-        match self.rested {
-            Some((at, since)) if at == here => {
-                if now.saturating_duration_since(since) < REST {
+        let key = match &self.level {
+            Level::Repositories => {
+                let repository = self.selected_repository(store)?;
+                (
+                    repository.registry.clone(),
+                    repository.name.clone(),
+                    String::new(),
+                )
+            }
+            Level::Tags { registry, repo } => {
+                let tag = self.selected_tag(store)?;
+                (registry.clone(), repo.clone(), tag.digest.clone())
+            }
+        };
+        match &self.rested {
+            Some((at, since)) if *at == key => {
+                if now.saturating_duration_since(*since) < REST {
                     return None;
                 }
             }
             _ => {
-                self.rested = Some((here, now));
+                self.rested = Some((key, now));
                 return None;
             }
         }
-        match &self.level {
-            Level::Repositories => {
-                let repository = self.selected_repository(store)?;
-                let (registry, repo) = (repository.registry.clone(), repository.name.clone());
-                let key = (registry.clone(), repo.clone(), String::new());
-                if store.tags.contains_key(&(registry.clone(), repo.clone()))
-                    || !self.asked.insert(key)
-                {
-                    return None;
-                }
-                Some(Request::Tags { registry, repo })
+        let (registry, repo, digest) = key;
+        if matches!(self.level, Level::Repositories) {
+            if store.tags.contains_key(&(registry.clone(), repo.clone()))
+                || !self.asked.insert((registry.clone(), repo.clone(), digest))
+            {
+                return None;
             }
-            Level::Tags { registry, repo } => {
-                let tag = self.selected_tag(store)?;
-                let digest = tag.digest.clone();
-                if digest.is_empty() {
-                    return None;
-                }
-                let key = (registry.clone(), repo.clone(), digest.clone());
-                if store.manifests.contains_key(&key) || !self.asked.insert(key) {
-                    return None;
-                }
-                Some(Request::Manifest {
-                    registry: registry.clone(),
-                    repo: repo.clone(),
-                    digest,
-                })
-            }
+            return Some(Request::Tags { registry, repo });
         }
+        if digest.is_empty() {
+            return None;
+        }
+        let key = (registry.clone(), repo.clone(), digest.clone());
+        if store.manifests.contains_key(&key) || !self.asked.insert(key) {
+            return None;
+        }
+        Some(Request::Manifest {
+            registry,
+            repo,
+            digest,
+        })
     }
 
     /// Whether the cursor has landed somewhere in the last [`REST`], so the
@@ -360,7 +367,9 @@ impl RegistriesScreen {
     /// does, rather than leaving the loop awake for the rest of the run.
     #[must_use]
     pub fn is_resting(&self) -> bool {
-        self.rested.is_some_and(|(_, since)| since.elapsed() < REST)
+        self.rested
+            .as_ref()
+            .is_some_and(|(_, since)| since.elapsed() < REST)
     }
 
     /// A refresh, or a tab switch. Nothing here is secret, so only the

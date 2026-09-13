@@ -564,8 +564,11 @@ mod tests {
         screen.on_value(
             &mut shell,
             &store,
-            "kv-dev",
-            "api-key",
+            crate::app::secrets::Reading {
+                vault: "kv-dev".into(),
+                name: "api-key".into(),
+                copy: false,
+            },
             Ok((
                 crate::azure::Secret::new("s3cr3t-value"),
                 "8f3a2c1d".to_owned(),
@@ -595,8 +598,11 @@ mod tests {
         screen.on_value(
             &mut shell,
             &store,
-            "kv-dev",
-            "api-key",
+            crate::app::secrets::Reading {
+                vault: "kv-dev".into(),
+                name: "api-key".into(),
+                copy: false,
+            },
             Err("kv-dev: no permission to read secrets".to_owned()),
             std::time::Instant::now(),
         );

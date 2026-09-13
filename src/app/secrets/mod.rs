@@ -303,15 +303,16 @@ pub struct SecretsScreen {
     available: u16,
     /// The one place a value lives. See [`Revealed`].
     revealed: Option<Revealed>,
-    /// A value request that has gone out and not come back, and whether it
-    /// was `y` rather than `v` that sent it.
-    reading: Option<Reading>,
+    /// The value requests out and not yet back: `y` and `v` on the same row
+    /// can both be waiting, and each answer goes where its ask said.
+    reading: Vec<Reading>,
     /// What the vault said when it would not hand one over. Cleared when the
     /// cursor moves.
     refusal: Option<String>,
-    /// Where the cursor is and when it got there, for the rest interval that
-    /// gates the versions request.
-    rested: Option<(usize, Instant)>,
+    /// The row under the cursor and when it got there, for the rest
+    /// interval that gates the versions request. By identity: a keystroke
+    /// in the search box puts another row under the same index.
+    rested: Option<((String, String), Instant)>,
     /// The rows whose versions have already been asked for this run, so a
     /// cursor coming back to one costs nothing.
     asked: std::collections::HashSet<(String, String)>,
@@ -319,14 +320,14 @@ pub struct SecretsScreen {
     pub details_scroll: super::cursor::ScrollState,
 }
 
-/// A value request in flight.
-#[derive(Debug)]
-struct Reading {
-    vault: String,
-    name: String,
+/// A value request in flight, and what an answer names when it lands.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reading {
+    pub vault: String,
+    pub name: String,
     /// `y` sent it, so the answer goes to the clipboard rather than the
     /// screen. `v` sent it otherwise.
-    copy: bool,
+    pub copy: bool,
 }
 
 impl Default for SecretsScreen {
@@ -344,7 +345,7 @@ impl Default for SecretsScreen {
             built_for: None,
             available: 0,
             revealed: None,
-            reading: None,
+            reading: Vec::new(),
             refusal: None,
             rested: None,
             asked: std::collections::HashSet::new(),
@@ -660,8 +661,8 @@ impl SecretsScreen {
     #[must_use]
     pub fn is_reading(&self, row: &SecretRow) -> bool {
         self.reading
-            .as_ref()
-            .is_some_and(|held| held.vault == row.vault && held.name == row.name && !held.copy)
+            .iter()
+            .any(|held| held.vault == row.vault && held.name == row.name && !held.copy)
     }
 
     /// The revealed value, if it is this row's.
@@ -688,7 +689,7 @@ impl SecretsScreen {
         }
         let (vault, name) = (row.vault.clone(), row.name.clone());
         self.refusal = None;
-        self.reading = Some(Reading {
+        self.reading.push(Reading {
             vault: vault.clone(),
             name: name.clone(),
             copy: false,
@@ -697,6 +698,7 @@ impl SecretsScreen {
             vault,
             name,
             version: None,
+            copy: false,
         })
     }
 
@@ -716,7 +718,7 @@ impl SecretsScreen {
         }
         let (vault, name) = (row.vault.clone(), row.name.clone());
         self.refusal = None;
-        self.reading = Some(Reading {
+        self.reading.push(Reading {
             vault: vault.clone(),
             name: name.clone(),
             copy: true,
@@ -726,6 +728,7 @@ impl SecretsScreen {
             vault,
             name,
             version: None,
+            copy: true,
         })
     }
 
@@ -736,26 +739,25 @@ impl SecretsScreen {
         &mut self,
         shell: &mut Shell,
         store: &AzureStore,
-        vault: &str,
-        name: &str,
+        asked: Reading,
         result: Result<(Secret, String), String>,
         now: Instant,
     ) -> AppAction {
-        // Taken only if it is the one asked for: an answer for a row the
-        // cursor has left must not cancel the ask still out for the row it
-        // is on now.
-        let Some(asked) = self
-            .reading
-            .take_if(|held| held.vault == vault && held.name == name)
-        else {
+        // Taken only if it is one asked for: an answer for a row the cursor
+        // has left must not cancel the ask still out for the row it is on
+        // now, and a `y` must not take the `v` sent after it.
+        let Some(at) = self.reading.iter().position(|held| *held == asked) else {
             return AppAction::None;
         };
+        self.reading.remove(at);
+        let Reading { vault, name, copy } = asked;
+        let (vault, name) = (vault.as_str(), name.as_str());
         let still_here = self
             .selected(store)
             .is_some_and(|row| row.vault == vault && row.name == name);
         match result {
             Err(message) => {
-                if asked.copy {
+                if copy {
                     shell.set_error(message.clone());
                 }
                 if still_here {
@@ -765,7 +767,7 @@ impl SecretsScreen {
             }
             // The second and last call to `Secret::expose`: `y` pressed with
             // nothing on screen, copying blind, which is the common case.
-            Ok((secret, _version)) if asked.copy => AppAction::Copy {
+            Ok((secret, _version)) if copy => AppAction::Copy {
                 text: secret.expose().to_owned(),
                 label: format!("Copied value of {name} ({vault})"),
             },
@@ -794,19 +796,18 @@ impl SecretsScreen {
         }
         let row = self.selected(store)?;
         let (vault, name) = (row.vault.clone(), row.name.clone());
-        let here = self.cursor.index;
-        match self.rested {
-            Some((at, since)) if at == here => {
-                if now.saturating_duration_since(since) < REST {
+        let key = (vault.clone(), name.clone());
+        match &self.rested {
+            Some((at, since)) if *at == key => {
+                if now.saturating_duration_since(*since) < REST {
                     return None;
                 }
             }
             _ => {
-                self.rested = Some((here, now));
+                self.rested = Some((key, now));
                 return None;
             }
         }
-        let key = (vault.clone(), name.clone());
         if store.versions.contains_key(&key) || !self.asked.insert(key) {
             return None;
         }
@@ -817,7 +818,7 @@ impl SecretsScreen {
     /// down, or something is being waited for.
     #[must_use]
     pub const fn is_ticking(&self) -> bool {
-        self.revealed.is_some() || self.reading.is_some()
+        self.revealed.is_some() || !self.reading.is_empty()
     }
 
     /// Whether the cursor has landed somewhere in the last [`REST`], so the
@@ -828,7 +829,9 @@ impl SecretsScreen {
     /// moving minutes ago.
     #[must_use]
     pub fn is_resting(&self) -> bool {
-        self.rested.is_some_and(|(_, since)| since.elapsed() < REST)
+        self.rested
+            .as_ref()
+            .is_some_and(|(_, since)| since.elapsed() < REST)
     }
 
     /// Moving the cursor takes the value off the screen with it, and clears
@@ -843,7 +846,7 @@ impl SecretsScreen {
     /// tab switch is looking away.
     pub fn on_refresh(&mut self) {
         self.revealed = None;
-        self.reading = None;
+        self.reading.clear();
         self.refusal = None;
         self.asked.clear();
     }
