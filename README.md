@@ -184,7 +184,7 @@ is in more than one vault is an error listing them rather than a guess.
 `setup` fetches credentials for every AKS cluster the login can see, converts
 the kubeconfig, and prints a `[[clusters]]` block per cluster to trim;
 `--write` puts them in `config.toml` when there is no file yet, and never
-overwrites one.
+overwrites one: with a file already there it prints the blocks and exits 0.
 
 Exit codes: **0** it worked, **1** a read failed (the rows that did answer
 are still printed first), **2** the arguments were wrong.
@@ -257,9 +257,10 @@ and the moment it is switched to; the other namespaces every thirty, for
 their badges. A kind other than pods is read for the open tab only, while it
 shows. A scope that fails backs off, doubling to two minutes, and its rows
 stand from the last read that worked, with the message in the status bar and
-under `?`. Every `kubectl` call carries `--request-timeout=10s` and is killed
-after twenty seconds regardless, which is what a credential plugin waiting on
-a device-code login looks like.
+under `?`. Every one-shot `kubectl` read carries `--request-timeout=10s` and
+is killed after twenty seconds regardless, which is what a credential plugin
+waiting on a device-code login looks like. A followed log and the `b` shell
+are the two calls with neither: Ctrl-C ends them.
 
 Describe, YAML and an owner's replica count are read once per object per
 run, the owner once the cursor rests on a pod for 150 ms. One
@@ -399,7 +400,7 @@ painted, every key and every kind:
 
 ```console
 cargo build --release
-scripts/walk.py --show          # needs uv; or: pip install pyte && python3 scripts/walk.py
+scripts/walk.py --show          # needs uv
 ```
 
 ## How it was built
