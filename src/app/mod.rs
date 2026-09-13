@@ -21,6 +21,7 @@ use shell::{Focus, Shell};
 use crate::columns::{ColumnId, TableLayout};
 use crate::session::{Session, SessionColumn};
 use crate::store::{Applied, Store};
+use crate::text_input::TextInput;
 use crate::worker::Request;
 use crate::{ui, worker};
 
@@ -76,10 +77,14 @@ impl App {
             KeyCode::Char('q') => AppAction::Quit,
             // Esc out of the table clears the query rather than quitting:
             // Esc left the box keeping the filter, and this is the second
-            // press that takes it off.
+            // press that takes it off. With nothing to clear it is the
+            // screen's, which is how it backs out of a repository.
             KeyCode::Esc => {
-                self.clear_query();
-                AppAction::None
+                if self.clear_query() {
+                    AppAction::None
+                } else {
+                    self.screen_key(key)
+                }
             }
             KeyCode::Char('r') => {
                 self.on_refresh();
@@ -97,36 +102,44 @@ impl App {
         }
     }
 
-    /// While the box has focus every key is a character, except the two that
-    /// leave it.
+    /// While the box has focus every key is a character, except the three
+    /// that leave it.
     fn key_in_search(&mut self, key: KeyEvent) -> AppAction {
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => {
                 self.shell.focus = Focus::Table;
-                AppAction::None
-            }
-            KeyCode::Esc => {
-                self.shell.focus = Focus::Table;
-                AppAction::None
             }
             _ => {
-                let input = match self.tab {
-                    TabId::Secrets => &mut self.secrets.input,
-                    TabId::Registries => self.registries.input_mut(),
-                };
-                input.handle_key(key);
-                AppAction::None
+                self.input().handle_key(key);
             }
+        }
+        AppAction::None
+    }
+
+    /// A paste, which bracketed paste hands over whole. It goes into the
+    /// search box when that is what has focus, and nowhere otherwise.
+    pub fn handle_paste(&mut self, text: &str) -> AppAction {
+        if self.shell.focus == Focus::Search {
+            self.input().paste(text);
+        }
+        AppAction::None
+    }
+
+    /// The search box of whichever table is showing.
+    fn input(&mut self) -> &mut TextInput {
+        match self.tab {
+            TabId::Secrets => &mut self.secrets.input,
+            TabId::Registries => self.registries.input_mut(),
         }
     }
 
     /// `Esc` out of the table: the filter goes, and the table comes back
-    /// whole.
-    fn clear_query(&mut self) {
-        match self.tab {
-            TabId::Secrets => self.secrets.input.clear(),
-            TabId::Registries => self.registries.input_mut().clear(),
-        }
+    /// whole. Says whether there was one to take off.
+    fn clear_query(&mut self) -> bool {
+        let input = self.input();
+        let had = !input.is_empty();
+        input.clear();
+        had
     }
 
     fn screen_key(&mut self, key: KeyEvent) -> AppAction {
@@ -137,15 +150,18 @@ impl App {
         }
     }
 
+    /// Switching tabs drops a revealed value, like every other way of
+    /// looking away from it.
     fn switch_to(&mut self, tab: TabId) {
         if self.tab != tab {
             self.tab = tab;
             self.shell.focus = Focus::Table;
-            self.on_tab_switch();
+            self.on_refresh();
         }
     }
 
-    /// A click, resolved against what was drawn last frame.
+    /// A click, resolved against what was drawn last frame. A click lands
+    /// focus where it lands: on a row, the table; on the pane, the pane.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> AppAction {
         let target = self.shell.hit(event.column, event.row).cloned();
         match event.kind {
@@ -166,7 +182,12 @@ impl App {
                     self.clear_query();
                     AppAction::None
                 }
+                Some(Target::Details) => {
+                    self.shell.focus = Focus::Details;
+                    AppAction::None
+                }
                 Some(target) => {
+                    self.shell.focus = Focus::Table;
                     let store = &self.store;
                     match self.tab {
                         TabId::Secrets => self.secrets.handle_click(&mut self.shell, store, target),
@@ -228,7 +249,10 @@ impl App {
                     now,
                 );
             }
-            Applied::Nothing | Applied::Detail | Applied::Status => {}
+            // A repository's tags re-read with the same count would otherwise
+            // keep the old order under the new list.
+            Applied::Detail => self.registries.invalidate(),
+            Applied::Nothing | Applied::Status => {}
         }
         AppAction::None
     }
@@ -265,15 +289,9 @@ impl App {
         settled
     }
 
-    /// `r`: everything a screen was holding that a refresh makes stale.
+    /// `r`, or a tab switch: everything a screen was holding that a refresh
+    /// makes stale, the revealed value first.
     fn on_refresh(&mut self) {
-        self.secrets.on_refresh();
-        self.registries.on_refresh();
-    }
-
-    /// Switching tabs drops a revealed value, like every other way of
-    /// looking away from it.
-    fn on_tab_switch(&mut self) {
         self.secrets.on_refresh();
         self.registries.on_refresh();
     }
@@ -365,7 +383,15 @@ impl App {
         ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, self.tab, &badges);
         self.render_body(frame, body);
         let hint = self.footer_hint();
-        ui::widgets::render_status_bar(frame, &mut self.shell, status, &hint, &self.store, millis);
+        ui::widgets::render_status_bar(
+            frame,
+            &mut self.shell,
+            status,
+            &hint,
+            &self.store,
+            self.tab,
+            millis,
+        );
         if self.shell.help_open {
             ui::widgets::render_help(frame, &mut self.shell, area, self.tab, &self.store);
         }
@@ -388,6 +414,32 @@ impl App {
                 );
             }
         }
+    }
+}
+
+/// `None` sorts last in both directions: a stamp that is not set, or a count
+/// that has not arrived, is not the most interesting row on screen, and
+/// flipping the sort should not make it so.
+pub(crate) fn none_last<T: Ord>(
+    left: Option<T>,
+    right: Option<T>,
+    descending: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(left), Some(right)) => flip(left.cmp(&right), descending),
+    }
+}
+
+/// An ordering, turned over when the sort is descending.
+pub(crate) const fn flip(ordering: std::cmp::Ordering, descending: bool) -> std::cmp::Ordering {
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
     }
 }
 
@@ -491,6 +543,108 @@ mod tests {
             "and an unknown sort is the default"
         );
         assert_eq!(app.secrets.layout, before);
+    }
+
+    #[test]
+    fn a_paste_lands_in_the_search_box_and_nowhere_else() {
+        let mut app = App::new(Store::default());
+        app.handle_paste("db\npass");
+        assert!(app.secrets.input.is_empty(), "the table took nothing");
+        app.shell.focus = Focus::Search;
+        app.handle_paste("db\npass");
+        assert_eq!(app.secrets.input.text(), "db pass");
+    }
+
+    #[test]
+    fn tab_leaves_the_search_box_and_esc_backs_out_of_a_repository() {
+        let mut app = App::new(Store::default());
+        app.shell.focus = Focus::Search;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.shell.focus, Focus::Table);
+
+        // A query is what Esc takes off first; with none, the screen has it.
+        app.secrets.input.set_text("db");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.secrets.input.is_empty());
+        let mut app = App::new(crate::app::registries::tests::stocked());
+        app.tab = TabId::Registries;
+        app.registries.refilter(&app.store);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.registries.level,
+            registries::Level::Tags { .. }
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.registries.level, registries::Level::Repositories);
+    }
+
+    #[test]
+    fn a_click_puts_focus_where_it_landed() {
+        let mut app = App::new(Store::default());
+        app.shell.begin_frame();
+        app.shell.region(Rect::new(0, 5, 40, 10), Target::Details);
+        app.shell.region(Rect::new(0, 1, 40, 1), Target::Row(0));
+        app.shell.focus = Focus::Search;
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click(3, 1));
+        assert_eq!(app.shell.focus, Focus::Table);
+        app.handle_mouse(click(3, 7));
+        assert_eq!(app.shell.focus, Focus::Details);
+    }
+
+    #[test]
+    fn a_re_read_of_the_open_repositorys_tags_is_shown_in_its_new_order() {
+        use crate::azure::Tag;
+        use crate::timestamp::ts;
+
+        let mut app = App::new(crate::app::registries::tests::stocked());
+        app.tab = TabId::Registries;
+        app.registries.refilter(&app.store);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.registries.refilter(&app.store);
+        let first = |app: &App| {
+            app.registries
+                .selected_tag(&app.store)
+                .map(|tag| tag.name.clone())
+        };
+        let was = first(&app).expect("a tag under the cursor");
+        // The same two names come back with their stamps swapped: the other
+        // one is now the newest, and `Updated ↓` must put it first.
+        let (registry, repo) = app
+            .registries
+            .open_repository()
+            .map(|(r, p)| (r.to_owned(), p.to_owned()))
+            .unwrap();
+        let Ok(tags) = app.store.tags[&(registry.clone(), repo.clone())].clone() else {
+            panic!("tags");
+        };
+        let swapped: Vec<Tag> = tags
+            .iter()
+            .enumerate()
+            .map(|(at, tag)| Tag {
+                updated: Some(ts(if at == 0 {
+                    "2020-01-01T00:00:00Z"
+                } else {
+                    "2030-01-01T00:00:00Z"
+                })),
+                ..tag.clone()
+            })
+            .collect();
+        app.apply(
+            worker::Event::Tags {
+                registry,
+                repo,
+                result: Ok(swapped),
+            },
+            Instant::now(),
+        );
+        app.registries.refilter(&app.store);
+        assert_ne!(first(&app).unwrap(), was, "the newest tag is first again");
     }
 
     #[test]

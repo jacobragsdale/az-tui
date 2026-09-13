@@ -193,14 +193,6 @@ impl TextInput {
         true
     }
 
-    /// Puts the caret where a click at `column` of a one-row field `width`
-    /// columns wide landed, the field showing the text the way
-    /// [`field_window`] scrolled it for the caret as it was.
-    pub fn click(&mut self, column: usize, width: u16) {
-        let (start, _) = field_window(&self.text, self.cursor, width);
-        self.cursor = char_at_column(&self.text, start, column);
-    }
-
     fn character_count(&self) -> usize {
         self.text.chars().count()
     }
@@ -254,22 +246,6 @@ pub fn field_window(text: &str, cursor: usize, width: u16) -> (usize, u16) {
         start += 1;
     }
     (start, u16::try_from(before).unwrap_or(u16::MAX))
-}
-
-/// The character a click at `column` lands on, in a field showing `text` from
-/// character `start`: the one painted under that column, or the end of the
-/// text past its last character. The caret goes in front of it.
-#[must_use]
-pub fn char_at_column(text: &str, start: usize, column: usize) -> usize {
-    let mut x = 0;
-    for (offset, character) in text.chars().skip(start).enumerate() {
-        let width = display_width(character.encode_utf8(&mut [0; 4]));
-        if x + width > column {
-            return start + offset;
-        }
-        x += width;
-    }
-    text.chars().count()
 }
 
 fn byte_index(text: &str, character_index: usize) -> usize {
@@ -427,34 +403,5 @@ mod tests {
         assert_eq!(field_window("abc", 3, 0), (3, 0), "no width is one column");
         assert_eq!(display_width("日本語"), 6);
         assert_eq!(display_width("e\u{301}"), 1);
-    }
-
-    #[test]
-    fn a_click_lands_on_the_character_under_its_column() {
-        assert_eq!(char_at_column("abc", 0, 1), 1);
-        assert_eq!(char_at_column("abc", 0, 7), 3, "past the end is the end");
-        assert_eq!(char_at_column("abcdefghij", 5, 2), 7, "in a scrolled field");
-        assert_eq!(
-            char_at_column("日本語", 0, 1),
-            0,
-            "either column of a wide character is that character"
-        );
-        assert_eq!(char_at_column("日本語", 0, 2), 1);
-        assert_eq!(
-            char_at_column("e\u{301}x", 0, 1),
-            2,
-            "a mark and its base are one column"
-        );
-
-        let mut input = TextInput::new("abcdefghij");
-        input.click(2, 6);
-        assert_eq!(
-            input.cursor(),
-            7,
-            "the field was scrolled for the caret at the end"
-        );
-        input.move_home();
-        input.click(2, 6);
-        assert_eq!(input.cursor(), 2, "and not once the caret is at the start");
     }
 }

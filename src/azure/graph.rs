@@ -19,17 +19,12 @@ const URL: &str = "https://management.azure.com/providers/Microsoft.ResourceGrap
 /// The two resource types the tabs know, with the fields each needs projected
 /// under one name.
 ///
-/// A registry keeps its SKU at the top level and a vault keeps its inside
-/// `properties`, so `coalesce` picks whichever is there — with each arm cast
-/// first, because both are `dynamic` until they are.
-///
 /// The sort names `id` as well as `name`: a skip token paging over a
 /// non-unique sort column can hand back a row twice and miss another, which
 /// is Resource Graph's own warning about paging.
 const QUERY: &str = r"resources
 | where type in~ ('microsoft.keyvault/vaults', 'microsoft.containerregistry/registries')
-| project id, name, type, subscriptionId, resourceGroup, location,
-          sku = coalesce(tostring(sku.name), tostring(properties.sku.name)),
+| project id, name, type, resourceGroup, location,
           loginServer = tostring(properties.loginServer),
           vaultUri = tostring(properties.vaultUri)
 | order by name asc, id asc";
@@ -135,10 +130,8 @@ fn vault(row: &Value) -> Vault {
     Vault {
         id: string(&row["id"]),
         name: string(&row["name"]),
-        subscription_id: string(&row["subscriptionId"]),
         resource_group: string(&row["resourceGroup"]),
         location: string(&row["location"]),
-        sku: string(&row["sku"]),
         uri: string(&row["vaultUri"]),
     }
 }
@@ -147,10 +140,8 @@ fn registry(row: &Value) -> Registry {
     Registry {
         id: string(&row["id"]),
         name: string(&row["name"]),
-        subscription_id: string(&row["subscriptionId"]),
         resource_group: string(&row["resourceGroup"]),
         location: string(&row["location"]),
-        sku: string(&row["sku"]),
         login_server: string(&row["loginServer"]),
     }
 }
@@ -209,7 +200,6 @@ mod tests {
         let inventory = inventory(&client, &Azure::default()).unwrap();
         assert_eq!(inventory.vaults.len(), 1);
         assert_eq!(inventory.vaults[0].uri, "https://kv-a.vault.azure.net/");
-        assert_eq!(inventory.vaults[0].subscription_id, "sub-1");
         assert_eq!(inventory.registries.len(), 1);
         assert_eq!(inventory.registries[0].login_server, "acrb.azurecr.io");
 

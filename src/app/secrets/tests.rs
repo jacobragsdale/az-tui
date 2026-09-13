@@ -95,7 +95,11 @@ fn an_expiry_is_told_four_ways_and_the_boundary_lands_where_it_says() {
 fn an_expiry_cell_says_the_age_or_a_dash_or_that_it_has_gone() {
     let soon = Some(ts("2026-09-23T20:00:00Z"));
     assert_eq!(Expiry::None.cell(None, now()), "—");
-    assert_eq!(Expiry::Soon.cell(soon, now()), "12d");
+    assert_eq!(
+        Expiry::Soon.cell(soon, now()),
+        "12d ⚠",
+        "marked as well as coloured"
+    );
     assert_eq!(
         Expiry::Expired.cell(Some(ts("2026-09-08T20:00:00Z")), now()),
         "expired"
@@ -110,7 +114,7 @@ fn order() -> HashMap<&'static str, usize> {
 
 fn sorted(rows: &[SecretRow], by: ColumnId, descending: bool) -> Vec<String> {
     let mut indices: Vec<usize> = (0..rows.len()).collect();
-    sort(&mut indices, rows, by, descending, &order(), now());
+    sort(&mut indices, rows, by, descending, &order());
     indices
         .into_iter()
         .map(|at| format!("{}/{}", rows[at].vault, rows[at].name))
@@ -171,7 +175,7 @@ fn a_stamp_that_is_not_set_sorts_last_whichever_way_the_sort_points() {
 
 #[test]
 fn only_the_columns_on_screen_can_be_sorted_by() {
-    let layout = default_layout();
+    let layout = TableLayout::new(SECRET_COLUMNS);
     let wide = sortable(&layout, 200);
     assert!(wide.contains(&ColumnId::Vault));
     assert!(wide.contains(&ColumnId::Name));
@@ -193,10 +197,8 @@ fn stocked() -> Store {
     let vault = |name: &str| Vault {
         id: format!("/vaults/{name}"),
         name: name.to_owned(),
-        subscription_id: "s".into(),
         resource_group: "rg".into(),
         location: "eastus".into(),
-        sku: "standard".into(),
         uri: format!("https://{name}.vault.azure.net/"),
     };
     let mut store = Store::default();
@@ -333,10 +335,8 @@ fn filters_forty_thousand_rows_between_keystrokes() {
             .map(|name| Vault {
                 id: format!("/vaults/{name}"),
                 name: name.clone(),
-                subscription_id: "s".into(),
                 resource_group: "rg".into(),
                 location: "eastus".into(),
-                sku: "standard".into(),
                 uri: format!("https://{name}.vault.azure.net/"),
             })
             .collect(),
@@ -657,4 +657,103 @@ fn the_badge_counts_only_enabled_secrets_that_are_running_out() {
         1,
         "a disabled secret's expiry is nobody's problem"
     );
+}
+
+#[test]
+fn an_answer_for_a_row_the_cursor_left_does_not_cancel_the_ask_on_the_new_one() {
+    let store = stocked();
+    let mut screen = SecretsScreen::default();
+    let mut shell = Shell::default();
+    screen.refilter(&store);
+    let first = screen.selected(&store).unwrap().clone();
+    press(&mut screen, &mut shell, &store, 'v');
+    press(&mut screen, &mut shell, &store, 'j');
+    let second = screen.selected(&store).unwrap().clone();
+    assert_ne!(first.name, second.name);
+    press(&mut screen, &mut shell, &store, 'v');
+    // The first answer lands late, for a row nobody is on any more.
+    screen.on_value(
+        &mut shell,
+        &store,
+        &first.vault,
+        &first.name,
+        Ok((Secret::new("a"), "v1".into())),
+        Instant::now(),
+    );
+    screen.on_value(
+        &mut shell,
+        &store,
+        &second.vault,
+        &second.name,
+        Ok((Secret::new("b"), "v2".into())),
+        Instant::now(),
+    );
+    assert!(
+        screen.revealed_here(&second).is_some(),
+        "the ask still out was answered, not cancelled by the stale one"
+    );
+}
+
+#[test]
+fn a_click_on_another_row_takes_a_revealed_value_off_the_screen() {
+    let store = stocked();
+    let mut screen = SecretsScreen::default();
+    let mut shell = Shell::default();
+    screen.refilter(&store);
+    let row = screen.selected(&store).unwrap().clone();
+    press(&mut screen, &mut shell, &store, 'v');
+    screen.on_value(
+        &mut shell,
+        &store,
+        &row.vault,
+        &row.name,
+        Ok((Secret::new("x"), "v".into())),
+        Instant::now(),
+    );
+    assert!(screen.revealed_here(&row).is_some());
+    screen.handle_click(&mut shell, &store, Target::Row(1));
+    assert!(
+        screen.revealed_here(&row).is_none(),
+        "looking away drops it, by mouse as by key"
+    );
+    assert!(!screen.is_ticking(), "and nothing is left counting down");
+}
+
+#[test]
+fn the_wheel_after_a_shrinking_refresh_does_not_turn_the_window_inside_out() {
+    use crate::azure::Inventory;
+    use crate::worker::Event;
+
+    let mut store = Store::default();
+    store.apply(Event::Inventory(Ok(Inventory {
+        vaults: vec![crate::azure::Vault {
+            id: "/vaults/kv-dev".into(),
+            name: "kv-dev".into(),
+            resource_group: "rg".into(),
+            location: "eastus".into(),
+            uri: "https://kv-dev.vault.azure.net/".into(),
+        }],
+        registries: Vec::new(),
+    })));
+    store.apply(Event::Secrets {
+        vault: "kv-dev".into(),
+        result: Ok((0..20)
+            .map(|n| row("kv-dev", &format!("s-{n:02}")))
+            .collect()),
+    });
+    let mut screen = SecretsScreen::default();
+    screen.refilter(&store);
+    // As the last draw left it: a five-row window, the cursor well down.
+    screen.cursor.scroll.set_viewport(5, screen.visible().len());
+    screen.cursor.focus(15);
+    // The vault answers with two rows; the table is short and the scroll
+    // state is stale.
+    store.apply(Event::Secrets {
+        vault: "kv-dev".into(),
+        result: Ok(vec![row("kv-dev", "a"), row("kv-dev", "b")]),
+    });
+    screen.invalidate();
+    screen.keep_cursor(&store, None);
+    screen.handle_wheel(&mut Shell::default(), None, 3);
+    assert!(screen.cursor.index < screen.visible().len());
 }

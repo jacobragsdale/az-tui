@@ -9,7 +9,8 @@
 # subscriptions = ["00000000-0000-0000-0000-000000000000"]
 
 # Only read these key vaults, in this order. Left out: every vault found.
-# A name that is not found is listed by `az-tui doctor`, not an error.
+# A name that is not found is listed by `az-tui doctor` under `not found`,
+# which then exits 1.
 # vaults = ["kv-dev", "kv-qa", "kv-prod"]
 
 # Only read these container registries, in this order. Left out: all of them.
@@ -17,6 +18,10 @@
 
 # Seconds between background refreshes. 0 leaves `r` as the only refresh.
 # refresh = 300
+
+# How many vaults, registries or repositories a refresh reads at once.
+# Turn it down if a Basic-tier registry with many repositories throttles.
+# parallel = 8
 
 [theme]
 # terminal · terminal-light · mono · custom

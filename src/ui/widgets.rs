@@ -5,26 +5,90 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::theme::theme;
 use crate::app::keys;
 use crate::app::screen::{TabId, Target};
-use crate::app::shell::{Level, Shell};
-use crate::store::Store;
+use crate::app::shell::{Focus, Level, Panes, Shell};
+use crate::store::{Store, problem_line};
 use crate::text_input::{TextInput, field_window};
 use crate::timestamp::Timestamp;
 
 /// The frames of the spinner that turns while a refresh runs.
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
-/// What each tab's search row says before anything is typed. The grammar
-/// differs per tab, and a placeholder naming the other tab's keys is a
+
+/// What each table's search row says before anything is typed. The grammar
+/// differs per table, and a placeholder naming another table's keys is a
 /// worked example of something that will not match.
-#[must_use]
-pub const fn placeholder(tab: TabId) -> &'static str {
-    match tab {
-        TabId::Secrets => "Type / to search, or vault:kv-prod enabled:no expires:<30d",
-        TabId::Registries => "Type / to search, or registry:acrprod updated:<30d",
+pub const SECRETS_PLACEHOLDER: &str = "Type / to search, or vault:kv-prod enabled:no expires:<30d";
+pub const REPOSITORIES_PLACEHOLDER: &str = "Type / to search, or registry:acrprod updated:<30d";
+pub const TAGS_PLACEHOLDER: &str = "Type / to search, or tag:1.4 digest:ab12 updated:<30d";
+
+/// The `key:value` filters each table takes, for the help. The README is
+/// otherwise the only place the grammar is written down.
+const FILTERS: &[(TabId, &str, &str)] = &[
+    (
+        TabId::Secrets,
+        "Filters",
+        "vault: name: type: enabled:yes|no managed:yes|no tag:key=value expires:<30d|>30d|none|expired",
+    ),
+    (
+        TabId::Registries,
+        "Filters",
+        "registry: repo: updated:<30d|>30d created:<30d|>30d",
+    ),
+    (
+        TabId::Registries,
+        "Inside one",
+        "tag: digest: updated:<30d|>30d created:<30d|>30d",
+    ),
+];
+
+/// Which pane a frame is asking a screen to draw, at the width it has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Pane {
+    Table,
+    Details,
+}
+
+/// A tab's body: the search row, then the table and the details pane laid
+/// out to fit — side by side, stacked, or one at a time with `Tab` saying
+/// which. The screen draws each pane it is asked for; this decides where.
+pub fn render_panes(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    input: &TextInput,
+    placeholder: &str,
+    mut draw: impl FnMut(&mut Frame, &mut Shell, Pane, Rect),
+) {
+    let [search, body] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .areas(area);
+    let focused = shell.focus == Focus::Search;
+    render_search_row(frame, shell, search, input, focused, placeholder);
+
+    match Shell::panes(area.width) {
+        Panes::SideBySide => {
+            let [table, details] = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(body);
+            draw(frame, shell, Pane::Table, table);
+            draw(frame, shell, Pane::Details, details);
+        }
+        Panes::Stacked => {
+            let [table, details] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(body);
+            draw(frame, shell, Pane::Table, table);
+            draw(frame, shell, Pane::Details, details);
+        }
+        Panes::One if shell.focus == Focus::Details => draw(frame, shell, Pane::Details, body),
+        Panes::One => draw(frame, shell, Pane::Table, body),
     }
 }
 
@@ -102,7 +166,7 @@ pub fn render_search_row(
     area: Rect,
     input: &TextInput,
     focused: bool,
-    tab: TabId,
+    placeholder: &str,
 ) {
     let palette = theme();
     // `/ ` on the left, ` × ` on the right when there is anything to clear.
@@ -132,7 +196,7 @@ pub fn render_search_row(
     if input.is_empty() && !focused {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                placeholder(tab),
+                placeholder.to_owned(),
                 Style::default().fg(palette.muted),
             )),
             field,
@@ -167,6 +231,7 @@ pub fn render_status_bar(
     area: Rect,
     hint: &str,
     store: &Store,
+    tab: TabId,
     millis: u128,
 ) {
     let palette = theme();
@@ -175,7 +240,7 @@ pub fn render_status_bar(
         Some((said, Level::Info)) => (said.to_owned(), Style::default().fg(palette.success)),
         None => (hint.to_owned(), Style::default().fg(palette.muted)),
     };
-    let (right, right_style) = store_state(store, millis);
+    let (right, right_style) = store_state(store, tab, millis);
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
 
     // The right-hand end is the one that cannot be guessed from the keys, so
@@ -210,8 +275,8 @@ fn truncate(text: &str, room: usize) -> String {
 }
 
 /// The right-hand end of the status bar: what is happening, or what is
-/// wrong, or what was read and when.
-fn store_state(store: &Store, millis: u128) -> (String, Style) {
+/// wrong, or what this tab holds and when it was read.
+fn store_state(store: &Store, tab: TabId, millis: u128) -> (String, Style) {
     let palette = theme();
     if store.refreshing {
         let said = store.progress.clone().unwrap_or_else(|| "reading…".into());
@@ -220,13 +285,11 @@ fn store_state(store: &Store, millis: u128) -> (String, Style) {
             Style::default().fg(palette.info),
         );
     }
-    if let Some((who, message)) = store.first_problem() {
-        let said = if who.is_empty() {
-            message.clone()
-        } else {
-            format!("{who}: {message}")
-        };
-        return (format!("! {said}"), Style::default().fg(palette.error));
+    if let Some(problem) = store.first_problem() {
+        return (
+            format!("! {}", problem_line(problem)),
+            Style::default().fg(palette.error),
+        );
     }
     let age = store.read_at.map_or_else(
         || "never read".to_owned(),
@@ -235,12 +298,20 @@ fn store_state(store: &Store, millis: u128) -> (String, Style) {
             age => format!("{age} ago"),
         },
     );
-    (
-        format!(
-            "● {} vaults · {} secrets · {age}",
+    let counts = match tab {
+        TabId::Secrets => format!(
+            "{} vaults · {} secrets",
             store.inventory.vaults.len(),
             store.secrets.len()
         ),
+        TabId::Registries => format!(
+            "{} registries · {} repositories",
+            store.inventory.registries.len(),
+            store.repositories.len()
+        ),
+    };
+    (
+        format!("● {counts} · {age}"),
         Style::default().fg(palette.muted),
     )
 }
@@ -288,20 +359,27 @@ pub fn dim_behind(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// The help: every key this tab has, then whatever is wrong.
+/// The help: every key this tab has, the filters its search box takes, then
+/// whatever is wrong.
 pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, tab: TabId, store: &Store) {
+    const WIDTH: u16 = 74;
     let palette = theme();
+    let entry = |keys: &str, does: &str| {
+        Line::from(vec![
+            Span::styled(format!("{keys:<12}"), Style::default().fg(palette.accent)),
+            Span::styled(does.to_owned(), Style::default().fg(palette.body)),
+        ])
+    };
     let mut lines: Vec<Line> = keys::for_tab(tab)
-        .map(|key| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<12}", key.keys),
-                    Style::default().fg(palette.accent),
-                ),
-                Span::styled(key.does, Style::default().fg(palette.body)),
-            ])
-        })
+        .map(|key| entry(key.keys, key.does))
         .collect();
+    lines.push(Line::from(""));
+    lines.extend(
+        FILTERS
+            .iter()
+            .filter(|(held, _, _)| *held == tab)
+            .map(|(_, label, grammar)| entry(label, grammar)),
+    );
     if !store.problems.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -310,22 +388,20 @@ pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, tab: TabId,
                 .fg(palette.header)
                 .add_modifier(Modifier::BOLD),
         )));
-        for (who, message) in &store.problems {
-            let said = if who.is_empty() {
-                message.clone()
-            } else {
-                format!("{who}: {message}")
-            };
+        for problem in &store.problems {
             lines.push(Line::from(Span::styled(
-                said,
+                problem_line(problem),
                 Style::default().fg(palette.error),
             )));
         }
     }
-    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let inner = render_modal_frame(frame, area, "Keys", 74, height);
+    // Wrapped, and sized to what the wrapping makes of it: a refusal names
+    // the role that would fix it in its second half, which a cut line lost.
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let height = u16::try_from(paragraph.line_count(WIDTH - 2) + 2).unwrap_or(u16::MAX);
+    let inner = render_modal_frame(frame, area, "Keys", WIDTH, height);
     shell.region(area, Target::Help);
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(paragraph, inner);
 }
 
 /// A one-character scrollbar down the right edge of a pane, drawn only when
@@ -443,7 +519,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::default(),
                 false,
-                TabId::Secrets,
+                SECRETS_PLACEHOLDER,
             );
         });
         assert!(drawn.starts_with("/ Type / to search"), "{drawn}");
@@ -456,7 +532,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::new("db-pass"),
                 true,
-                TabId::Secrets,
+                SECRETS_PLACEHOLDER,
             );
         });
         assert!(drawn.contains("db-pass"), "{drawn}");
@@ -471,7 +547,7 @@ mod tests {
                 Rect::new(0, 0, 80, 1),
                 &TextInput::default(),
                 false,
-                TabId::Registries,
+                REPOSITORIES_PLACEHOLDER,
             );
         });
         assert!(drawn.contains("registry:acrprod"), "{drawn}");
@@ -482,7 +558,15 @@ mod tests {
     fn the_status_bar_says_the_hint_then_the_notification_then_the_error() {
         let store = Store::default();
         let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "↑↓ move", &store, 0);
+            render_status_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 1),
+                "↑↓ move",
+                &store,
+                TabId::Secrets,
+                0,
+            );
         });
         assert!(drawn.contains("↑↓ move"), "{drawn}");
         assert!(drawn.contains("never read"), "{drawn}");
@@ -499,6 +583,7 @@ mod tests {
                     Rect::new(0, 0, 100, 1),
                     "↑↓ move",
                     &store,
+                    TabId::Secrets,
                     0,
                 );
             })
@@ -523,6 +608,7 @@ mod tests {
                     Rect::new(0, 0, width, 1),
                     "↑↓/jk move  / search  s sort  y copy value  v reveal  r refresh  ? help",
                     &store,
+                    TabId::Secrets,
                     0,
                 );
             });
@@ -551,7 +637,15 @@ mod tests {
         store.apply(Event::Inventory(Ok(Inventory::default())));
         store.apply(Event::Progress("reading kv-prod (2/3)…".into()));
         let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "", &store, 0);
+            render_status_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 1),
+                "",
+                &store,
+                TabId::Secrets,
+                0,
+            );
         });
         assert!(drawn.contains("reading kv-prod (2/3)"), "{drawn}");
         assert!(drawn.contains(SPINNER[0]), "{drawn}");
@@ -562,7 +656,15 @@ mod tests {
         });
         store.apply(Event::Idle);
         let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(frame, shell, Rect::new(0, 0, 100, 1), "", &store, 0);
+            render_status_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 1),
+                "",
+                &store,
+                TabId::Secrets,
+                0,
+            );
         });
         assert!(drawn.contains("! kv-prod: no permission"), "{drawn}");
     }
@@ -587,8 +689,51 @@ mod tests {
         assert!(drawn.contains("Keys"), "{drawn}");
         assert!(drawn.contains("copy the value"), "{drawn}");
         assert!(!drawn.contains("repository's tags"), "{drawn}");
+        assert!(drawn.contains("Filters"), "{drawn}");
+        assert!(drawn.contains("expires:<30d"), "{drawn}");
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(drawn.contains("blocked by the vault firewall"), "{drawn}");
+    }
+
+    #[test]
+    fn a_long_problem_wraps_in_the_help_so_the_fix_is_readable() {
+        let mut store = Store::default();
+        store.apply(Event::Inventory(Ok(Inventory::default())));
+        store.apply(Event::Secrets {
+            vault: "kv-prod".into(),
+            result: Err("no permission to read secrets (needs the Key Vault Secrets User role or a `list` access policy)".into()),
+        });
+        let drawn = screen(100, 40, |frame, shell| {
+            render_help(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 40),
+                TabId::Secrets,
+                &store,
+            );
+        });
+        assert!(
+            drawn.contains("access policy"),
+            "the second half of the line is the actionable half: {drawn}"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_counts_what_the_open_tab_holds() {
+        let store = Store::default();
+        let drawn = screen(100, 1, |frame, shell| {
+            render_status_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 1),
+                "",
+                &store,
+                TabId::Registries,
+                0,
+            );
+        });
+        assert!(drawn.contains("registries"), "{drawn}");
+        assert!(!drawn.contains("secrets"), "{drawn}");
     }
 
     #[test]

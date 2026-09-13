@@ -10,6 +10,7 @@
 //! vaults = ["kv-dev", "kv-qa", "kv-prod"] # only these, in this order; left out: all
 //! registries = ["acrdev", "acrprod"]
 //! refresh = 300                           # seconds between background refreshes; 0 = only `r`
+//! parallel = 8                            # vaults or repositories read at once during a refresh
 //!
 //! [theme]
 //! preset = "custom"          # terminal · terminal-light · mono · custom
@@ -55,6 +56,23 @@ pub struct Azure {
     /// and leaves `r` as the only way to read again.
     #[serde(default)]
     pub refresh: Option<u64>,
+    /// How many vaults, registries or repositories a refresh reads at once.
+    /// Left out is [`DEFAULT_PARALLEL`]; anything below one is one.
+    #[serde(default)]
+    pub parallel: Option<usize>,
+}
+
+/// How many reads a refresh runs side by side when the file does not say.
+/// Eight is well inside every plane's per-resource quota; a Basic-tier
+/// registry with hundreds of repositories is the one place to turn it down.
+pub const DEFAULT_PARALLEL: usize = 8;
+
+impl Azure {
+    /// The threads a refresh fans out over.
+    #[must_use]
+    pub fn threads(&self) -> usize {
+        self.parallel.unwrap_or(DEFAULT_PARALLEL).max(1)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -67,24 +85,12 @@ pub struct ThemeSection {
     pub custom: Option<Palette>,
 }
 
-/// Whether a palette is meant for a dark or a light terminal.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Appearance {
-    #[default]
-    Dark,
-    Light,
-}
-
 /// One palette in the `theme` tool's vocabulary: the grounds from the window
-/// back, three weights of text, one accent, and seven hues.
+/// back, three weights of text, one accent, and seven hues. The tool also
+/// writes a `name` and an `appearance`; nothing here reads them, and unknown
+/// keys are ignored.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Palette {
-    /// The palette's slug, for the footer to name when it changes.
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub appearance: Appearance,
     pub bg: Rgb,
     pub bg_deep: Rgb,
     pub surface: Rgb,
@@ -100,14 +106,6 @@ pub struct Palette {
     pub cyan: Rgb,
     pub orange: Rgb,
     pub teal: Rgb,
-}
-
-impl Palette {
-    /// What the footer calls this palette.
-    #[must_use]
-    pub fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or("custom")
-    }
 }
 
 /// A `#rrggbb` colour.

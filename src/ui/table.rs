@@ -106,16 +106,6 @@ impl Cell {
         }
     }
 
-    /// A cell in one colour, or in whatever its row is painted when the
-    /// screen has nothing to say about this one.
-    #[must_use]
-    pub fn colored(text: impl Into<String>, color: Option<Color>) -> Self {
-        Self::styled(
-            text,
-            color.map_or_else(Style::default, |color| Style::default().fg(color)),
-        )
-    }
-
     /// The same cell with the query's hits in it lit up.
     #[must_use]
     pub fn matched(mut self, matches: Vec<u32>) -> Self {

@@ -18,22 +18,29 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::desktop::{command, is_wsl};
+
+/// Which channel took the text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Channel {
+    /// A clipboard command exited cleanly: the text is on the clipboard.
+    Command,
+    /// Only the OSC 52 escape went out. A terminal that speaks it has the
+    /// text; one that does not has dropped it, and neither gives a receipt.
+    Terminal,
+}
+
 /// Puts `text` on the clipboard by whichever channel works.
 ///
 /// Takes `&str`: the caller is what exposes a secret, and it does so on one
 /// line that is easy to find.
-pub fn copy(text: &str) -> Result<()> {
+pub fn copy(text: &str) -> Result<Channel> {
     // OSC 52 first and always, because it is the one that crosses an SSH
     // hop, and because a terminal that ignores it costs nothing.
     let osc = write_osc52(&mut std::io::stdout(), text);
     match first_that_works(commands(), text) {
-        Ok(()) => Ok(()),
-        Err(error) if osc.is_ok() => {
-            // The escape went out; the terminal may well have taken it. Say
-            // what could not be confirmed rather than claiming a failure.
-            let _ = error;
-            Ok(())
-        }
+        Ok(()) => Ok(Channel::Command),
+        Err(_) if osc.is_ok() => Ok(Channel::Terminal),
         Err(error) => {
             Err(error).context("no clipboard command found and the terminal may not support OSC 52")
         }
@@ -67,12 +74,6 @@ fn commands() -> Vec<Command> {
     commands.push(command("xclip", &["-selection", "clipboard"]));
     commands.push(command("xsel", &["--clipboard", "--input"]));
     commands
-}
-
-fn command(program: &str, args: &[&str]) -> Command {
-    let mut command = Command::new(program);
-    command.args(args);
-    command
 }
 
 /// Runs `commands` in turn, each fed `stdin`, until one exits cleanly. The
@@ -112,14 +113,6 @@ fn write_to_command(mut command: Command, text: &str) -> Result<()> {
     } else {
         bail!("{program} exited with {status}");
     }
-}
-
-/// WSL 1 reports `…-Microsoft`, WSL 2 `…-microsoft-standard-WSL2`. The file
-/// is read rather than `WSL_DISTRO_NAME`, which an ssh session does not
-/// carry.
-fn is_wsl() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
 /// Standard base64 with padding, which is what OSC 52 wants.

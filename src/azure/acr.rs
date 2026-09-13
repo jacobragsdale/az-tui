@@ -33,8 +33,8 @@ const PAGE: usize = 100;
 /// three hours and is cached per registry, the second trades that for an
 /// access token scoped to the one thing about to be read.
 ///
-/// Called from [`Client::bearer`](super::transport::Client::bearer) and
-/// nowhere else, so a registry read looks like every other read from above.
+/// Called from the client's own token cache and nowhere else, so a registry
+/// read looks like every other read from above.
 pub(crate) fn mint(client: &Client, login_server: &str, scope: &str) -> Result<String> {
     let refresh = client.registry_refresh_token(login_server, || exchange(client, login_server))?;
     let issued = client.call_unsigned(Request::post_form(
@@ -53,7 +53,7 @@ pub(crate) fn mint(client: &Client, login_server: &str, scope: &str) -> Result<S
 /// The first of the two posts: a CLI token in, a refresh token out. Once per
 /// registry per run, however many scopes are asked for after it.
 fn exchange(client: &Client, login_server: &str) -> Result<String> {
-    let cli = client.bearer(&Audience::ContainerRegistry)?;
+    let cli = client.token(&Audience::ContainerRegistry)?;
     let mut fields = vec![
         ("grant_type".to_owned(), "access_token".to_owned()),
         ("service".to_owned(), login_server.to_owned()),
@@ -239,24 +239,6 @@ fn tag(entry: &Value) -> Option<Tag> {
     })
 }
 
-/// One line for `doctor`: how many repositories a registry holds, or why it
-/// would not say. No attributes calls — one call per repository is a
-/// listing's job, not a check's.
-pub fn doctor_line(client: &Client, registry: &Registry) -> (String, bool) {
-    let started = std::time::Instant::now();
-    match repositories(client, registry) {
-        Ok(names) => (
-            format!(
-                "{} repositories ({})",
-                names.len(),
-                crate::doctor::took(started)
-            ),
-            true,
-        ),
-        Err(error) => (format!("{error:#}"), false),
-    }
-}
-
 fn tags_url(registry: &Registry, repo: &str, last: Option<&str>) -> String {
     let mut url = format!(
         "https://{}/acr/v1/{}/_tags?n={PAGE}&orderby=timedesc",
@@ -298,11 +280,15 @@ pub fn digest_reference(login_server: &str, repo: &str, digest: &str) -> String 
 }
 
 /// A digest short enough for a cell: the algorithm and eight hex characters.
-/// The details pane prints the whole thing.
+/// The details pane prints the whole thing. Counted in characters: the
+/// string is whatever the registry sent, and a byte slice through a
+/// multi-byte one would panic in the middle of a frame.
 #[must_use]
 pub fn short_digest(digest: &str) -> String {
     match digest.split_once(':') {
-        Some((algorithm, hex)) if hex.len() > 8 => format!("{algorithm}:{}", &hex[..8]),
+        Some((algorithm, hex)) if hex.chars().count() > 8 => {
+            format!("{algorithm}:{}", hex.chars().take(8).collect::<String>())
+        }
         _ => digest.to_owned(),
     }
 }
@@ -349,10 +335,8 @@ mod tests {
         Registry {
             id: "/subscriptions/s/resourceGroups/rg/providers/Microsoft.ContainerRegistry/registries/acrprod".into(),
             name: "acrprod".into(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "Premium".into(),
             login_server: "acrprod.azurecr.io".into(),
         }
     }
@@ -466,6 +450,53 @@ mod tests {
             "the spent refresh token is dropped with the access token"
         );
         assert_eq!(transport.bearers()[5].as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn a_spent_chain_is_rebuilt_from_a_fresh_cli_token() {
+        use crate::azure::auth::FixedTokens;
+        use crate::azure::transport::Client;
+        use crate::azure::transport::fake::FakeTransport;
+
+        // The data plane refuses: the access token, the refresh token *and*
+        // the CLI token they were traded from are all re-minted, or a TUI
+        // open past the CLI token's hour would trade a stale one for ever.
+        let tokens = FixedTokens::new();
+        let transport = FakeTransport::answering([
+            exchanged(),
+            issued("stale"),
+            Answer::status(401, r#"{"errors":[{"message":"expired"}]}"#),
+            exchanged(),
+            issued("fresh"),
+            Answer::json(json!({ "repositories": ["api"] })),
+        ]);
+        let client = Client::new(Box::new(tokens.clone()), Box::new(transport.clone()));
+        repositories(&client, &registry()).unwrap();
+        let sent = transport.sent();
+        assert_ne!(
+            field(&form(&sent[0]), "access_token"),
+            field(&form(&sent[3]), "access_token"),
+            "the second exchange carries a fresh CLI token"
+        );
+        assert_eq!(tokens.count(), 2);
+
+        // The refresh token itself is refused — what happens after three
+        // hours — and the next read still gets through.
+        let (client, transport, _) = fake_client([
+            exchanged(),
+            issued("a"),
+            Answer::json(json!({ "repositories": ["api"] })),
+            Answer::status(401, r#"{"errors":[{"message":"refresh token expired"}]}"#),
+            exchanged(),
+            issued("b"),
+            Answer::json(json!({ "imageName": "api" })),
+        ]);
+        repositories(&client, &registry()).unwrap();
+        assert!(
+            attributes(&client, &registry(), "api").is_ok(),
+            "{:?}",
+            transport.urls()
+        );
     }
 
     #[test]
@@ -695,6 +726,12 @@ mod tests {
             "nothing to trim"
         );
         assert_eq!(short_digest("nonsense"), "nonsense");
+        assert_eq!(
+            short_digest("sha256:aéééééé"),
+            "sha256:aéééééé",
+            "a registry's string is cut by character, never mid-byte"
+        );
+        assert_eq!(short_digest("sha256:éééééééééé"), "sha256:éééééééé");
     }
 
     #[test]

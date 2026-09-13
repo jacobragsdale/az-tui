@@ -10,19 +10,22 @@
 use std::io::Write;
 
 use anyhow::Result;
+use serde::Serialize;
 use serde_json::json;
 
-use crate::azure::transport::Client;
-use crate::azure::{Registry, Repository, SecretRow, Vault, acr, graph, vault};
+use crate::azure::transport::{Client, said};
+use crate::azure::{
+    Inventory, Registry, Repository, SecretRow, Vault, acr, allowed, graph, missing, vault,
+};
 use crate::cache;
 use crate::config::Azure;
 use crate::filter::Query;
+use crate::parallel;
 use crate::timestamp::Timestamp;
 
 /// What a command exits with. 0 ok, 1 a read failed, 2 the arguments were
 /// wrong — the shape `grep` and friends use, so a script can tell "nothing
 /// matched" from "you asked wrong".
-pub const OK: i32 = 0;
 pub const FAILED: i32 = 1;
 pub const BAD_ARGUMENTS: i32 = 2;
 
@@ -40,23 +43,30 @@ impl Failure {
             code: BAD_ARGUMENTS,
         }
     }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: FAILED,
+        }
+    }
 }
 
 impl From<anyhow::Error> for Failure {
     fn from(error: anyhow::Error) -> Self {
-        // A missing login is the one failure worth rewording: the CLI
-        // answers it with a paragraph of its own stack, and what a person
-        // needs is the two words that fix it. Every command's errors funnel
-        // through here, as the worker's do through its own.
-        let message = if crate::azure::transport::is_signed_out(&error) {
-            "not signed in — run `az login`".to_owned()
-        } else {
-            format!("{error:#}")
-        };
-        Self {
-            message,
-            code: FAILED,
-        }
+        Self::failed(said(&error))
+    }
+}
+
+impl From<std::io::Error> for Failure {
+    fn from(error: std::io::Error) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Failure {
+    fn from(error: serde_json::Error) -> Self {
+        Self::failed(error.to_string())
     }
 }
 
@@ -71,12 +81,11 @@ pub struct Context<'a> {
 impl Context<'_> {
     /// The inventory, from the cache when it is young enough and from Azure
     /// otherwise. A command that has to be current passes `refresh`.
-    fn inventory(&self, refresh: bool) -> Result<(Vec<Vault>, Vec<Registry>)> {
+    fn inventory(&self, refresh: bool) -> Result<Inventory> {
         if !refresh && let Some(snapshot) = self.snapshot() {
-            return Ok((snapshot.inventory.vaults, snapshot.inventory.registries));
+            return Ok(snapshot.inventory);
         }
-        let inventory = graph::inventory(self.client, self.azure)?;
-        Ok((inventory.vaults, inventory.registries))
+        graph::inventory(self.client, self.azure)
     }
 
     /// The cache, if there is one and it is younger than the refresh
@@ -95,6 +104,10 @@ impl Context<'_> {
 }
 
 /// `az-tui secrets [QUERY] [--vault NAME]…`
+///
+/// Every row that answered is printed; a vault that would not answer is
+/// then the exit code, so a script can tell a whole listing from a partial
+/// one.
 pub fn secrets(
     out: &mut impl Write,
     context: &Context<'_>,
@@ -103,7 +116,7 @@ pub fn secrets(
     json: bool,
     refresh: bool,
 ) -> Result<(), Failure> {
-    let rows = read_secrets(context, only, refresh)?;
+    let (rows, failed) = read_secrets(context, only, refresh)?;
     let now = Timestamp::now();
     let parsed = Query::parse(query.unwrap_or_default(), crate::app::secrets::SCHEMA);
     let mut words = crate::search::Query::new(&parsed.words);
@@ -134,30 +147,21 @@ pub fn secrets(
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&document).map_err(anyhow::Error::from)?
-        )
-        .map_err(anyhow::Error::from)?;
-        return Ok(());
+        print_json(out, &document)?;
+    } else {
+        for row in shown {
+            writeln!(
+                out,
+                "{:<16} {:<40} {:<8} {:<10} {}",
+                row.vault,
+                row.name,
+                if row.enabled { "enabled" } else { "disabled" },
+                crate::timestamp::age(row.expires, now),
+                crate::timestamp::age(row.updated, now),
+            )?;
+        }
     }
-
-    for row in shown {
-        writeln!(
-            out,
-            "{:<16} {:<40} {:<8} {:<10} {}",
-            row.vault,
-            row.name,
-            if row.enabled { "enabled" } else { "disabled" },
-            row.expires
-                .map_or_else(|| "—".to_owned(), |at| at.relative_age(now)),
-            row.updated
-                .map_or_else(|| "—".to_owned(), |at| at.relative_age(now))
-        )
-        .map_err(anyhow::Error::from)?;
-    }
-    Ok(())
+    partial(failed)
 }
 
 /// `az-tui secret get NAME [--vault NAME] [--version ID]`
@@ -171,20 +175,25 @@ pub fn secret_get(
     version: Option<&str>,
     json: bool,
 ) -> Result<(), Failure> {
-    let (vaults, _) = context.inventory(false)?;
-    let vaults = allowed_vaults(vaults, context.azure, only);
+    let vaults = narrow(
+        context.inventory(false)?.vaults,
+        &context.azure.vaults,
+        only.map(str::to_owned).as_slice(),
+        "vault",
+        |vault| vault.name.as_str(),
+    )?;
     if vaults.is_empty() {
-        return Err(Failure::arguments(match only {
-            Some(named) => format!("no vault called {named}"),
-            None => "the login can reach no vaults".to_owned(),
-        }));
+        return Err(Failure::arguments("the login can reach no vaults"));
     }
 
     // Which vaults actually hold it. A name in more than one and no --vault
     // is ambiguous, and guessing would be the worst possible answer.
     let mut holding = Vec::new();
-    for vault in &vaults {
-        match vault::secrets(context.client, vault) {
+    let listed = parallel::map(&vaults, context.azure.threads(), |vault| {
+        vault::secrets(context.client, vault)
+    });
+    for (vault, listing) in vaults.iter().zip(listed) {
+        match listing {
             Ok(rows) => {
                 if let Some(row) = rows.into_iter().find(|row| row.name == name) {
                     holding.push((vault.clone(), row));
@@ -198,18 +207,14 @@ pub fn secret_get(
     }
     let [(held, row)] = holding.as_slice() else {
         return Err(if holding.is_empty() {
-            Failure {
-                message: format!("no secret called {name} in {}", named(&vaults)),
-                code: FAILED,
-            }
+            Failure::failed(format!(
+                "no secret called {name} in {}",
+                joined(vaults.iter().map(|vault| vault.name.as_str()))
+            ))
         } else {
             Failure::arguments(format!(
                 "{name} is in more than one vault ({}); name one with --vault",
-                holding
-                    .iter()
-                    .map(|(vault, _)| vault.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                joined(holding.iter().map(|(vault, _)| vault.name.as_str()))
             ))
         });
     };
@@ -226,12 +231,11 @@ pub fn secret_get(
             "content_type": row.content_type,
             "value": value,
         });
-        writeln!(out, "{document}").map_err(anyhow::Error::from)?;
+        writeln!(out, "{document}")?;
     } else {
         // No newline of its own: a value that ends in one keeps it, and one
         // that does not is not given one.
-        out.write_all(value.as_bytes())
-            .map_err(anyhow::Error::from)?;
+        out.write_all(value.as_bytes())?;
     }
     Ok(())
 }
@@ -245,7 +249,7 @@ pub fn repos(
     json: bool,
     refresh: bool,
 ) -> Result<(), Failure> {
-    let rows = read_repositories(context, only, refresh)?;
+    let (rows, failed) = read_repositories(context, only, refresh)?;
     let now = Timestamp::now();
     let parsed = Query::parse(
         query.unwrap_or_default(),
@@ -274,28 +278,21 @@ pub fn repos(
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&document).map_err(anyhow::Error::from)?
-        )
-        .map_err(anyhow::Error::from)?;
-        return Ok(());
+        print_json(out, &document)?;
+    } else {
+        for row in shown {
+            writeln!(
+                out,
+                "{:<16} {:<40} {:>6} {}",
+                row.registry,
+                row.name,
+                row.tag_count
+                    .map_or_else(|| "—".to_owned(), |count| count.to_string()),
+                crate::timestamp::age(row.updated, now),
+            )?;
+        }
     }
-    for row in shown {
-        writeln!(
-            out,
-            "{:<16} {:<40} {:>6} {}",
-            row.registry,
-            row.name,
-            row.tag_count
-                .map_or_else(|| "—".to_owned(), |count| count.to_string()),
-            row.updated
-                .map_or_else(|| "—".to_owned(), |at| at.relative_age(now))
-        )
-        .map_err(anyhow::Error::from)?;
-    }
-    Ok(())
+    partial(failed)
 }
 
 /// `az-tui tags REPO [--registry NAME]`
@@ -306,18 +303,23 @@ pub fn tags(
     only: Option<&str>,
     json: bool,
 ) -> Result<(), Failure> {
-    let (_, registries) = context.inventory(false)?;
-    let registries = allowed_registries(registries, context.azure, only);
+    let registries = narrow(
+        context.inventory(false)?.registries,
+        &context.azure.registries,
+        only.map(str::to_owned).as_slice(),
+        "registry",
+        |registry| registry.name.as_str(),
+    )?;
     if registries.is_empty() {
-        return Err(Failure::arguments(match only {
-            Some(named) => format!("no registry called {named}"),
-            None => "the login can reach no registries".to_owned(),
-        }));
+        return Err(Failure::arguments("the login can reach no registries"));
     }
 
     let mut holding = Vec::new();
-    for registry in &registries {
-        match acr::repositories(context.client, registry) {
+    let catalogs = parallel::map(&registries, context.azure.threads(), |registry| {
+        acr::repositories(context.client, registry)
+    });
+    for (registry, catalog) in registries.iter().zip(catalogs) {
+        match catalog {
             Ok(names) if names.iter().any(|held| held == repo) => holding.push(registry.clone()),
             Ok(_) => {}
             Err(error) if registries.len() == 1 => return Err(error.into()),
@@ -326,17 +328,14 @@ pub fn tags(
     }
     let [held] = holding.as_slice() else {
         return Err(if holding.is_empty() {
-            Failure {
-                message: format!(
-                    "no repository called {repo} in {}",
-                    named_registries(&registries)
-                ),
-                code: FAILED,
-            }
+            Failure::failed(format!(
+                "no repository called {repo} in {}",
+                joined(registries.iter().map(|registry| registry.name.as_str()))
+            ))
         } else {
             Failure::arguments(format!(
                 "{repo} is in more than one registry ({}); name one with --registry",
-                named_registries(&holding)
+                joined(holding.iter().map(|registry| registry.name.as_str()))
             ))
         });
     };
@@ -358,174 +357,165 @@ pub fn tags(
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&document).map_err(anyhow::Error::from)?
-        )
-        .map_err(anyhow::Error::from)?;
-        return Ok(());
-    }
-    for tag in &tags {
-        writeln!(
-            out,
-            "{:<30} {:<20} {}",
-            tag.name,
-            acr::short_digest(&tag.digest),
-            tag.updated
-                .map_or_else(|| "—".to_owned(), |at| at.relative_age(now))
-        )
-        .map_err(anyhow::Error::from)?;
+        print_json(out, &document)?;
+    } else {
+        for tag in &tags {
+            writeln!(
+                out,
+                "{:<30} {:<20} {}",
+                tag.name,
+                acr::short_digest(&tag.digest),
+                crate::timestamp::age(tag.updated, now),
+            )?;
+        }
     }
     Ok(())
 }
 
-/// Every secret in every allowed vault, from the cache or from Azure.
+/// Every secret in every allowed vault, from the cache or from Azure, and
+/// the vaults that would not answer.
 fn read_secrets(
     context: &Context<'_>,
     only: &[String],
     refresh: bool,
-) -> Result<Vec<SecretRow>, Failure> {
+) -> Result<(Vec<SecretRow>, Vec<String>), Failure> {
     if !refresh && let Some(snapshot) = context.snapshot() {
-        let wanted = wanted(only, &context.azure.vaults);
-        return Ok(snapshot
+        let vaults = narrow(
+            snapshot.inventory.vaults,
+            &context.azure.vaults,
+            only,
+            "vault",
+            vault_name,
+        )?;
+        let all = only.is_empty() && context.azure.vaults.is_empty();
+        let rows = snapshot
             .secrets
             .into_iter()
-            .filter(|row| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&row.vault))
-            })
-            .collect());
+            .filter(|row| all || vaults.iter().any(|vault| vault.name == row.vault))
+            .collect();
+        return Ok((rows, Vec::new()));
     }
-    let (vaults, _) = context.inventory(refresh)?;
-    let vaults = allowed_vaults(vaults, context.azure, None);
-    let vaults = keep_named(vaults, only, |vault| vault.name.as_str());
+    let vaults = narrow(
+        context.inventory(refresh)?.vaults,
+        &context.azure.vaults,
+        only,
+        "vault",
+        vault_name,
+    )?;
     let mut rows = Vec::new();
     let mut failed = Vec::new();
-    for vault in &vaults {
-        match vault::secrets(context.client, vault) {
+    let listed = parallel::map(&vaults, context.azure.threads(), |vault| {
+        vault::secrets(context.client, vault)
+    });
+    for listing in listed {
+        match listing {
             Ok(found) => rows.extend(found),
             Err(error) => failed.push(format!("{error:#}")),
         }
     }
-    if rows.is_empty() && !failed.is_empty() {
-        return Err(Failure {
-            message: failed.join("; "),
-            code: FAILED,
-        });
-    }
-    for message in failed {
-        eprintln!("warning: {message}");
-    }
-    Ok(rows)
+    Ok((rows, failed))
 }
 
 fn read_repositories(
     context: &Context<'_>,
     only: &[String],
     refresh: bool,
-) -> Result<Vec<Repository>, Failure> {
+) -> Result<(Vec<Repository>, Vec<String>), Failure> {
     if !refresh && let Some(snapshot) = context.snapshot() {
-        let wanted = wanted(only, &context.azure.registries);
-        return Ok(snapshot
+        let registries = narrow(
+            snapshot.inventory.registries,
+            &context.azure.registries,
+            only,
+            "registry",
+            registry_name,
+        )?;
+        let all = only.is_empty() && context.azure.registries.is_empty();
+        let rows = snapshot
             .repositories
             .into_iter()
-            .filter(|row| {
-                wanted
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&row.registry))
-            })
-            .collect());
+            .filter(|row| all || registries.iter().any(|held| held.name == row.registry))
+            .collect();
+        return Ok((rows, Vec::new()));
     }
-    let (_, registries) = context.inventory(refresh)?;
-    let registries = allowed_registries(registries, context.azure, None);
-    let registries = keep_named(registries, only, |registry| registry.name.as_str());
+    let registries = narrow(
+        context.inventory(refresh)?.registries,
+        &context.azure.registries,
+        only,
+        "registry",
+        registry_name,
+    )?;
     let mut rows = Vec::new();
     let mut failed = Vec::new();
-    for registry in &registries {
-        match acr::repositories(context.client, registry) {
-            Ok(names) => rows.extend(names.into_iter().map(|name| Repository {
-                registry: registry.name.clone(),
-                name,
-                tag_count: None,
-                manifest_count: None,
-                created: None,
-                updated: None,
-            })),
+    let catalogs = parallel::map(&registries, context.azure.threads(), |registry| {
+        acr::repositories(context.client, registry)
+    });
+    for (registry, catalog) in registries.iter().zip(catalogs) {
+        match catalog {
+            Ok(names) => rows.extend(
+                names
+                    .iter()
+                    .map(|name| Repository::unfilled(&registry.name, name)),
+            ),
             Err(error) => failed.push(format!("{error:#}")),
         }
     }
-    if rows.is_empty() && !failed.is_empty() {
-        return Err(Failure {
-            message: failed.join("; "),
-            code: FAILED,
-        });
-    }
-    for message in failed {
-        eprintln!("warning: {message}");
-    }
-    Ok(rows)
+    Ok((rows, failed))
 }
 
-/// The names a command was told to keep, lowercased, or `None` for all of
-/// them. A `--vault` flag narrows the file's list rather than replacing it.
-fn wanted(flags: &[String], configured: &[String]) -> Option<Vec<String>> {
-    let names: Vec<String> = if flags.is_empty() {
-        configured.to_vec()
-    } else {
-        flags.to_vec()
-    };
-    (!names.is_empty()).then(|| names.iter().map(|name| name.trim().to_owned()).collect())
-}
-
-fn keep_named<T: Clone>(
+/// The vaults or registries a command reads: the configuration's allowlist
+/// first, then the command's own `--vault`/`--registry` on top of it. Naming
+/// one the login cannot reach is an argument error that says what it can.
+fn narrow<T: Clone>(
     found: Vec<T>,
+    configured: &[String],
     only: &[String],
+    kind: &str,
     name_of: impl Fn(&T) -> &str + Copy,
-) -> Vec<T> {
-    if only.is_empty() {
-        return found;
+) -> Result<Vec<T>, Failure> {
+    let reachable = allowed(found, configured, name_of);
+    let gone = missing(&reachable, only, name_of);
+    if !gone.is_empty() {
+        return Err(Failure::arguments(if reachable.is_empty() {
+            format!(
+                "no {kind} called {}; the login can reach no {kind}",
+                gone.join(", ")
+            )
+        } else {
+            format!(
+                "no {kind} called {}; the login can reach {}",
+                gone.join(", "),
+                joined(reachable.iter().map(name_of))
+            )
+        }));
     }
-    crate::azure::allowed(found, only, name_of)
+    Ok(allowed(reachable, only, name_of))
 }
 
-fn allowed_vaults(found: Vec<Vault>, azure: &Azure, only: Option<&str>) -> Vec<Vault> {
-    let found = crate::azure::allowed(found, &azure.vaults, |vault| vault.name.as_str());
-    match only {
-        Some(name) => found
-            .into_iter()
-            .filter(|vault| vault.name.eq_ignore_ascii_case(name.trim()))
-            .collect(),
-        None => found,
+/// What a listing that printed its rows exits with: a read that failed is
+/// the exit code, however many rows the others answered with.
+fn partial(failed: Vec<String>) -> Result<(), Failure> {
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::failed(failed.join("; ")))
     }
 }
 
-fn allowed_registries(found: Vec<Registry>, azure: &Azure, only: Option<&str>) -> Vec<Registry> {
-    let found = crate::azure::allowed(found, &azure.registries, |registry| registry.name.as_str());
-    match only {
-        Some(name) => found
-            .into_iter()
-            .filter(|registry| registry.name.eq_ignore_ascii_case(name.trim()))
-            .collect(),
-        None => found,
-    }
+fn print_json(out: &mut impl Write, document: &impl Serialize) -> Result<(), Failure> {
+    writeln!(out, "{}", serde_json::to_string_pretty(document)?)?;
+    Ok(())
 }
 
-fn named(vaults: &[Vault]) -> String {
-    vaults
-        .iter()
-        .map(|vault| vault.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+fn vault_name(vault: &Vault) -> &str {
+    &vault.name
 }
 
-fn named_registries(registries: &[Registry]) -> String {
-    registries
-        .iter()
-        .map(|registry| registry.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+fn registry_name(registry: &Registry) -> &str {
+    &registry.name
+}
+
+fn joined<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    names.collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -572,6 +562,16 @@ mod tests {
         }))
     }
 
+    /// One thread, so the fake's canned answers land in the order they were
+    /// given: every test here reads several vaults and says which is which
+    /// by that order.
+    fn serial() -> Azure {
+        Azure {
+            parallel: Some(1),
+            ..Azure::default()
+        }
+    }
+
     fn context<'a>(client: &'a Client, azure: &'a Azure) -> Context<'a> {
         Context {
             azure,
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn secrets_prints_one_line_per_secret_and_the_query_narrows_it() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["api-key", "db-password"]),
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn the_json_of_a_listing_can_never_carry_a_value() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["api-key"]),
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn a_vault_flag_narrows_what_is_read_at_all() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, transport, _) =
             fake_client([inventory_answer(), listing("kv-prod", &["db-password"])]);
         let mut out = Vec::new();
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn secret_get_prints_the_value_and_nothing_else() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["api-key"]),
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn secret_get_keeps_a_value_that_ends_in_a_newline() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["pem"]),
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn secret_get_refuses_to_guess_when_two_vaults_hold_the_name() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["db-password"]),
@@ -759,7 +759,7 @@ mod tests {
             Box::new(tokens),
             Box::new(crate::azure::transport::fake::FakeTransport::answering([])),
         );
-        let azure = Azure::default();
+        let azure = serial();
         let mut out = Vec::new();
         let failure =
             secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
@@ -769,7 +769,7 @@ mod tests {
 
     #[test]
     fn a_name_nothing_holds_is_a_read_failure_rather_than_an_argument_one() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["api-key"]),
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn secret_get_json_names_the_vault_and_the_version_it_read() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["api-key"]),
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn repos_and_tags_print_what_a_script_would_pull() {
-        let azure = Azure::default();
+        let azure = serial();
         let (client, _, _) = fake_client([
             inventory_answer(),
             Answer::json(json!({ "refresh_token": "r" })),
@@ -882,6 +882,69 @@ mod tests {
     }
 
     #[test]
+    fn a_vault_that_would_not_answer_is_the_exit_code_after_the_rows_that_did() {
+        let azure = serial();
+        let (client, _, _) = fake_client([
+            inventory_answer(),
+            listing("kv-dev", &["api-key"]),
+            Answer::status(403, r#"{"error":{"code":"Forbidden","message":"no"}}"#),
+        ]);
+        let mut out = Vec::new();
+        let failure =
+            secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
+        assert_eq!(failure.code, FAILED);
+        assert!(failure.message.contains("kv-prod"), "{}", failure.message);
+        assert!(
+            text(out).contains("api-key"),
+            "the rows that answered were still printed"
+        );
+    }
+
+    #[test]
+    fn a_vault_the_login_cannot_reach_is_an_argument_error_that_names_the_ones_it_can() {
+        let azure = serial();
+        let (client, _, _) = fake_client([inventory_answer()]);
+        let mut out = Vec::new();
+        let failure = secrets(
+            &mut out,
+            &context(&client, &azure),
+            None,
+            &["kv-typo".to_owned()],
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, BAD_ARGUMENTS);
+        assert!(
+            failure.message.contains("no vault called kv-typo"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("kv-dev, kv-prod"),
+            "{}",
+            failure.message
+        );
+
+        let (client, _, _) = fake_client([inventory_answer()]);
+        let failure = secret_get(
+            &mut out,
+            &context(&client, &azure),
+            "x",
+            Some("kv-x"),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, BAD_ARGUMENTS);
+        assert!(
+            failure.message.contains("kv-dev, kv-prod"),
+            "{}",
+            failure.message
+        );
+    }
+
+    #[test]
     fn a_cache_young_enough_is_read_instead_of_azure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.json");
@@ -889,7 +952,16 @@ mod tests {
             &path,
             &cache::Snapshot::new(
                 Timestamp::now(),
-                crate::azure::Inventory::default(),
+                crate::azure::Inventory {
+                    vaults: vec![Vault {
+                        id: "/vaults/kv-cached".into(),
+                        name: "kv-cached".into(),
+                        resource_group: "rg".into(),
+                        location: "eastus".into(),
+                        uri: "https://kv-cached.vault.azure.net/".into(),
+                    }],
+                    registries: Vec::new(),
+                },
                 vec![SecretRow {
                     vault: "kv-cached".into(),
                     name: "from-the-cache".into(),
@@ -907,7 +979,7 @@ mod tests {
         )
         .unwrap();
 
-        let azure = Azure::default();
+        let azure = serial();
         // No answers at all: reading one would panic the fake transport,
         // which is exactly the assertion.
         let (client, transport, _) = fake_client([]);
@@ -920,6 +992,20 @@ mod tests {
         secrets(&mut out, &context, None, &[], false, false).unwrap();
         assert!(text(out).contains("from-the-cache"));
         assert!(transport.sent().is_empty(), "nothing went out");
+
+        // `--vault` narrows the cache the way it narrows Azure: without
+        // regard to case.
+        let mut out = Vec::new();
+        secrets(
+            &mut out,
+            &context,
+            None,
+            &["KV-CACHED".to_owned()],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(text(out).contains("from-the-cache"));
 
         // `--refresh` goes and looks whatever the cache holds.
         let (client, transport, _) = fake_client([
@@ -953,7 +1039,7 @@ mod tests {
         )
         .unwrap();
 
-        let azure = Azure::default();
+        let azure = serial();
         let (client, transport, _) = fake_client([
             inventory_answer(),
             listing("kv-dev", &["a"]),

@@ -26,10 +26,8 @@ pub struct Vault {
     /// from.
     pub id: String,
     pub name: String,
-    pub subscription_id: String,
     pub resource_group: String,
     pub location: String,
-    pub sku: String,
     /// The data-plane base, `https://kv-prod.vault.azure.net/`, trailing
     /// slash included.
     pub uri: String,
@@ -40,10 +38,8 @@ pub struct Vault {
 pub struct Registry {
     pub id: String,
     pub name: String,
-    pub subscription_id: String,
     pub resource_group: String,
     pub location: String,
-    pub sku: String,
     /// The data-plane host, `acrprod.azurecr.io`.
     pub login_server: String,
 }
@@ -95,6 +91,22 @@ pub struct Repository {
     pub manifest_count: Option<u64>,
     pub created: Option<Timestamp>,
     pub updated: Option<Timestamp>,
+}
+
+impl Repository {
+    /// A row as the catalog lists it: a name, and everything else still to
+    /// come.
+    #[must_use]
+    pub fn unfilled(registry: &str, name: &str) -> Self {
+        Self {
+            registry: registry.to_owned(),
+            name: name.to_owned(),
+            tag_count: None,
+            manifest_count: None,
+            created: None,
+            updated: None,
+        }
+    }
 }
 
 /// One tag, and the manifest it points at.

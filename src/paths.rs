@@ -9,19 +9,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Reads one variable, the way the process does.
-#[must_use]
-pub fn from_env(name: &str) -> Option<OsString> {
+fn from_env(name: &str) -> Option<OsString> {
     std::env::var_os(name)
 }
 
 /// `$XDG_CONFIG_HOME/az-tui`, else `~/.config/az-tui` — on macOS too, because
 /// that is where every other terminal program keeps its own.
-#[must_use]
-pub fn config_dir() -> PathBuf {
-    config_dir_with(from_env)
-}
-
-pub fn config_dir_with(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+fn config_dir_with(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     absolute(env("XDG_CONFIG_HOME"))
         .or_else(|| absolute(env("HOME")).map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from(".config"))
@@ -30,12 +24,7 @@ pub fn config_dir_with(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
 
 /// `$XDG_DATA_HOME/az-tui`, else `~/.local/share/az-tui`, and
 /// `~/Library/Application Support/az-tui` on macOS.
-#[must_use]
-pub fn data_dir() -> PathBuf {
-    data_dir_with(from_env)
-}
-
-pub fn data_dir_with(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+fn data_dir_with(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     absolute(env("XDG_DATA_HOME"))
         .or_else(|| {
             absolute(env("HOME")).map(|home| {

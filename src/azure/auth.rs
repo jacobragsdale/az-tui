@@ -71,7 +71,7 @@ impl Audience {
 
 /// Where a token comes from. One seam, so every test hands the client fixed
 /// strings instead of shelling out to `az`.
-pub trait TokenSource: Send {
+pub trait TokenSource: Send + Sync {
     fn token(&self, audience: &Audience) -> Result<String>;
 
     /// The tenant the login is in, for the one form field that wants it.
@@ -95,6 +95,10 @@ impl TokenSource for AzCli {
     /// would show three lines of the CLI's stack where "run `az login`"
     /// belongs, and would go on asking every vault in turn for a token it
     /// cannot get.
+    ///
+    /// The one failure that is not a login is `az` not being there at all:
+    /// that one keeps its own words, which say to install it, rather than
+    /// being reduced to "run `az login`" — a program the user does not have.
     fn token(&self, audience: &Audience) -> Result<String> {
         az(&[
             "account",
@@ -107,10 +111,11 @@ impl TokenSource for AzCli {
             "tsv",
         ])
         .map_err(|error| {
-            anyhow::Error::new(crate::azure::transport::NoLogin(format!(
-                "could not get a token for {}: {error:#}",
-                audience.label()
-            )))
+            let message = format!("could not get a token for {}: {error:#}", audience.label());
+            if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+                return anyhow::anyhow!(message);
+            }
+            anyhow::Error::new(crate::azure::transport::NoLogin(message))
         })
     }
 }

@@ -73,7 +73,10 @@ impl Session {
             .with_context(|| format!("failed to make {}", directory.display()))?;
         let mut file = tempfile::NamedTempFile::new_in(directory)
             .with_context(|| format!("failed to write in {}", directory.display()))?;
-        serde_json::to_writer_pretty(&mut file, self).context("failed to write the session")?;
+        // Whole, then once: the temp file is unbuffered.
+        let bytes = serde_json::to_vec_pretty(self).context("failed to write the session")?;
+        file.write_all(&bytes)
+            .context("failed to write the session")?;
         file.flush().context("failed to write the session")?;
         file.persist(path)
             .with_context(|| format!("failed to replace {}", path.display()))?;

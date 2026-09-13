@@ -42,8 +42,54 @@ fn a_throttle_waits_the_header_out_and_asks_once_more() {
         .unwrap();
     assert_eq!(waits.taken(), [Duration::from_secs(2)]);
     assert_eq!(transport.sent().len(), 2);
-    assert_eq!(client.last_throttle(), Some(Duration::from_secs(2)));
-    assert_eq!(client.last_throttle(), None, "reading it clears it");
+}
+
+#[test]
+fn a_2xx_with_nothing_in_it_is_a_failure_rather_than_no_rows() {
+    let (client, _, _) = client([Answer::ok("  ")]);
+    let error = client
+        .call(&Audience::Vault, Request::get("https://kv/secrets"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("empty body"), "{error:#}");
+}
+
+#[test]
+fn a_token_that_cannot_be_minted_is_retried_once_unless_there_is_no_login() {
+    use super::super::auth::FixedTokens;
+
+    // The mint itself says the token is spent — what a registry's refresh
+    // token does after three hours — and the second mint is what is used.
+    let tokens = FixedTokens::new();
+    tokens
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::Error::new(SignedOut("spent".to_owned()))));
+    let transport = fake::FakeTransport::answering([Answer::json(json!({"ok": true}))]);
+    let client = Client::new(Box::new(tokens.clone()), Box::new(transport));
+    client
+        .call(&Audience::Arm, Request::get("https://example/one"))
+        .unwrap();
+    assert_eq!(tokens.count(), 2, "one failed mint, one that worked");
+
+    // No login at all is said once, not tried twice.
+    let tokens = FixedTokens::new();
+    tokens
+        .answers
+        .lock()
+        .unwrap()
+        .push_back(Err(anyhow::Error::new(NoLogin("nope".to_owned()))));
+    let transport = fake::FakeTransport::answering([]);
+    let client = Client::new(Box::new(tokens.clone()), Box::new(transport));
+    let error = client
+        .call(&Audience::Arm, Request::get("https://example/one"))
+        .unwrap_err();
+    assert!(is_no_login(&error));
+    assert_eq!(
+        tokens.count(),
+        1,
+        "a second shell-out would fail the same way"
+    );
 }
 
 #[test]
@@ -72,7 +118,7 @@ fn a_token_is_minted_once_and_then_reused() {
         .call(&Audience::Arm, Request::get("https://example/two"))
         .unwrap();
     // Two calls, one mint: the second reads the cache.
-    assert_eq!(client.cached.borrow().len(), 1);
+    assert_eq!(locked(&client.cached).len(), 1);
 }
 
 #[test]

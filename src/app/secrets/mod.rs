@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::cursor::ListCursor;
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
+use super::{flip, none_last};
 use crate::azure::{Secret, SecretRow};
 use crate::columns::{ColumnId, SECRET_COLUMNS, TableLayout};
 use crate::filter::{self, Query, When};
@@ -116,15 +117,16 @@ impl Expiry {
         }
     }
 
-    /// What the Expires cell says.
+    /// What the Expires cell says. An expiry inside the window carries its
+    /// own mark as well as its colour, so it still reads under `NO_COLOR`.
     #[must_use]
     pub fn cell(self, expires: Option<Timestamp>, now: Timestamp) -> String {
+        let age = expires.map(|expires| expires.relative_age(now));
         match self {
             Self::None => "—".to_owned(),
             Self::Expired => "expired".to_owned(),
-            Self::Soon | Self::Later => expires
-                .map(|expires| expires.relative_age(now))
-                .unwrap_or_default(),
+            Self::Soon => format!("{} ⚠", age.unwrap_or_default()),
+            Self::Later => age.unwrap_or_default(),
         }
     }
 }
@@ -175,15 +177,7 @@ pub fn sort(
     by: ColumnId,
     descending: bool,
     order: &HashMap<&str, usize>,
-    _now: Timestamp,
 ) {
-    let flip = |ordering: std::cmp::Ordering| {
-        if descending {
-            ordering.reverse()
-        } else {
-            ordering
-        }
-    };
     indices.sort_by(|a, b| {
         let (left, right) = (&rows[*a], &rows[*b]);
         let ordering = match by {
@@ -191,22 +185,17 @@ pub fn sort(
                 order
                     .get(left.vault.as_str())
                     .cmp(&order.get(right.vault.as_str())),
+                descending,
             ),
-            ColumnId::Enabled => flip(left.enabled.cmp(&right.enabled)),
-            ColumnId::Expires => stamps(left.expires, right.expires, descending),
-            ColumnId::Updated => stamps(left.updated, right.updated, descending),
-            ColumnId::Created => stamps(left.created, right.created, descending),
-            ColumnId::Type => flip(left.content_type.cmp(&right.content_type)),
+            ColumnId::Enabled => flip(left.enabled.cmp(&right.enabled), descending),
+            ColumnId::Expires => none_last(left.expires, right.expires, descending),
+            ColumnId::Updated => none_last(left.updated, right.updated, descending),
+            ColumnId::Created => none_last(left.created, right.created, descending),
+            ColumnId::Type => flip(left.content_type.cmp(&right.content_type), descending),
             _ => std::cmp::Ordering::Equal,
         };
         ordering
-            .then_with(|| {
-                flip(
-                    left.name
-                        .to_ascii_lowercase()
-                        .cmp(&right.name.to_ascii_lowercase()),
-                )
-            })
+            .then_with(|| flip(cmp_ignore_ascii_case(&left.name, &right.name), descending))
             .then_with(|| {
                 order
                     .get(left.vault.as_str())
@@ -215,35 +204,12 @@ pub fn sort(
     });
 }
 
-/// Two stamps, with a missing one always last.
-///
-/// The absence is compared outside the flip on purpose: `S` should turn the
-/// dates over, not move "has no expiry" to the top of a list of things that
-/// are expiring.
-fn stamps(
-    left: Option<Timestamp>,
-    right: Option<Timestamp>,
-    descending: bool,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(left), Some(right)) => {
-            if descending {
-                right.cmp(&left)
-            } else {
-                left.cmp(&right)
-            }
-        }
-    }
-}
-
-/// The table a Secrets tab opens with.
-#[must_use]
-pub fn default_layout() -> TableLayout {
-    TableLayout::new(SECRET_COLUMNS)
+/// Two names, compared without regard to ASCII case and without allocating:
+/// this runs a million times in a sort of forty thousand rows.
+fn cmp_ignore_ascii_case(left: &str, right: &str) -> std::cmp::Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
 /// A value, on screen, and when it got there.
@@ -363,7 +329,7 @@ impl Default for SecretsScreen {
     fn default() -> Self {
         Self {
             cursor: ListCursor::default(),
-            layout: default_layout(),
+            layout: TableLayout::new(SECRET_COLUMNS),
             input: TextInput::default(),
             sort: ColumnId::Name,
             descending: false,
@@ -445,7 +411,6 @@ impl SecretsScreen {
             self.sort,
             self.descending,
             &vault_order(store),
-            Timestamp::now(),
         );
     }
 
@@ -606,6 +571,8 @@ impl SecretsScreen {
         }
     }
 
+    /// A click on a row moves the cursor there, and takes a revealed value
+    /// off the screen with it, as a key would.
     pub fn handle_click(
         &mut self,
         _shell: &mut Shell,
@@ -613,14 +580,16 @@ impl SecretsScreen {
         target: Target,
     ) -> AppAction {
         match target {
-            Target::Row(index) => self
-                .cursor
-                .focus(index.min(self.visible.len().saturating_sub(1))),
-            Target::Header(key) => {
-                if let Some(column) = ColumnId::from_key(key) {
-                    self.sort_by(column);
+            Target::Row(index) => {
+                let before = self.cursor.index;
+                self.cursor
+                    .focus(index.min(self.visible.len().saturating_sub(1)));
+                if self.cursor.index != before {
+                    self.cursor_moved();
+                    self.details_scroll.scroll_to(0);
                 }
             }
+            Target::Header(column) => self.sort_by(column),
             _ => {}
         }
         AppAction::None
@@ -632,17 +601,23 @@ impl SecretsScreen {
             return;
         }
         let before = self.cursor.index;
+        // The scroll state is from the last draw of the table, which a
+        // refresh may have shortened the list under since; measured again
+        // here so the window below cannot come out inside out.
+        let count = self.visible.len();
+        self.cursor
+            .scroll
+            .set_viewport(self.cursor.scroll.viewport, count);
         self.cursor.scroll.scroll_by(delta);
         // The cursor follows the viewport rather than being left behind it,
         // so what `v` acts on is always something on screen.
-        let first = self.cursor.scroll.offset;
-        let last = first + self.cursor.scroll.viewport.saturating_sub(1);
-        self.cursor.index = self
-            .cursor
-            .index
-            .clamp(first, last.min(self.visible.len().saturating_sub(1)));
+        let last = (self.cursor.scroll.offset + self.cursor.scroll.viewport.saturating_sub(1))
+            .min(count.saturating_sub(1));
+        let first = self.cursor.scroll.offset.min(last);
+        self.cursor.index = self.cursor.index.clamp(first, last);
         if self.cursor.index != before {
             self.cursor_moved();
+            self.details_scroll.scroll_to(0);
         }
     }
 
@@ -651,12 +626,7 @@ impl SecretsScreen {
         let Some(row) = self.selected(store) else {
             return AppAction::None;
         };
-        let Some(vault) = store
-            .inventory
-            .vaults
-            .iter()
-            .find(|vault| vault.name == row.vault)
-        else {
+        let Some(vault) = store.vault(&row.vault) else {
             shell.set_error(format!("{} is not in the inventory", row.vault));
             return AppAction::None;
         };
@@ -767,10 +737,12 @@ impl SecretsScreen {
         result: Result<(Secret, String), String>,
         now: Instant,
     ) -> AppAction {
+        // Taken only if it is the one asked for: an answer for a row the
+        // cursor has left must not cancel the ask still out for the row it
+        // is on now.
         let Some(asked) = self
             .reading
-            .take()
-            .filter(|held| held.vault == vault && held.name == name)
+            .take_if(|held| held.vault == vault && held.name == name)
         else {
             return AppAction::None;
         };

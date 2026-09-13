@@ -8,10 +8,8 @@ fn registry(name: &str) -> Registry {
     Registry {
         id: format!("/registries/{name}"),
         name: name.to_owned(),
-        subscription_id: "s".into(),
         resource_group: "rg".into(),
         location: "eastus".into(),
-        sku: "Premium".into(),
         login_server: format!("{name}.azurecr.io"),
     }
 }
@@ -36,7 +34,7 @@ fn tag(name: &str, digest: &str, updated: &str) -> Tag {
     }
 }
 
-fn stocked() -> Store {
+pub(crate) fn stocked() -> Store {
     let mut store = Store::default();
     store.apply(Event::Inventory(Ok(Inventory {
         vaults: Vec::new(),
@@ -318,4 +316,48 @@ fn each_levels_filters_narrow_their_own_table() {
     screen.refilter(&store);
     assert_eq!(screen.count(), 1);
     assert_eq!(screen.selected_tag(&store).unwrap().name, "1.41.3");
+}
+
+#[test]
+fn a_header_click_on_the_default_column_turns_the_sort_over() {
+    let mut screen = RegistriesScreen::default();
+    assert_eq!(screen.repositories.sort, ColumnId::Updated);
+    assert!(screen.repositories.descending);
+    screen.sort_by(ColumnId::Updated);
+    assert!(
+        !screen.repositories.descending,
+        "ascending now, rather than a click that did nothing"
+    );
+    screen.sort_by(ColumnId::Updated);
+    assert!(screen.repositories.descending);
+
+    // Another column still cycles ascending, descending, then the default.
+    screen.sort_by(ColumnId::Tags);
+    assert_eq!(
+        (screen.repositories.sort, screen.repositories.descending),
+        (ColumnId::Tags, false)
+    );
+    screen.sort_by(ColumnId::Tags);
+    assert!(screen.repositories.descending);
+    screen.sort_by(ColumnId::Tags);
+    assert_eq!(
+        (screen.repositories.sort, screen.repositories.descending),
+        (ColumnId::Updated, true)
+    );
+}
+
+#[test]
+fn the_details_pane_pages_and_jumps_when_it_has_focus() {
+    let store = stocked();
+    let mut screen = RegistriesScreen::default();
+    let mut shell = Shell::default();
+    shell.focus = Focus::Details;
+    screen.details_scroll.set_viewport(5, 40);
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    screen.handle_key(&mut shell, &store, key(KeyCode::PageDown));
+    assert_eq!(screen.details_scroll.offset, 4, "a screenful less one row");
+    screen.handle_key(&mut shell, &store, key(KeyCode::End));
+    assert_eq!(screen.details_scroll.offset, 35);
+    screen.handle_key(&mut shell, &store, key(KeyCode::Home));
+    assert_eq!(screen.details_scroll.offset, 0);
 }

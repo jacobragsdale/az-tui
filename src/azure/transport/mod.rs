@@ -10,12 +10,12 @@
 //! promise: a write verb cannot be named here, so no later step can add one
 //! by accident.
 
-use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -122,7 +122,7 @@ impl Response {
 
 /// How the client reaches the network. One seam, so a test drives every read
 /// in the crate with canned answers rather than a socket.
-pub trait Transport: Send {
+pub trait Transport: Send + Sync {
     fn send(&self, request: Request) -> Result<Response>;
 }
 
@@ -266,6 +266,23 @@ pub fn is_signed_out(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<SignedOut>() || cause.is::<NoLogin>())
 }
 
+/// What a person is shown for one failure.
+///
+/// A signed-out login is the one refusal worth rewording: the CLI answers it
+/// with five lines of its own stack, and what a person needs is the two words
+/// that fix it. The worker's events and the subcommands' errors both go
+/// through here, so the status bar and stderr say the same thing.
+#[must_use]
+pub fn said(error: &anyhow::Error) -> String {
+    if is_signed_out(error) {
+        return SIGNED_OUT.to_owned();
+    }
+    format!("{error:#}")
+}
+
+/// The two words that fix a signed-out login.
+pub const SIGNED_OUT: &str = "not signed in — run `az login`";
+
 /// A plane refused, and said why in its own words.
 ///
 /// Carried as a type rather than a formatted string so a caller can ask what
@@ -324,19 +341,16 @@ pub struct Client {
     /// One token per audience, minted on first use and re-minted once when a
     /// plane says it is spent. A CLI token lasts about an hour; a running TUI
     /// outlives that.
-    cached: RefCell<HashMap<String, String>>,
+    cached: Mutex<HashMap<String, String>>,
     /// One refresh token per registry, by login server. The exchange that
     /// mints one costs a round trip and the token it mints is good for every
     /// scope that registry is asked for, for about three hours.
-    refresh_tokens: RefCell<HashMap<String, String>>,
+    refresh_tokens: Mutex<HashMap<String, String>>,
     /// The tenant, asked for once and only when something needs it.
-    tenant: RefCell<Option<Option<String>>>,
-    /// How long the last refusal asked to be left alone, until something
-    /// reads it.
-    throttled: Cell<Option<Duration>>,
-    /// How a wait is taken. A test hands in a closure that records the wait
-    /// instead of sleeping through it.
-    sleep: Box<dyn Fn(Duration) + Send>,
+    tenant: Mutex<Option<Option<String>>>,
+    /// How a wait is taken. The worker hands in one that says so on screen
+    /// first; a test hands in one that records the wait instead of sleeping.
+    sleep: Box<dyn Fn(Duration) + Send + Sync>,
 }
 
 impl Client {
@@ -349,41 +363,44 @@ impl Client {
     pub fn with_sleep(
         tokens: Box<dyn TokenSource>,
         transport: Box<dyn Transport>,
-        sleep: Box<dyn Fn(Duration) + Send>,
+        sleep: Box<dyn Fn(Duration) + Send + Sync>,
     ) -> Self {
         Self {
             tokens,
             transport,
-            cached: RefCell::new(HashMap::new()),
-            refresh_tokens: RefCell::new(HashMap::new()),
-            tenant: RefCell::new(None),
-            throttled: Cell::new(None),
+            cached: Mutex::new(HashMap::new()),
+            refresh_tokens: Mutex::new(HashMap::new()),
+            tenant: Mutex::new(None),
             sleep,
         }
     }
 
-    /// How long the refusals since this was last asked want to be left alone.
-    /// Reading it clears it, so one refusal is reported once.
-    pub fn last_throttle(&self) -> Option<Duration> {
-        self.throttled.take()
+    /// Replaces how a throttle wait is taken, so the worker can say on screen
+    /// how long Azure asked for before sleeping through it.
+    pub fn set_sleep(&mut self, sleep: Box<dyn Fn(Duration) + Send + Sync>) {
+        self.sleep = sleep;
     }
 
     /// Forgets the token for one audience, so the next call mints afresh.
     ///
-    /// A registry's access token is minted from its refresh token, so
-    /// forgetting one has to forget the other: otherwise the retry trades a
-    /// spent refresh token for another spent access token.
+    /// A registry's access token is minted from its refresh token, and that
+    /// from the CLI's token, so forgetting one has to forget the whole chain:
+    /// otherwise the retry trades a spent token for another spent token, and
+    /// a TUI left open past the CLI token's hour loses every registry for
+    /// good.
     pub fn forget(&self, audience: &Audience) {
-        self.cached.borrow_mut().remove(&audience.cache_key());
+        locked(&self.cached).remove(&audience.cache_key());
         if let Audience::Acr { login_server, .. } = audience {
-            self.refresh_tokens.borrow_mut().remove(login_server);
+            locked(&self.refresh_tokens).remove(login_server);
+            locked(&self.cached).remove(&Audience::ContainerRegistry.cache_key());
         }
     }
 
     /// The tenant the login is in, asked for at most once a run.
     pub fn tenant(&self) -> Option<String> {
-        let mut held = self.tenant.borrow_mut();
-        held.get_or_insert_with(|| self.tokens.tenant()).clone()
+        locked(&self.tenant)
+            .get_or_insert_with(|| self.tokens.tenant())
+            .clone()
     }
 
     /// The refresh token one registry issued, or the one it issues now.
@@ -392,14 +409,12 @@ impl Client {
         login_server: &str,
         mint: impl FnOnce() -> Result<String>,
     ) -> Result<String> {
-        let held = self.refresh_tokens.borrow().get(login_server).cloned();
+        let held = locked(&self.refresh_tokens).get(login_server).cloned();
         if let Some(held) = held {
             return Ok(held);
         }
         let minted = mint()?;
-        self.refresh_tokens
-            .borrow_mut()
-            .insert(login_server.to_owned(), minted.clone());
+        locked(&self.refresh_tokens).insert(login_server.to_owned(), minted.clone());
         Ok(minted)
     }
 
@@ -407,11 +422,18 @@ impl Client {
     ///
     /// A `401` is worth exactly one fresh token: the CLI's tokens expire while
     /// the TUI is open, and re-minting is cheap. A second `401` is a signed-out
-    /// login, which no amount of retrying fixes.
+    /// login, which no amount of retrying fixes. The mint is inside the
+    /// retried expression: a registry refusing a spent refresh token says so
+    /// while the token is being minted, not while the call is being made.
     pub fn call(&self, audience: &Audience, mut request: Request) -> Result<Value> {
-        request.bearer = Some(self.token(audience)?);
-        match self.attempt(&request) {
-            Err(error) if is_signed_out(&error) => {
+        let first = self.token(audience).and_then(|token| {
+            request.bearer = Some(token);
+            self.attempt(&request)
+        });
+        match first {
+            // A missing login is not retried: a second `az` shell-out would
+            // only fail the same way, a second later.
+            Err(error) if is_signed_out(&error) && !is_no_login(&error) => {
                 self.forget(audience);
                 let Ok(minted) = self.token(audience) else {
                     // The mint failed too; the first refusal is the one that
@@ -432,19 +454,14 @@ impl Client {
         self.attempt(&request)
     }
 
-    /// This audience's token, minted on first use. Public because the
+    /// This audience's token, minted on first use. Crate-visible because the
     /// registry exchange needs a CLI token as a *value* in a form body rather
     /// than as a header.
-    pub fn bearer(&self, audience: &Audience) -> Result<String> {
-        self.token(audience)
-    }
-
-    /// This audience's token, minted on first use.
-    fn token(&self, audience: &Audience) -> Result<String> {
+    pub(crate) fn token(&self, audience: &Audience) -> Result<String> {
         let key = audience.cache_key();
         // Cloned out before the mint below, which may itself reach back into
-        // this cache: a borrow held across it would panic at runtime.
-        let held = self.cached.borrow().get(&key).cloned();
+        // this cache: a lock held across it would deadlock.
+        let held = locked(&self.cached).get(&key).cloned();
         if let Some(held) = held {
             return Ok(held);
         }
@@ -456,7 +473,7 @@ impl Client {
             } => super::acr::mint(self, login_server, scope)?,
             other => self.tokens.token(other)?,
         };
-        self.cached.borrow_mut().insert(key, minted.clone());
+        locked(&self.cached).insert(key, minted.clone());
         Ok(minted)
     }
 
@@ -466,7 +483,6 @@ impl Client {
         let response = self.transport.send(request.clone())?;
         let response = if THROTTLED.contains(&response.status) {
             let wait = throttle_wait(&response, OffsetDateTime::now_utc());
-            self.note_throttle(wait);
             (self.sleep)(wait);
             self.transport.send(request.clone())?
         } else {
@@ -505,20 +521,21 @@ impl Client {
                 message: failure_message(&response.body),
             }));
         }
+        // No call in the crate legitimately answers with nothing: read as
+        // "no rows" it would empty a vault, or both tabs, and the next save
+        // would write that emptiness to the cache.
         if response.body.trim().is_empty() {
-            return Ok(Value::Null);
+            bail!("{url} answered with an empty body");
         }
         serde_json::from_str(&response.body)
             .with_context(|| format!("{url} answered with something other than JSON"))
     }
+}
 
-    /// One read makes several calls; the longest wait any of them asked for
-    /// is the one worth reporting.
-    fn note_throttle(&self, wait: Duration) {
-        if self.throttled.get().is_none_or(|held| wait > held) {
-            self.throttled.set(Some(wait));
-        }
-    }
+/// One of the client's caches, poisoned or not. A thread that panicked while
+/// holding one left a map that is still a map; the other threads carry on.
+fn locked<T>(cache: &Mutex<T>) -> MutexGuard<'_, T> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// What a plane says when it refuses. ARM and Key Vault write the reason

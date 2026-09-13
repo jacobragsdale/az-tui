@@ -33,7 +33,7 @@ pub fn run() -> Result<()> {
     let mut cli = Cli::parse();
     let config_path = paths::config_file(cli.config.as_deref());
     let config = cli.merge(config::load(&config_path)?);
-    let (theme, _label) = cli
+    let theme = cli
         .resolve_theme(&config)
         .and_then(|choice| choice.theme(&config))
         .with_context(|| format!("resolving the theme (config: {})", config_path.display()))?;
@@ -132,7 +132,11 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     worker.send(Request::Refresh);
 
     let every = Duration::from_secs(config.azure.refresh.unwrap_or(DEFAULT_REFRESH));
-    let mut next_refresh = (!every.is_zero()).then(|| Instant::now() + every);
+    // An interval too far off to represent is "never", which is what a
+    // person who typed it meant; `+` would panic before the first frame.
+    let mut next_refresh = (!every.is_zero())
+        .then(|| Instant::now().checked_add(every))
+        .flatten();
 
     let mut app = App::new(store);
     // Before the first frame, so nothing is drawn in a layout that is about
@@ -158,6 +162,9 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             let action = match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
+                // Bracketed paste is on, so a paste arrives whole rather than
+                // as keystrokes — and would be dropped here if nothing took it.
+                Event::Paste(text) => app.handle_paste(&text),
                 _ => AppAction::None,
             };
             if act(&mut app, &worker, action) {
@@ -174,8 +181,13 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             if act(&mut app, &worker, action) {
                 return Ok(());
             }
+            // A store that has never read anything is not worth a file: a
+            // first run with no login would otherwise write an empty cache
+            // stamped now, which the subcommands would then trust for five
+            // minutes and answer "nothing" from.
             if idle
                 && !cli.no_cache
+                && app.store.read_at.is_some()
                 && let Err(error) = cache::save(&cache_path, &app.store.snapshot())
             {
                 // A cache that will not save is a slower next start, not a
@@ -212,7 +224,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             && Instant::now() >= due
         {
             worker.send(Request::Refresh);
-            next_refresh = Some(Instant::now() + every);
+            next_refresh = Instant::now().checked_add(every);
         }
     }
 }
@@ -226,7 +238,12 @@ fn act(app: &mut App, worker: &Worker, action: AppAction) -> bool {
         AppAction::Quit => return true,
         AppAction::Send(request) => worker.send(request),
         AppAction::Copy { text, label } => match clipboard::copy(&text) {
-            Ok(()) => app.shell.set_status(label),
+            Ok(clipboard::Channel::Command) => app.shell.set_status(label),
+            // The escape went out and nothing confirmed it; a terminal that
+            // does not speak it has dropped the text, so say which it was.
+            Ok(clipboard::Channel::Terminal) => app
+                .shell
+                .set_status(format!("{label} · sent to the terminal (OSC 52)")),
             Err(error) => app.shell.set_error(format!("{error:#}")),
         },
         AppAction::OpenUrl(url) => {

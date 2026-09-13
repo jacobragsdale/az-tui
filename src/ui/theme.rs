@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use ratatui::style::Color;
 use ratatui::widgets::BorderType;
 
-use crate::config::{Appearance, Config, Palette};
+use crate::config::{Config, Palette};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
@@ -30,8 +30,6 @@ pub struct Theme {
     /// The frame of a pane nothing is focused on, and of every overlay.
     pub border: Color,
     pub border_focused: Color,
-    /// The ground a pill, a chip or a button sits on.
-    pub surface: Color,
     pub selected_background: Color,
     /// The text of a selected row where the palette says so; `Reset` keeps
     /// whatever the cell was painted in.
@@ -69,7 +67,6 @@ impl Theme {
             header: Color::Cyan,
             border: Color::DarkGray,
             border_focused: Color::Cyan,
-            surface: Color::DarkGray,
             selected_background: Color::DarkGray,
             selection_fg: Color::Reset,
             hover_background: Color::Indexed(237),
@@ -107,7 +104,6 @@ impl Theme {
             header: Color::Blue,
             border: Color::Gray,
             border_focused: Color::Blue,
-            surface: Color::Indexed(254),
             selected_background: Color::Indexed(253),
             selection_fg: Color::Reset,
             hover_background: Color::Indexed(255),
@@ -145,7 +141,6 @@ impl Theme {
             header: Color::Reset,
             border: Color::Reset,
             border_focused: Color::Reset,
-            surface: Color::Reset,
             selected_background: Color::Reset,
             selection_fg: Color::Reset,
             hover_background: Color::Reset,
@@ -181,7 +176,6 @@ impl Theme {
             header: palette.subtle.into(),
             border: palette.overlay.into(),
             border_focused: palette.accent.into(),
-            surface: palette.overlay.into(),
             selected_background: palette.overlay.into(),
             selection_fg: palette.fg.into(),
             hover_background: hover.into(),
@@ -251,16 +245,6 @@ impl ThemeChoice {
         }
     }
 
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Terminal => "terminal",
-            Self::TerminalLight => "terminal-light",
-            Self::Mono => "mono",
-            Self::Custom => "custom",
-        }
-    }
-
     /// Which theme this run paints with: `NO_COLOR` first, then whatever
     /// `--theme` or `AZ_TUI_THEME` settled on, then the file's `preset`,
     /// then the custom palette if the file carries one, and the terminal's
@@ -282,24 +266,17 @@ impl ThemeChoice {
         })
     }
 
-    /// The theme itself, and what the footer may call it.
-    pub fn theme(self, config: &Config) -> Result<(Theme, String)> {
+    /// The theme itself.
+    pub fn theme(self, config: &Config) -> Result<Theme> {
         Ok(match self {
-            Self::Terminal => (Theme::terminal(), "terminal".to_owned()),
-            Self::TerminalLight => (Theme::terminal_light(), "terminal-light".to_owned()),
-            Self::Mono => (Theme::mono(), "mono".to_owned()),
+            Self::Terminal => Theme::terminal(),
+            Self::TerminalLight => Theme::terminal_light(),
+            Self::Mono => Theme::mono(),
             Self::Custom => {
                 let Some(palette) = config.theme.custom.as_ref() else {
                     bail!("theme \"custom\" needs a [theme.custom] palette in config.toml");
                 };
-                let appearance = match palette.appearance {
-                    Appearance::Dark => "dark",
-                    Appearance::Light => "light",
-                };
-                (
-                    Theme::from_palette(palette),
-                    format!("{} ({appearance})", palette.label()),
-                )
+                Theme::from_palette(palette)
             }
         })
     }
@@ -440,8 +417,7 @@ teal = "#1abc9c"
     #[test]
     fn a_palette_maps_onto_the_tokens() {
         let config = custom_config();
-        let (theme, label) = ThemeChoice::Custom.theme(&config).unwrap();
-        assert_eq!(label, "grok-night (dark)");
+        let theme = ThemeChoice::Custom.theme(&config).unwrap();
         assert_eq!(theme.accent, Color::Rgb(0xbb, 0x9a, 0xf7));
         assert_eq!(theme.border_focused, theme.accent);
         assert_eq!(theme.text, Color::Rgb(0xe1, 0xe1, 0xe1));

@@ -1,24 +1,31 @@
-//! The one background thread. Requests in, events out, and the UI never
-//! waits on either.
+//! The background threads. Requests in, events out, and the UI never waits
+//! on either.
 //!
-//! Every HTTPS call and every `az` shell-out in the program happens here. The
-//! run loop drains [`Worker::try_recv`] each turn and redraws; a vault that
-//! will not answer is one event carrying one string, not a frozen table.
+//! Every HTTPS call and every `az` shell-out in the program happens here: on
+//! the one loop thread, or on the threads a refresh fans out over
+//! ([`Azure::threads`] of them, this one included). The run loop drains
+//! [`Worker::try_recv`] each turn and redraws; a vault that will not answer
+//! is one event carrying one string, not a frozen table.
 //!
 //! The loop's one rule beyond that: **somebody is waiting on a detail.** A
-//! refresh walking three hundred repositories checks the request channel
-//! between every call, so a `v` pressed halfway through is answered in one
-//! round trip rather than after the walk.
+//! refresh walking three hundred repositories pumps the request channel
+//! between the items the loop thread takes itself, so a `v` pressed halfway
+//! through is answered after one round trip rather than after the walk.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 
-use crate::azure::transport::{Client, is_signed_out};
+use crate::azure::auth::Audience;
+use crate::azure::transport::{Client, SIGNED_OUT, api_error, is_no_login, said};
 use crate::azure::{
     Inventory, Manifest, Registry, Repository, Secret, SecretRow, SecretVersion, Tag, Vault, acr,
     graph, vault,
 };
 use crate::config::Azure;
+use crate::parallel::each;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Request {
@@ -111,9 +118,20 @@ impl Worker {
     /// first frame would be told the vault is not in the subscription, when
     /// really the refresh behind the frame has not finished yet.
     #[must_use]
-    pub fn start(azure: Azure, client: Client, known: Inventory) -> Self {
+    pub fn start(azure: Azure, mut client: Client, known: Inventory) -> Self {
         let (requests, inbox) = channel();
         let (outbox, events) = channel();
+        // A throttle wait is said on screen before it is taken: a worker
+        // sleeping in silence for the thirty seconds Key Vault asks for reads
+        // as a hang, with the spinner stuck on the last vault's name.
+        let progress = outbox.clone();
+        client.set_sleep(Box::new(move |wait| {
+            let _ = progress.send(Event::Progress(format!(
+                "throttled — waiting {} s…",
+                wait.as_secs()
+            )));
+            std::thread::sleep(wait);
+        }));
         let handle = std::thread::Builder::new()
             .name("az-tui-worker".to_owned())
             .spawn(move || {
@@ -155,11 +173,14 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// Says stop and does not wait. The thread may be inside a thirty-second
+    /// timeout, a throttle wait, or an `az` that will not come back, and a
+    /// quit that hangs on any of those reads as a hang. Nothing on it needs
+    /// to finish — the cache and the session are written on the main thread
+    /// — and the process's exit ends it.
     fn drop(&mut self) {
         let _ = self.requests.send(Request::Stop);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.handle.take();
     }
 }
 
@@ -176,12 +197,12 @@ struct Loop {
     registries: Vec<Registry>,
 }
 
-/// What the loop decided to do next, once a batch of requests has been
-/// collapsed.
+/// Whether a refresh is wanted, once a batch of requests has been collapsed.
+/// Two queued refreshes are one refresh; one asked for during a refresh runs
+/// straight after it.
 #[derive(Default)]
 struct Batch {
     refresh: bool,
-    stop: bool,
 }
 
 impl Loop {
@@ -191,39 +212,48 @@ impl Loop {
             // behind it.
             let Ok(first) = self.inbox.recv() else { return };
             let mut batch = Batch::default();
-            self.take(first, &mut batch);
+            if !self.take(first, &mut batch) {
+                return;
+            }
             while let Ok(queued) = self.inbox.try_recv() {
-                self.take(queued, &mut batch);
+                if !self.take(queued, &mut batch) {
+                    return;
+                }
             }
-            if batch.stop {
-                return;
-            }
-            if batch.refresh && !self.refresh() {
-                return;
+            // A loop rather than a call from the end of `refresh`: a run
+            // whose refreshes keep being asked for mid-refresh must not
+            // nest one stack frame per refresh.
+            while batch.refresh {
+                batch.refresh = false;
+                if !self.refresh(&mut batch) {
+                    return;
+                }
             }
         }
     }
 
-    /// Serves a detail request now, or notes that a refresh or a stop is
-    /// wanted. Two queued refreshes are one refresh; a stop anywhere in the
-    /// batch wins.
-    fn take(&mut self, request: Request, batch: &mut Batch) {
+    /// Serves a detail request now, or notes that a refresh is wanted.
+    /// Returns false on a `Stop`, which wins over everything else queued.
+    fn take(&self, request: Request, batch: &mut Batch) -> bool {
         match request {
-            Request::Stop => batch.stop = true,
+            Request::Stop => return false,
             Request::Refresh => batch.refresh = true,
             detail => self.serve(detail),
         }
+        true
     }
 
     /// Drains whatever has arrived without blocking, serving details at once.
     /// Returns false when the loop should stop — a `Stop` during a refresh,
     /// or a UI that has gone away.
-    fn pump(&mut self, batch: &mut Batch) -> bool {
+    fn pump(&self, batch: &mut Batch) -> bool {
         loop {
             match self.inbox.try_recv() {
-                Ok(Request::Stop) => return false,
-                Ok(Request::Refresh) => batch.refresh = true,
-                Ok(detail) => self.serve(detail),
+                Ok(request) => {
+                    if !self.take(request, batch) {
+                        return false;
+                    }
+                }
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => return false,
             }
@@ -239,13 +269,30 @@ impl Loop {
     }
 
     /// One pass over everything. Returns false when the loop should stop.
-    fn refresh(&mut self) -> bool {
-        let mut batch = Batch::default();
+    ///
+    /// Three phases, each fanned out over [`Azure::threads`] threads with this
+    /// one among them: every vault, then every registry's catalog, then the
+    /// per-repository fill. Between the items this thread takes it pumps the
+    /// inbox, so a detail asked for mid-refresh waits for one call.
+    ///
+    /// Only a login that cannot mint a token stops the pass: that is nobody's
+    /// vault's problem, and it is said once — by minting the one token a
+    /// phase shares before the phase starts. A plane refusing a token that
+    /// was minted a moment ago — a vault left behind in another tenant, a
+    /// registry this login has no role on — is that plane's problem, and the
+    /// next one is still asked.
+    ///
+    // ponytail: a detail asked for while this thread is inside its own call
+    // waits for that call, up to the transport's 30 s timeout — the same
+    // ceiling as the serial walk had. Serving details on a thread of their
+    // own would need the inventory shared and requests routed; add it if a
+    // `v` ever visibly waits.
+    fn refresh(&mut self, batch: &mut Batch) -> bool {
         self.progress("reading the subscription…");
         let inventory = match graph::inventory(&self.client, &self.azure) {
             Ok(inventory) => inventory,
             Err(error) => {
-                self.send(Event::Inventory(Err(said(error))));
+                self.send(Event::Inventory(Err(said(&error))));
                 return self.send(Event::Idle);
             }
         };
@@ -256,125 +303,148 @@ impl Loop {
         if !self.send(Event::Inventory(Ok(inventory))) {
             return false;
         }
+        let limit = self.azure.threads();
+        let (client, outbox) = (&self.client, &self.outbox);
 
-        for (index, vault) in vaults.iter().enumerate() {
-            if !self.pump(&mut batch) {
-                return false;
-            }
-            self.progress(format!(
-                "reading {} ({}/{})…",
-                vault.name,
-                index + 1,
-                vaults.len()
-            ));
-            if !self.read_vault(vault) {
-                return false;
-            }
+        // The vaults. The one token they all share is minted first, once:
+        // otherwise every thread would shell out to `az` at the same moment,
+        // and a login that is gone would be said once per vault.
+        //
+        // ponytail: a token that expires *during* a phase is re-minted by up
+        // to `limit` threads at once, once an hour. A per-audience mint lock
+        // in the client is the fix if that ever shows on a laptop.
+        if !vaults.is_empty()
+            && let Err(error) = client.token(&Audience::Vault)
+            && is_no_login(&error)
+        {
+            return self.stop_signed_out();
+        }
+        self.progress(format!("reading {} vaults…", vaults.len()));
+        let done = AtomicUsize::new(0);
+        let walked = each(
+            &vaults,
+            limit,
+            || self.pump(batch),
+            |_, vault| {
+                let result = vault::secrets(client, vault).map_err(|error| format!("{error:#}"));
+                let _ = outbox.send(Event::Secrets {
+                    vault: vault.name.clone(),
+                    result,
+                });
+                let _ = outbox.send(Event::Progress(format!(
+                    "reading vaults ({}/{})…",
+                    done.fetch_add(1, Relaxed) + 1,
+                    vaults.len()
+                )));
+            },
+        );
+        if !walked {
+            return false;
         }
 
-        let mut catalogs: Vec<(Registry, Vec<String>)> = Vec::new();
-        for (index, registry) in registries.iter().enumerate() {
-            if !self.pump(&mut batch) {
-                return false;
-            }
-            self.progress(format!(
-                "reading {} ({}/{})…",
-                registry.name,
-                index + 1,
-                registries.len()
-            ));
-            match acr::repositories(&self.client, registry) {
-                Ok(names) => {
-                    let rows = names
-                        .iter()
-                        .map(|name| Repository {
-                            registry: registry.name.clone(),
-                            name: name.clone(),
-                            tag_count: None,
-                            manifest_count: None,
-                            created: None,
-                            updated: None,
-                        })
-                        .collect();
-                    if !self.send(Event::Repositories {
-                        registry: registry.name.clone(),
-                        result: Ok(rows),
-                    }) {
-                        return false;
+        // The catalogs, one per registry.
+        if !registries.is_empty()
+            && let Err(error) = client.token(&Audience::ContainerRegistry)
+            && is_no_login(&error)
+        {
+            return self.stop_signed_out();
+        }
+        self.progress(format!("reading {} registries…", registries.len()));
+        let catalogs: Mutex<Vec<(usize, Vec<String>)>> = Mutex::new(Vec::new());
+        let walked = each(
+            &registries,
+            limit,
+            || self.pump(batch),
+            |index, registry| {
+                let result = match acr::repositories(client, registry) {
+                    Ok(names) => {
+                        let rows = names
+                            .iter()
+                            .map(|name| Repository::unfilled(&registry.name, name))
+                            .collect();
+                        catalogs.lock().unwrap().push((index, names));
+                        Ok(rows)
                     }
-                    catalogs.push((registry.clone(), names));
-                }
-                Err(error) => {
-                    if is_signed_out(&error) {
-                        return self.stop_signed_out();
-                    }
-                    if !self.send(Event::Repositories {
-                        registry: registry.name.clone(),
-                        result: Err(format!("{error:#}")),
-                    }) {
-                        return false;
-                    }
-                }
-            }
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = outbox.send(Event::Repositories {
+                    registry: registry.name.clone(),
+                    result,
+                });
+            },
+        );
+        if !walked {
+            return false;
         }
 
         // The fill: one call per repository, behind the names that are
-        // already on screen, yielding to anything anyone is waiting on.
-        let total: usize = catalogs.iter().map(|(_, names)| names.len()).sum();
-        let mut done = 0_usize;
-        for (registry, names) in &catalogs {
-            for name in names {
-                if !self.pump(&mut batch) {
-                    return false;
+        // already on screen.
+        let catalogs = catalogs.into_inner().unwrap();
+        let fill: Vec<(&Registry, &str)> = catalogs
+            .iter()
+            .flat_map(|(index, names)| {
+                let registry = &registries[*index];
+                names.iter().map(move |name| (registry, name.as_str()))
+            })
+            .collect();
+        let done = AtomicUsize::new(0);
+        // A registry that stopped answering. Anything but a 404 ends its
+        // fill: a host that has gone quiet would otherwise cost a timeout per
+        // repository, for hours. The names stay on screen, marked stale, with
+        // the reason in the footer — once, however many threads saw it.
+        let dead: Mutex<HashSet<&str>> = Mutex::new(HashSet::new());
+        let walked = each(
+            &fill,
+            limit,
+            || self.pump(batch),
+            |_, &(registry, name)| {
+                if dead.lock().unwrap().contains(registry.name.as_str()) {
+                    return;
                 }
-                done += 1;
+                let done = done.fetch_add(1, Relaxed) + 1;
                 if done.is_multiple_of(20) {
-                    self.progress(format!("filling repository details ({done}/{total})…"));
+                    let _ = outbox.send(Event::Progress(format!(
+                        "filling repository details ({done}/{})…",
+                        fill.len()
+                    )));
                 }
-                if let Ok(repository) = acr::attributes(&self.client, registry, name)
-                    && !self.send(Event::Repository {
-                        registry: registry.name.clone(),
-                        repository,
-                    })
-                {
-                    return false;
+                match acr::attributes(client, registry, name) {
+                    Ok(repository) => {
+                        let _ = outbox.send(Event::Repository {
+                            registry: registry.name.clone(),
+                            repository,
+                        });
+                    }
+                    // A repository deleted since the catalog was read is
+                    // simply skipped.
+                    Err(error) if api_error(&error).is_some_and(|e| e.status == 404) => {}
+                    Err(error) => {
+                        if dead.lock().unwrap().insert(registry.name.as_str()) {
+                            let _ = outbox.send(Event::Repositories {
+                                registry: registry.name.clone(),
+                                result: Err(format!("{error:#}")),
+                            });
+                        }
+                    }
                 }
-            }
-        }
-
-        if !self.send(Event::Idle) {
+            },
+        );
+        if !walked {
             return false;
         }
-        // A refresh asked for during this one runs now rather than waiting
-        // for the next keystroke.
-        if batch.refresh { self.refresh() } else { true }
+
+        self.send(Event::Idle)
     }
 
-    fn read_vault(&mut self, vault: &Vault) -> bool {
-        match vault::secrets(&self.client, vault) {
-            Ok(rows) => self.send(Event::Secrets {
-                vault: vault.name.clone(),
-                result: Ok(rows),
-            }),
-            Err(error) if is_signed_out(&error) => self.stop_signed_out(),
-            Err(error) => self.send(Event::Secrets {
-                vault: vault.name.clone(),
-                result: Err(format!("{error:#}")),
-            }),
-        }
-    }
-
-    /// A signed-out login is not one vault's problem, so the refresh stops
-    /// and says so once.
+    /// A missing login is not one vault's problem, so the refresh stops and
+    /// says so once.
     fn stop_signed_out(&self) -> bool {
-        self.send(Event::Inventory(Err(
-            "not signed in — run `az login`".to_owned()
-        ))) && self.send(Event::Idle)
+        self.send(Event::Inventory(Err(SIGNED_OUT.to_owned()))) && self.send(Event::Idle)
     }
 
     /// One detail, read now. Nothing here is retried and nothing is cached on
     /// this thread — least of all a value.
-    fn serve(&mut self, request: Request) {
+    fn serve(&self, request: Request) {
         match request {
             Request::Versions {
                 vault: name,
@@ -453,7 +523,7 @@ impl Loop {
         let Some(vault) = self.vaults.iter().find(|vault| vault.name == name) else {
             return Err(self.cannot_place(name));
         };
-        read(&self.client, vault).map_err(said)
+        read(&self.client, vault).map_err(|error| said(&error))
     }
 
     fn with_registry<T>(
@@ -466,23 +536,10 @@ impl Loop {
             .iter()
             .find(|registry| registry.name == name)
         else {
-            return Err(format!("{name} is no longer in the subscription"));
+            return Err(self.cannot_place(name));
         };
-        read(&self.client, registry).map_err(said)
+        read(&self.client, registry).map_err(|error| said(&error))
     }
-}
-
-/// What the screen shows for one failure.
-///
-/// A signed-out login is the one refusal worth rewording: the CLI answers it
-/// with five lines of its own stack, and what a person needs is the two words
-/// that fix it. Every detail request goes through here, so the Value line and
-/// the versions list say the same thing the status bar does.
-fn said(error: anyhow::Error) -> String {
-    if is_signed_out(&error) {
-        return "not signed in — run `az login`".to_owned();
-    }
-    format!("{error:#}")
 }
 
 #[cfg(test)]
@@ -491,6 +548,16 @@ mod tests {
     use crate::azure::transport::fake::{Answer, client as fake_client};
     use serde_json::json;
     use std::time::{Duration, Instant};
+
+    /// One thread, so the fake's canned answers land in the order they were
+    /// given. Every assertion below is about an order; the one test about
+    /// threads builds its own configuration.
+    fn serial() -> Azure {
+        Azure {
+            parallel: Some(1),
+            ..Azure::default()
+        }
+    }
 
     /// Reads events until one of them is named in `until`, or five seconds
     /// pass. Every assertion below is about an order, so the wait is for the
@@ -590,7 +657,7 @@ mod tests {
             Answer::json(json!({ "access_token": "web-token" })),
             Answer::json(json!({ "imageName": "web", "tagCount": 1 })),
         ]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Refresh);
         assert_eq!(
             until_idle(&worker),
@@ -607,6 +674,39 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_reads_vaults_side_by_side() {
+        use crate::azure::auth::FixedTokens;
+        use crate::azure::transport::fake::FakeTransport;
+
+        // Two vaults and two interchangeable listings: which thread takes
+        // which answer does not matter, only that both were in flight at once.
+        let transport = FakeTransport::answering([
+            inventory_answer(),
+            secrets_answer("one"),
+            secrets_answer("two"),
+            Answer::json(json!({ "refresh_token": "r" })),
+            Answer::json(json!({ "access_token": "a" })),
+            Answer::json(json!({ "repositories": [] })),
+        ])
+        .slow(Duration::from_millis(30));
+        let client = Client::new(Box::new(FixedTokens::new()), Box::new(transport.clone()));
+        let azure = Azure {
+            parallel: Some(2),
+            ..Azure::default()
+        };
+        let worker = Worker::start(azure, client, Inventory::default());
+        worker.send(Request::Refresh);
+        let said = until_idle(&worker);
+        assert!(said.contains(&"secrets(kv-a,ok)".to_owned()), "{said:?}");
+        assert!(said.contains(&"secrets(kv-b,ok)".to_owned()), "{said:?}");
+        assert_eq!(said.last().map(String::as_str), Some("idle"));
+        assert!(
+            transport.peak() >= 2,
+            "the vaults were read one after another: {said:?}"
+        );
+    }
+
+    #[test]
     fn a_vault_that_refuses_does_not_stop_the_next_one() {
         let (client, _, _) = fake_client([
             inventory_answer(),
@@ -616,7 +716,7 @@ mod tests {
             Answer::json(json!({ "access_token": "a" })),
             Answer::json(json!({ "repositories": [] })),
         ]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Refresh);
         let said = until_idle(&worker);
         assert!(said.contains(&"secrets(kv-a,err)".to_owned()), "{said:?}");
@@ -628,7 +728,7 @@ mod tests {
     fn a_signed_out_login_stops_the_refresh_and_says_so_once() {
         let (client, transport, _) =
             fake_client([Answer::status(401, "{}"), Answer::status(401, "{}")]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Refresh);
         assert_eq!(
             until_idle(&worker),
@@ -655,7 +755,7 @@ mod tests {
             Answer::json(json!({ "access_token": "web-token" })),
             Answer::json(json!({ "imageName": "web" })),
         ]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         // The ask lands while the catalog call is still in flight, which is
         // the moment this test is about: the fill has not started, and the
         // refresh has to notice the request before it does. Sending it from
@@ -697,7 +797,7 @@ mod tests {
             Answer::json(json!({ "access_token": "a" })),
             Answer::json(json!({ "repositories": [] })),
         ]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Refresh);
         worker.send(Request::Refresh);
         worker.send(Request::Refresh);
@@ -715,7 +815,7 @@ mod tests {
     #[test]
     fn a_detail_for_something_the_inventory_does_not_hold_is_an_answer_not_a_hang() {
         let (client, _, _) = fake_client([]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Versions {
             vault: "kv-gone".into(),
             name: "x".into(),
@@ -732,15 +832,13 @@ mod tests {
             vaults: vec![crate::azure::Vault {
                 id: "/vaults/kv-a".into(),
                 name: "kv-a".into(),
-                subscription_id: "s".into(),
                 resource_group: "rg".into(),
                 location: "eastus".into(),
-                sku: "standard".into(),
                 uri: "https://kv-a.vault.azure.net/".into(),
             }],
             registries: Vec::new(),
         };
-        let worker = Worker::start(Azure::default(), client, known);
+        let worker = Worker::start(serial(), client, known);
         worker.send(Request::Value {
             vault: "kv-a".into(),
             name: "one".into(),
@@ -773,15 +871,13 @@ mod tests {
             vaults: vec![crate::azure::Vault {
                 id: "/vaults/kv-a".into(),
                 name: "kv-a".into(),
-                subscription_id: "s".into(),
                 resource_group: "rg".into(),
                 location: "eastus".into(),
-                sku: "standard".into(),
                 uri: "https://kv-a.vault.azure.net/".into(),
             }],
             registries: Vec::new(),
         };
-        let worker = Worker::start(Azure::default(), client, known);
+        let worker = Worker::start(serial(), client, known);
         worker.send(Request::Value {
             vault: "kv-a".into(),
             name: "one".into(),
@@ -799,7 +895,7 @@ mod tests {
     #[test]
     fn a_name_the_worker_cannot_place_says_which_of_the_two_reasons_it_is() {
         let (client, _, _) = fake_client([]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Versions {
             vault: "kv-gone".into(),
             name: "x".into(),
@@ -812,10 +908,161 @@ mod tests {
     #[test]
     fn dropping_the_worker_stops_the_thread() {
         let (client, _, _) = fake_client([]);
-        let worker = Worker::start(Azure::default(), client, Inventory::default());
+        let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Stop);
-        // `Drop` sends another Stop and joins; a thread that ignored the
-        // first would hang this test rather than fail it.
+        // `Drop` no longer waits — a quit must not hang on a request in
+        // flight — so the test waits itself, briefly, for the thread to
+        // honour the Stop it was sent.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.handle.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline, "the thread ignored Stop");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         drop(worker);
+    }
+
+    #[test]
+    fn a_login_that_lapses_mid_refresh_stops_the_refresh_and_says_so_once() {
+        use crate::azure::auth::FixedTokens;
+        use crate::azure::transport::NoLogin;
+        use crate::azure::transport::fake::FakeTransport;
+
+        // The ARM token mints; the vault token does not — `az` has nothing to
+        // give — so the first vault is where the login is found to be gone.
+        let tokens = FixedTokens::new();
+        tokens
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Ok("arm-token".to_owned()));
+        tokens
+            .answers
+            .lock()
+            .unwrap()
+            .push_back(Err(anyhow::Error::new(NoLogin("gone".to_owned()))));
+        let transport = FakeTransport::answering([inventory_answer()]);
+        let client = Client::new(Box::new(tokens), Box::new(transport.clone()));
+        let worker = Worker::start(serial(), client, Inventory::default());
+        worker.send(Request::Refresh);
+        assert_eq!(
+            until_idle(&worker),
+            [
+                "inventory",
+                "inventory-err(not signed in — run `az login`)",
+                "idle"
+            ],
+            "said once, not once per vault"
+        );
+        assert_eq!(
+            transport.sent().len(),
+            1,
+            "kv-b and the registry were never asked"
+        );
+    }
+
+    #[test]
+    fn a_vault_that_refuses_a_fresh_token_is_that_vaults_problem_not_the_logins() {
+        // A vault in another tenant answers 401 to a token that was minted a
+        // moment ago. The retry re-mints, the vault refuses again, and that
+        // is one vault's line in the footer — not "not signed in" for a login
+        // that is fine, and not the end of the refresh.
+        let (client, _, _) = fake_client([
+            inventory_answer(),
+            Answer::status(401, r#"{"error":{"message":"AKV10032: Invalid issuer"}}"#),
+            Answer::status(401, r#"{"error":{"message":"AKV10032: Invalid issuer"}}"#),
+            secrets_answer("two"),
+            Answer::json(json!({ "refresh_token": "r" })),
+            Answer::json(json!({ "access_token": "a" })),
+            Answer::json(json!({ "repositories": [] })),
+        ]);
+        let worker = Worker::start(serial(), client, Inventory::default());
+        worker.send(Request::Refresh);
+        let said = until_idle(&worker);
+        assert_eq!(
+            said,
+            [
+                "inventory",
+                "secrets(kv-a,err)",
+                "secrets(kv-b,ok)",
+                "repositories(acra,ok)",
+                "idle",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_registry_that_stops_answering_ends_its_fill_rather_than_timing_out_per_repository() {
+        // The catalog lands; the first attributes call fails for want of an
+        // answer; the second repository is never asked about.
+        let (client, transport, _) = fake_client([
+            inventory_answer(),
+            secrets_answer("one"),
+            secrets_answer("two"),
+            Answer::json(json!({ "refresh_token": "r" })),
+            Answer::json(json!({ "access_token": "a" })),
+            Answer::json(json!({ "repositories": ["api", "web"] })),
+            Answer::json(json!({ "access_token": "api-token" })),
+        ]);
+        let worker = Worker::start(serial(), client, Inventory::default());
+        worker.send(Request::Refresh);
+        assert_eq!(
+            until_idle(&worker),
+            [
+                "inventory",
+                "secrets(kv-a,ok)",
+                "secrets(kv-b,ok)",
+                "repositories(acra,ok)",
+                "repositories(acra,err)",
+                "idle",
+            ]
+        );
+        let urls = transport.urls();
+        let catalog = urls
+            .iter()
+            .position(|url| url.contains("/_catalog"))
+            .unwrap();
+        assert_eq!(
+            urls[catalog + 1..]
+                .iter()
+                .filter(|url| url.ends_with("/oauth2/token"))
+                .count(),
+            1,
+            "no token was minted for web: {urls:?}"
+        );
+    }
+
+    #[test]
+    fn a_throttle_wait_is_said_on_screen_before_it_is_taken() {
+        let (client, _, _) = fake_client([
+            Answer::status(429, "{}").with_header("Retry-After", "1"),
+            inventory_answer(),
+            secrets_answer("one"),
+            secrets_answer("two"),
+            Answer::json(json!({ "refresh_token": "r" })),
+            Answer::json(json!({ "access_token": "a" })),
+            Answer::json(json!({ "repositories": [] })),
+        ]);
+        let worker = Worker::start(serial(), client, Inventory::default());
+        worker.send(Request::Refresh);
+        // Raw events this time: `pump_until` drops the progress lines, and
+        // the progress line is the point.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            match worker.try_recv() {
+                Some(Event::Progress(said)) => seen.push(said),
+                Some(Event::Inventory(_)) => break,
+                Some(_) => {}
+                None => {
+                    assert!(Instant::now() < deadline, "no inventory: {seen:?}");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        assert!(
+            seen.iter()
+                .any(|said| said.contains("throttled — waiting 1 s")),
+            "{seen:?}"
+        );
     }
 }

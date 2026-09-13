@@ -59,10 +59,6 @@ pub struct Store {
     pub read_at: Option<Timestamp>,
     pub refreshing: bool,
     pub progress: Option<String>,
-    /// Cleared at the start of each refresh and moved into `problems` and
-    /// `stale` as the refresh goes, so a vault that has started answering
-    /// again stops being stale at the same moment its rows land.
-    refreshed: HashSet<String>,
     /// Whether the refresh now ending actually read anything. A refresh that
     /// could not even list the subscription has not made the rows on screen
     /// any newer, and must not say it has.
@@ -95,17 +91,25 @@ impl Store {
         )
     }
 
-    /// True while nothing has ever been read — the first frame of a first
-    /// run, which says so rather than showing an empty table.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.secrets.is_empty() && self.repositories.is_empty() && self.read_at.is_none()
-    }
-
     /// The first problem, for the status bar. `?` lists them all.
     #[must_use]
     pub fn first_problem(&self) -> Option<&(String, String)> {
         self.problems.first()
+    }
+
+    /// The vault a row names, as the inventory describes it.
+    #[must_use]
+    pub fn vault(&self, name: &str) -> Option<&crate::azure::Vault> {
+        self.inventory.vaults.iter().find(|held| held.name == name)
+    }
+
+    /// The registry a row names, as the inventory describes it.
+    #[must_use]
+    pub fn registry(&self, name: &str) -> Option<&crate::azure::Registry> {
+        self.inventory
+            .registries
+            .iter()
+            .find(|held| held.name == name)
     }
 
     pub fn apply(&mut self, event: Event) -> Applied {
@@ -113,7 +117,6 @@ impl Store {
             Event::Inventory(Ok(inventory)) => {
                 self.refreshing = true;
                 self.read_something = true;
-                self.refreshed.clear();
                 self.problems.clear();
                 // Rows of a vault that has gone from the subscription go with
                 // it; rows of one still there are replaced as it answers.
@@ -141,14 +144,31 @@ impl Store {
                 self.refreshing = false;
                 self.read_something = false;
                 self.progress = None;
+                // One inventory problem at a time: a TUI left open overnight
+                // while signed out would otherwise list the same line once
+                // per refresh under `?`.
+                self.problems.retain(|(who, _)| !who.is_empty());
                 self.problems.push((String::new(), message));
+                Applied::Status
+            }
+            Event::Progress(said) => {
+                // The first word of a refresh arrives before the inventory
+                // does, and the spinner should turn from that word on.
+                self.refreshing = true;
+                self.progress = Some(said);
                 Applied::Status
             }
             Event::Secrets { vault, result } => match result {
                 Ok(rows) => {
-                    self.refreshed.insert(vault.clone());
                     self.stale.remove(&vault);
-                    self.replace_vault(&vault, rows);
+                    let order = &self.inventory.vaults;
+                    replace(
+                        &mut self.secrets,
+                        &vault,
+                        rows,
+                        |row| &row.vault,
+                        |name| order.iter().position(|held| held.name == name),
+                    );
                     Applied::Secrets
                 }
                 Err(message) => {
@@ -158,9 +178,15 @@ impl Store {
             },
             Event::Repositories { registry, result } => match result {
                 Ok(rows) => {
-                    self.refreshed.insert(registry.clone());
                     self.stale.remove(&registry);
-                    self.replace_registry(&registry, rows);
+                    let order = &self.inventory.registries;
+                    replace(
+                        &mut self.repositories,
+                        &registry,
+                        rows,
+                        |row| &row.registry,
+                        |name| order.iter().position(|held| held.name == name),
+                    );
                     Applied::Repositories
                 }
                 Err(message) => {
@@ -217,10 +243,6 @@ impl Store {
                 self.manifests.insert((registry, repo, digest), result);
                 Applied::Detail
             }
-            Event::Progress(said) => {
-                self.progress = Some(said);
-                Applied::Status
-            }
             Event::Idle => {
                 self.refreshing = false;
                 self.progress = None;
@@ -232,35 +254,50 @@ impl Store {
         }
     }
 
-    /// One vault's rows, replaced in place so the other vaults keep their
-    /// order. A refresh that reorders nothing leaves the cursor where it was.
-    fn replace_vault(&mut self, vault: &str, rows: Vec<SecretRow>) {
-        let at = self
-            .secrets
-            .iter()
-            .position(|row| row.vault == vault)
-            .unwrap_or(self.secrets.len());
-        self.secrets.retain(|row| row.vault != vault);
-        let at = at.min(self.secrets.len());
-        self.secrets.splice(at..at, rows);
-    }
-
-    fn replace_registry(&mut self, registry: &str, rows: Vec<Repository>) {
-        let at = self
-            .repositories
-            .iter()
-            .position(|row| row.registry == registry)
-            .unwrap_or(self.repositories.len());
-        self.repositories.retain(|row| row.registry != registry);
-        let at = at.min(self.repositories.len());
-        self.repositories.splice(at..at, rows);
-    }
-
     /// A vault or registry that would not answer: its rows stand, marked
     /// stale, and the footer says why.
     fn problem(&mut self, who: String, message: String) {
         self.stale.insert(who.clone());
         self.problems.push((who, message));
+    }
+}
+
+/// One owner's rows, replaced in place so the other owners keep their order.
+/// A refresh that reorders nothing leaves the cursor where it was.
+///
+/// An owner not there yet goes where `rank` — its place in the inventory —
+/// says, not at the end: the vaults answer side by side and in any order,
+/// and the cache and the shell listing should read the same whichever
+/// finished first. An owner the inventory does not name goes last.
+fn replace<T>(
+    rows: &mut Vec<T>,
+    owner: &str,
+    new: Vec<T>,
+    owner_of: impl Fn(&T) -> &str,
+    rank: impl Fn(&str) -> Option<usize>,
+) {
+    let at = rows
+        .iter()
+        .position(|row| owner_of(row) == owner)
+        .unwrap_or_else(|| {
+            let mine = rank(owner).unwrap_or(usize::MAX);
+            rows.iter()
+                .position(|row| rank(owner_of(row)).unwrap_or(usize::MAX) > mine)
+                .unwrap_or(rows.len())
+        });
+    rows.retain(|row| owner_of(row) != owner);
+    let at = at.min(rows.len());
+    rows.splice(at..at, new);
+}
+
+/// What the footer and the help say for one problem: who, then what, or just
+/// what when it is nobody's in particular.
+#[must_use]
+pub fn problem_line((who, message): &(String, String)) -> String {
+    if who.is_empty() {
+        message.clone()
+    } else {
+        format!("{who}: {message}")
     }
 }
 
@@ -274,10 +311,8 @@ mod tests {
         Vault {
             id: format!("/vaults/{name}"),
             name: name.to_owned(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "standard".into(),
             uri: format!("https://{name}.vault.azure.net/"),
         }
     }
@@ -286,10 +321,8 @@ mod tests {
         Registry {
             id: format!("/registries/{name}"),
             name: name.to_owned(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "Premium".into(),
             login_server: format!("{name}.azurecr.io"),
         }
     }
@@ -324,6 +357,36 @@ mod tests {
             result: Ok(vec![secret("kv-b", "three")]),
         });
         store
+    }
+
+    #[test]
+    fn rows_landing_in_any_order_read_in_the_inventorys_order() {
+        let mut store = Store::default();
+        store.apply(Event::Inventory(Ok(Inventory {
+            vaults: vec![vault("kv-a"), vault("kv-b"), vault("kv-c")],
+            registries: Vec::new(),
+        })));
+        // kv-c answers first, then kv-a, then kv-b — the order three threads
+        // might finish in — and a vault the inventory does not name at all.
+        for (vault, name) in [
+            ("kv-c", "three"),
+            ("kv-a", "one"),
+            ("kv-gone", "zero"),
+            ("kv-b", "two"),
+        ] {
+            store.apply(Event::Secrets {
+                vault: vault.into(),
+                result: Ok(vec![secret(vault, name)]),
+            });
+        }
+        assert_eq!(
+            store
+                .secrets
+                .iter()
+                .map(|row| row.vault.as_str())
+                .collect::<Vec<_>>(),
+            ["kv-a", "kv-b", "kv-c", "kv-gone"]
+        );
     }
 
     #[test]
@@ -431,6 +494,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["kv-a", "kv-a"]
         );
+    }
+
+    #[test]
+    fn a_refresh_that_cannot_start_says_so_once_however_often_it_is_tried() {
+        let mut store = stocked();
+        store.apply(Event::Secrets {
+            vault: "kv-a".into(),
+            result: Err("boom".into()),
+        });
+        store.apply(Event::Inventory(Err("not signed in".into())));
+        store.apply(Event::Inventory(Err("not signed in".into())));
+        assert_eq!(
+            store.problems.len(),
+            2,
+            "kv-a's problem stands; the inventory's is said once"
+        );
+        assert_eq!(problem_line(&store.problems[0]), "kv-a: boom");
+        assert_eq!(problem_line(&store.problems[1]), "not signed in");
+    }
+
+    #[test]
+    fn the_spinner_turns_from_the_first_word_of_a_refresh() {
+        let mut store = Store::default();
+        store.apply(Event::Progress("reading the subscription…".into()));
+        assert!(store.refreshing, "before the inventory has landed");
+        store.apply(Event::Inventory(Err("not signed in".into())));
+        assert!(!store.refreshing);
     }
 
     #[test]

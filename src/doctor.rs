@@ -29,11 +29,10 @@ pub fn run(azure: &Azure) -> Result<bool> {
     }
     match auth::account() {
         Ok((user, tenant)) => line(&mut out, "account", &format!("{user} · tenant {tenant}"))?,
-        Err(error) => {
+        Err(_) => {
             // The CLI's own words here are three lines of stack; what the
             // reader needs is which of the two things went wrong.
-            line(&mut out, "account", "not signed in — run `az login`")?;
-            let _ = error;
+            line(&mut out, "account", crate::azure::transport::SIGNED_OUT)?;
             return Ok(false);
         }
     }
@@ -106,14 +105,21 @@ pub fn run(azure: &Azure) -> Result<bool> {
 
     // What each plane actually answers, which is the half of the check ARM
     // cannot do for you: a vault can be listed by Resource Graph and still
-    // refuse every data-plane call.
+    // refuse every data-plane call. No values and no attributes are read:
+    // one listing per vault and per registry is the whole check.
     for vault in &inventory.vaults {
-        let (said, answered) = vault::doctor_line(&client, vault);
+        let (said, answered) = timed("secrets", &format!("{}: ", vault.name), || {
+            vault::secrets(&client, vault).map(|rows| rows.len())
+        });
         line(&mut out, &vault.name, &said)?;
         ok &= answered;
     }
     for registry in &inventory.registries {
-        let (said, answered) = acr::doctor_line(&client, registry);
+        let (said, answered) = timed(
+            "repositories",
+            &format!("{}: ", registry.login_server),
+            || acr::repositories(&client, registry).map(|names| names.len()),
+        );
         line(&mut out, &registry.name, &said)?;
         ok &= answered;
     }
@@ -121,6 +127,20 @@ pub fn run(azure: &Azure) -> Result<bool> {
         ok = false;
     }
     Ok(ok)
+}
+
+/// One data-plane read, timed: how many `noun` it found, or why it would not
+/// say. The label of the line already names the vault or registry, so a
+/// refusal that starts by naming it again has that taken off.
+fn timed(noun: &str, prefix: &str, read: impl FnOnce() -> Result<usize>) -> (String, bool) {
+    let started = Instant::now();
+    match read() {
+        Ok(count) => (format!("{count} {noun} ({})", took(started)), true),
+        Err(error) => {
+            let said = format!("{error:#}");
+            (said.strip_prefix(prefix).unwrap_or(&said).to_owned(), false)
+        }
+    }
 }
 
 /// A name in the allowlist that the login could not reach. Not an error —
@@ -158,12 +178,12 @@ fn subscriptions_line(azure: &Azure) -> Result<String> {
 }
 
 /// Every line is `label` padded to a column, then what it found.
-pub fn line(out: &mut impl Write, label: &str, said: &str) -> Result<()> {
+fn line(out: &mut impl Write, label: &str, said: &str) -> Result<()> {
     writeln!(out, "{label:<14}{said}")?;
     Ok(())
 }
 
-pub fn indented(out: &mut impl Write, label: &str, said: &str) -> Result<()> {
+fn indented(out: &mut impl Write, label: &str, said: &str) -> Result<()> {
     writeln!(out, "  {label:<12}{said}")?;
     Ok(())
 }
@@ -175,7 +195,7 @@ fn fail(out: &mut impl Write, label: &str, error: &anyhow::Error, fix: &str) -> 
 }
 
 /// How long a step took, in whichever unit reads.
-pub fn took(started: Instant) -> String {
+fn took(started: Instant) -> String {
     let elapsed = started.elapsed();
     if elapsed.as_secs() >= 1 {
         format!("{:.1} s", elapsed.as_secs_f64())
@@ -206,6 +226,18 @@ mod tests {
         let said = subscriptions_line(&azure).unwrap();
         assert!(said.contains("2 from config.toml"), "{said}");
         assert!(said.contains("sub-1, sub-2"), "{said}");
+    }
+
+    #[test]
+    fn a_refusal_is_not_prefixed_with_the_name_the_line_already_carries() {
+        let (said, ok) = timed("secrets", "kv-prod: ", || {
+            Err(anyhow::anyhow!("kv-prod: no permission to read secrets"))
+        });
+        assert!(!ok);
+        assert_eq!(said, "no permission to read secrets");
+        let (said, ok) = timed("secrets", "kv-prod: ", || Ok(3));
+        assert!(ok);
+        assert!(said.starts_with("3 secrets ("), "{said}");
     }
 
     #[test]

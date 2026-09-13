@@ -29,38 +29,20 @@ impl Query {
         let mut query = Self::default();
         for token in raw.split_whitespace() {
             match token.split_once(':') {
-                // A key this tab knows, with something after the colon.
-                Some((key, value))
-                    if !value.is_empty()
-                        && known.iter().any(|held| held.eq_ignore_ascii_case(key)) =>
-                {
-                    query
-                        .fields
-                        .push((key.to_ascii_lowercase(), value.to_owned()));
+                Some((key, value)) if known.iter().any(|held| held.eq_ignore_ascii_case(key)) => {
+                    // A key this tab knows with nothing after the colon is
+                    // nothing yet: half-typing a filter must not empty the
+                    // table on the way to typing it.
+                    if !value.is_empty() {
+                        query
+                            .fields
+                            .push((key.to_ascii_lowercase(), value.to_owned()));
+                    }
                 }
                 _ => query.words.push(token.to_owned()),
             }
         }
         query
-    }
-
-    /// The value of one field, if the query named it. The last one wins, so
-    /// correcting a typed filter by typing another works.
-    #[must_use]
-    pub fn field(&self, key: &str) -> Option<&str> {
-        self.fields
-            .iter()
-            .rev()
-            .find(|(held, _)| held == key)
-            .map(|(_, value)| value.as_str())
-    }
-
-    /// Every value given for one field, for the keys that may repeat.
-    pub fn all(&self, key: &str) -> impl Iterator<Item = &str> {
-        self.fields
-            .iter()
-            .filter(move |(held, _)| held == key)
-            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -178,8 +160,6 @@ mod tests {
                 ("enabled".to_owned(), "no".to_owned())
             ]
         );
-        assert_eq!(query.field("vault"), Some("kv-prod"));
-        assert_eq!(query.field("registry"), None);
     }
 
     #[test]
@@ -193,14 +173,10 @@ mod tests {
         assert!(query.fields.is_empty());
 
         let query = Query::parse("vault:", SECRETS);
-        assert_eq!(query.words, ["vault:"], "a key with nothing after it");
-    }
-
-    #[test]
-    fn the_last_value_of_a_field_wins_and_every_value_is_reachable() {
-        let query = Query::parse("vault:kv-a vault:kv-b", SECRETS);
-        assert_eq!(query.field("vault"), Some("kv-b"));
-        assert_eq!(query.all("vault").collect::<Vec<_>>(), ["kv-a", "kv-b"]);
+        assert!(
+            query.words.is_empty() && query.fields.is_empty(),
+            "a key with nothing after it is nothing yet, not a word that empties the table"
+        );
     }
 
     #[test]

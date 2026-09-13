@@ -45,7 +45,6 @@ pub enum Panes {
 #[derive(Default)]
 pub struct Shell {
     pub focus: Focus,
-    pub should_quit: bool,
     pub help_open: bool,
     /// What the status bar says instead of the footer hint, until it expires.
     notification: Option<(String, Instant, Level)>,
@@ -77,10 +76,6 @@ impl Shell {
         self.notification
             .as_ref()
             .map(|(said, _, level)| (said.as_str(), *level))
-    }
-
-    pub fn clear_notification(&mut self) {
-        self.notification = None;
     }
 
     /// Starts a frame: whatever was clickable last frame is gone.
@@ -160,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn a_notification_is_read_back_and_can_be_cleared() {
+    fn a_notification_is_read_back_with_its_level() {
         let mut shell = Shell::default();
         assert!(shell.notification().is_none());
         shell.set_status("Copied value of db-password (kv-prod)");
@@ -170,8 +165,6 @@ mod tests {
 
         shell.set_error("kv-prod: no permission");
         assert_eq!(shell.notification().unwrap().1, Level::Error);
-        shell.clear_notification();
-        assert!(shell.notification().is_none());
     }
 
     #[test]

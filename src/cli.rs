@@ -17,7 +17,7 @@ use crate::ui::theme::ThemeChoice;
 pub struct Cli {
     /// Only read this subscription. Repeat for more; left out, every
     /// subscription the login can see.
-    #[arg(long = "subscription", value_name = "GUID")]
+    #[arg(long = "subscription", value_name = "GUID", global = true)]
     pub subscriptions: Vec<String>,
 
     /// Only read this key vault, in the order given. Repeat for more.
@@ -33,19 +33,19 @@ pub struct Cli {
     pub refresh: Option<u64>,
 
     /// terminal · terminal-light · mono · custom
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", global = true)]
     pub theme: Option<String>,
 
     /// Read this file instead of ~/.config/az-tui/config.toml.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
     /// Keep the cache here instead of in the data directory.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub cache: Option<PathBuf>,
 
     /// Neither read nor write the cache.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_cache: bool,
 
     #[command(subcommand)]
@@ -66,6 +66,8 @@ pub enum Command {
         /// Only this vault. Repeat for more.
         #[arg(long = "vault", value_name = "NAME")]
         vaults: Vec<String>,
+        /// One JSON array: vault, name, enabled, content_type, expires,
+        /// created, updated, managed, tags. Never a value.
         #[arg(long)]
         json: bool,
         /// Read Azure rather than the cache.
@@ -86,6 +88,8 @@ pub enum Command {
         /// Only this registry. Repeat for more.
         #[arg(long = "registry", value_name = "NAME")]
         registries: Vec<String>,
+        /// One JSON array: registry, repository, tag_count, manifest_count,
+        /// created, updated.
         #[arg(long)]
         json: bool,
         /// Read Azure rather than the cache.
@@ -101,6 +105,8 @@ pub enum Command {
         /// name.
         #[arg(long, value_name = "NAME")]
         registry: Option<String>,
+        /// One JSON array: registry, repository, tag, digest, pull, created,
+        /// updated.
         #[arg(long)]
         json: bool,
     },
@@ -187,8 +193,15 @@ mod tests {
     }
 
     #[test]
-    fn doctor_is_the_one_subcommand_so_far() {
+    fn the_subcommands_parse_and_the_global_flags_may_follow_them() {
         let cli = Cli::parse_from(["az-tui", "doctor"]);
         assert!(matches!(cli.command, Some(Command::Doctor)));
+
+        // The natural order in a script: the command first, then how to run
+        // it. Only the flags no subcommand names for itself are global.
+        let cli = Cli::parse_from(["az-tui", "secrets", "--no-cache", "--config", "x.toml"]);
+        assert!(cli.no_cache);
+        assert_eq!(cli.config.as_deref(), Some(std::path::Path::new("x.toml")));
+        assert!(matches!(cli.command, Some(Command::Secrets { .. })));
     }
 }

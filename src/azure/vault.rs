@@ -199,19 +199,6 @@ fn unix(value: &Value) -> Option<Timestamp> {
     Timestamp::from_unix(value.as_i64()?)
 }
 
-/// One line for `doctor`: how many secrets a vault holds, or why it would not
-/// say, and whether it answered at all. Reads no values, ever.
-pub fn doctor_line(client: &Client, vault: &Vault) -> (String, bool) {
-    let started = std::time::Instant::now();
-    match secrets(client, vault) {
-        Ok(rows) => (
-            format!("{} secrets ({})", rows.len(), crate::doctor::took(started)),
-            true,
-        ),
-        Err(error) => (format!("{error:#}"), false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,10 +211,8 @@ mod tests {
             id: "/subscriptions/s/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/kv-prod"
                 .into(),
             name: "kv-prod".into(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "standard".into(),
             uri: "https://kv-prod.vault.azure.net/".into(),
         }
     }

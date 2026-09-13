@@ -13,6 +13,7 @@ use super::cursor::{ListCursor, ScrollState};
 use super::screen::{AppAction, Target};
 use super::secrets::REST;
 use super::shell::{Focus, Shell};
+use super::{flip, none_last};
 use crate::azure::{Repository, Tag, acr};
 use crate::columns::{ColumnId, REPOSITORY_COLUMNS, TAG_COLUMNS, TableLayout};
 use crate::filter::{self, Query, When};
@@ -180,18 +181,6 @@ impl RegistriesScreen {
             return None;
         };
         tags.get(*self.tag_visible.get(self.tags.cursor.index)?)
-    }
-
-    /// Where the registry a row belongs to lives, for the pull references
-    /// and the portal link.
-    #[must_use]
-    pub fn login_server<'a>(&self, store: &'a Store, registry: &str) -> Option<&'a str> {
-        store
-            .inventory
-            .registries
-            .iter()
-            .find(|held| held.name == registry)
-            .map(|held| held.login_server.as_str())
     }
 
     pub fn note_width(&mut self, available: u16) {
@@ -485,17 +474,19 @@ impl RegistriesScreen {
         table.descending = false;
     }
 
+    /// A header click: the same column cycles ascending, descending, then
+    /// back to the default; a different column starts ascending. The default
+    /// column opens descending, so on it a click simply turns the sort over
+    /// — otherwise no number of clicks would ever make it ascending.
     pub fn sort_by(&mut self, column: ColumnId) {
-        let default = match self.level {
-            Level::Repositories | Level::Tags { .. } => ColumnId::Updated,
-        };
+        const DEFAULT: ColumnId = ColumnId::Updated;
         let table = self.table_mut();
         if table.sort == column {
-            if table.descending {
-                table.sort = default;
+            if table.descending && column != DEFAULT {
+                table.sort = DEFAULT;
                 table.descending = true;
             } else {
-                table.descending = true;
+                table.descending = !table.descending;
             }
         } else {
             table.sort = column;
@@ -520,17 +511,23 @@ impl RegistriesScreen {
         use crossterm::event::KeyCode;
         let count = self.count();
         if shell.focus == Focus::Details {
+            let page = i32::try_from(self.details_scroll.page_step()).unwrap_or(1);
             match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.details_scroll.scroll_by(1);
-                    return AppAction::None;
+                KeyCode::Char('j') | KeyCode::Down => self.details_scroll.scroll_by(1),
+                KeyCode::Char('k') | KeyCode::Up => self.details_scroll.scroll_by(-1),
+                KeyCode::PageDown => self.details_scroll.scroll_by(page),
+                KeyCode::PageUp => self.details_scroll.scroll_by(-page),
+                KeyCode::Home => {
+                    self.details_scroll.scroll_to(0);
+                    true
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.details_scroll.scroll_by(-1);
-                    return AppAction::None;
+                KeyCode::End => {
+                    self.details_scroll.scroll_to(usize::MAX);
+                    true
                 }
                 _ => return self.acting_key(shell, store, key),
-            }
+            };
+            return AppAction::None;
         }
         let before = self.table().cursor.index;
         match key.code {
@@ -563,7 +560,8 @@ impl RegistriesScreen {
         use crossterm::event::KeyCode;
         match (key.code, &self.level) {
             (KeyCode::Enter, Level::Repositories) => self.open_tags(store),
-            (KeyCode::Backspace | KeyCode::Char('h'), Level::Tags { .. }) => {
+            // `Esc` reaches here only once there was no query to clear.
+            (KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Esc, Level::Tags { .. }) => {
                 self.close_tags();
                 AppAction::None
             }
@@ -583,7 +581,10 @@ impl RegistriesScreen {
                 let Some(repository) = self.selected_repository(store) else {
                     return AppAction::None;
                 };
-                let Some(login) = self.login_server(store, &repository.registry) else {
+                let Some(login) = store
+                    .registry(&repository.registry)
+                    .map(|held| &held.login_server)
+                else {
                     return AppAction::None;
                 };
                 let text = format!("{login}/{}", repository.name);
@@ -596,7 +597,7 @@ impl RegistriesScreen {
                 let Some(tag) = self.selected_tag(store) else {
                     return AppAction::None;
                 };
-                let Some(login) = self.login_server(store, registry) else {
+                let Some(login) = store.registry(registry).map(|held| &held.login_server) else {
                     return AppAction::None;
                 };
                 let text = if digest {
@@ -622,12 +623,7 @@ impl RegistriesScreen {
         let Some(registry) = registry else {
             return AppAction::None;
         };
-        let Some(held) = store
-            .inventory
-            .registries
-            .iter()
-            .find(|held| held.name == registry)
-        else {
+        let Some(held) = store.registry(&registry) else {
             shell.set_error(format!("{registry} is not in the inventory"));
             return AppAction::None;
         };
@@ -649,11 +645,7 @@ impl RegistriesScreen {
                 }
                 self.table_mut().cursor.focus(index);
             }
-            Target::Header(key) => {
-                if let Some(column) = ColumnId::from_key(key) {
-                    self.sort_by(column);
-                }
-            }
+            Target::Header(column) => self.sort_by(column),
             _ => {}
         }
         AppAction::None
@@ -666,10 +658,14 @@ impl RegistriesScreen {
         }
         let count = self.count();
         let cursor = &mut self.table_mut().cursor;
+        // Measured against the list as it is now, not as it was last drawn:
+        // a refresh may have shortened it since.
+        cursor.scroll.set_viewport(cursor.scroll.viewport, count);
         cursor.scroll.scroll_by(delta);
-        let first = cursor.scroll.offset;
-        let last = first + cursor.scroll.viewport.saturating_sub(1);
-        cursor.index = cursor.index.clamp(first, last.min(count.saturating_sub(1)));
+        let last = (cursor.scroll.offset + cursor.scroll.viewport.saturating_sub(1))
+            .min(count.saturating_sub(1));
+        let first = cursor.scroll.offset.min(last);
+        cursor.index = cursor.index.clamp(first, last);
     }
 
     /// Nothing about a registry is urgent, so no badge.
@@ -725,25 +721,6 @@ pub fn tag_passes(tag: &Tag, query: &Query, now: Timestamp) -> bool {
     })
 }
 
-/// `None` sorts last in both directions, as it does on the Secrets tab: a
-/// count that has not arrived yet is not the most interesting row on screen,
-/// and flipping the sort should not make it so.
-fn none_last<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(left), Some(right)) => {
-            if descending {
-                right.cmp(&left)
-            } else {
-                left.cmp(&right)
-            }
-        }
-    }
-}
-
 pub fn sort_repositories(
     indices: &mut [usize],
     rows: &[Repository],
@@ -752,16 +729,9 @@ pub fn sort_repositories(
 ) {
     indices.sort_by(|a, b| {
         let (left, right) = (&rows[*a], &rows[*b]);
-        let flip = |ordering: std::cmp::Ordering| {
-            if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        };
         let ordering = match by {
-            ColumnId::Registry => flip(left.registry.cmp(&right.registry)),
-            ColumnId::Repository => flip(left.name.cmp(&right.name)),
+            ColumnId::Registry => flip(left.registry.cmp(&right.registry), descending),
+            ColumnId::Repository => flip(left.name.cmp(&right.name), descending),
             ColumnId::Tags => none_last(left.tag_count, right.tag_count, descending),
             ColumnId::Manifests => none_last(left.manifest_count, right.manifest_count, descending),
             ColumnId::Updated => none_last(left.updated, right.updated, descending),
@@ -777,16 +747,9 @@ pub fn sort_repositories(
 pub fn sort_tags(indices: &mut [usize], tags: &[Tag], by: ColumnId, descending: bool) {
     indices.sort_by(|a, b| {
         let (left, right) = (&tags[*a], &tags[*b]);
-        let flip = |ordering: std::cmp::Ordering| {
-            if descending {
-                ordering.reverse()
-            } else {
-                ordering
-            }
-        };
         let ordering = match by {
-            ColumnId::Tag => flip(left.name.cmp(&right.name)),
-            ColumnId::Digest => flip(left.digest.cmp(&right.digest)),
+            ColumnId::Tag => flip(left.name.cmp(&right.name), descending),
+            ColumnId::Digest => flip(left.digest.cmp(&right.digest), descending),
             ColumnId::Updated => none_last(left.updated, right.updated, descending),
             ColumnId::Created => none_last(left.created, right.created, descending),
             _ => std::cmp::Ordering::Equal,
@@ -796,4 +759,4 @@ pub fn sort_tags(indices: &mut [usize], tags: &[Tag], by: ColumnId, descending: 
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -16,55 +16,15 @@
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-/// One query, compiled once and asked about many rows.
+/// One query, compiled once and asked about many rows: whether a row
+/// matches, and which characters of a cell it lit up.
 pub struct Query {
     pattern: Pattern,
     matcher: Matcher,
     buffer: Vec<char>,
-    empty: bool,
 }
 
 impl Query {
-    #[must_use]
-    pub fn new(words: &[String]) -> Self {
-        let joined = words.join(" ");
-        Self {
-            pattern: Pattern::new(
-                &joined,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Substring,
-            ),
-            matcher: Matcher::new(Config::DEFAULT),
-            buffer: Vec::new(),
-            empty: joined.trim().is_empty(),
-        }
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.empty
-    }
-
-    /// Whether every word of the query is somewhere in this row's text.
-    pub fn matches(&mut self, haystack: &str) -> bool {
-        if self.empty {
-            return true;
-        }
-        let haystack = Utf32Str::new(haystack, &mut self.buffer);
-        self.pattern.score(haystack, &mut self.matcher).is_some()
-    }
-}
-
-/// Which characters of one cell a query lit up, so the table can paint them
-/// in `search_match`.
-pub struct Highlighter {
-    pattern: Pattern,
-    matcher: Matcher,
-    buffer: Vec<char>,
-}
-
-impl Highlighter {
     #[must_use]
     pub fn new(words: &[String]) -> Self {
         Self {
@@ -84,8 +44,17 @@ impl Highlighter {
         self.pattern.atoms.is_empty()
     }
 
+    /// Whether every word of the query is somewhere in this row's text.
+    pub fn matches(&mut self, haystack: &str) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let haystack = Utf32Str::new(haystack, &mut self.buffer);
+        self.pattern.score(haystack, &mut self.matcher).is_some()
+    }
+
     /// The character indices of this cell that the query matched, sorted and
-    /// without repeats.
+    /// without repeats, so the table can paint them in `search_match`.
     pub fn indices(&mut self, haystack: &str) -> Vec<u32> {
         if self.is_empty() || haystack.is_empty() {
             return Vec::new();
@@ -137,28 +106,28 @@ mod tests {
     }
 
     #[test]
-    fn the_highlighter_marks_the_literal_run_and_nothing_else() {
-        let mut highlighter = Highlighter::new(&words("pass"));
+    fn the_indices_mark_the_literal_run_and_nothing_else() {
+        let mut query = Query::new(&words("pass"));
         let text = "db-password";
-        let lit: String = highlighter
+        let lit: String = query
             .indices(text)
             .into_iter()
             .map(|index| text.chars().nth(index as usize).unwrap())
             .collect();
         assert_eq!(lit, "pass");
 
-        let mut highlighter = Highlighter::new(&words("qa"));
-        assert!(highlighter.indices("db-password").is_empty());
+        let mut query = Query::new(&words("qa"));
+        assert!(query.indices("db-password").is_empty());
 
-        let mut highlighter = Highlighter::new(&[]);
-        assert!(highlighter.is_empty());
-        assert!(highlighter.indices("db-password").is_empty());
+        let mut query = Query::new(&[]);
+        assert!(query.is_empty());
+        assert!(query.indices("db-password").is_empty());
     }
 
     #[test]
     fn both_words_of_a_query_are_lit_in_the_cell_that_holds_them() {
-        let mut highlighter = Highlighter::new(&words("db pass"));
-        let indices = highlighter.indices("db-password");
+        let mut query = Query::new(&words("db pass"));
+        let indices = query.indices("db-password");
         assert!(indices.contains(&0) && indices.contains(&1), "db");
         assert!(indices.contains(&3), "the start of pass");
     }

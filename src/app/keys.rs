@@ -1,8 +1,4 @@
-//! Every key, in one table.
-//!
-//! `?` renders this and the dispatch in [`super`] matches on it, so the help
-//! and the program cannot drift apart: a key added to one is a key added to
-//! both, and a test asserts every entry here is one the dispatch knows.
+//! Every key, in one table, which is what `?` renders.
 
 use super::screen::TabId;
 
@@ -97,7 +93,7 @@ pub const KEYS: &[Key] = &[
         tab: Some(TabId::Registries),
     },
     Key {
-        keys: "Backspace  h",
+        keys: "h  Esc  Bksp",
         does: "back to the repositories",
         tab: Some(TabId::Registries),
     },
@@ -108,7 +104,7 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         keys: "Y",
-        does: "copy the digest reference",
+        does: "copy the digest reference (inside a repository)",
         tab: Some(TabId::Registries),
     },
 ];

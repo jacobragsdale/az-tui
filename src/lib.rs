@@ -9,6 +9,7 @@ pub mod config;
 pub mod desktop;
 pub mod doctor;
 pub mod filter;
+pub mod parallel;
 pub mod paths;
 pub mod run;
 pub mod search;

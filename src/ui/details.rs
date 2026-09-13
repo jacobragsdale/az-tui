@@ -4,14 +4,79 @@
 //! One place so both tabs' panes read the same: the label in `muted` at a
 //! fixed width, the value in whatever colour it has earned.
 
+use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::theme::theme;
+use crate::app::cursor::ScrollState;
+use crate::app::screen::Target;
+use crate::app::shell::Shell;
 
 /// How wide the label column is. Wide enough for `Content type`, which is
 /// the longest label either tab has.
 pub const LABEL: usize = 14;
+
+/// How wide the lines inside a pane drawn in `area` may be: the area less
+/// its border. What a caller builds its lines to before [`render_pane`].
+#[must_use]
+pub const fn pane_width(area: Rect) -> u16 {
+    area.width.saturating_sub(2)
+}
+
+/// The pane itself: its frame, and `lines` scrolled inside it. Both tabs
+/// draw theirs through here, so the pane looks the same whatever it says.
+pub fn render_pane(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    focused: bool,
+    scroll: &mut ScrollState,
+    lines: Vec<Line<'static>>,
+) {
+    let palette = theme();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(if focused {
+            palette.border_focused
+        } else {
+            palette.border
+        }))
+        .title(Line::from(" Details ").style(Style::default().fg(palette.accent)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    shell.region(area, Target::Details);
+
+    scroll.set_viewport(usize::from(inner.height), lines.len());
+    let offset = u16::try_from(scroll.offset).unwrap_or(0);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((offset, 0)),
+        inner,
+    );
+}
+
+/// One line in `muted`, for a pane with nothing to show yet.
+#[must_use]
+pub fn quiet(said: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        said.into(),
+        Style::default().fg(theme().muted),
+    ))
+}
+
+/// One line in `error`, for a pane whose read was refused.
+#[must_use]
+pub fn refused(said: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        said.into(),
+        Style::default().fg(theme().error),
+    ))
+}
 
 /// `Label   value`, with the value in the colour it was given.
 #[must_use]

@@ -1,23 +1,25 @@
 //! The Secrets tab's panes: the search row and the table under it.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::details::{LABEL, chip, coloured_field, field, link_field, section, title, with_hint};
+use super::details::{
+    LABEL, chip, coloured_field, field, link_field, pane_width, quiet, refused, render_pane,
+    section, title, with_hint,
+};
 use super::table::{Cell, TableSpec, render_list_table, table_geometry};
 use super::theme::theme;
-use super::widgets::{render_scrollbar, render_search_row};
+use super::widgets::{Pane, SECRETS_PLACEHOLDER, render_panes, render_scrollbar};
 use crate::app::screen::Target;
-use crate::app::secrets::{Expiry, SecretsScreen};
-use crate::app::shell::{Focus, Panes, Shell};
+use crate::app::secrets::{Expiry, SCHEMA, SecretsScreen};
+use crate::app::shell::{Focus, Shell};
 use crate::azure::SecretRow;
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
-use crate::search::Highlighter;
+use crate::search::Query;
 use crate::store::Store;
-use crate::timestamp::Timestamp;
+use crate::timestamp::{Timestamp, age};
 
 /// Draws the tab: one row for the search box, then the table and the details
 /// pane, laid out to fit.
@@ -28,42 +30,18 @@ pub fn render(
     store: &Store,
     area: Rect,
 ) {
-    let [search, body] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
-        .areas(area);
-    render_search_row(
+    let input = screen.input.clone();
+    render_panes(
         frame,
         shell,
-        search,
-        &screen.input,
-        shell.focus == Focus::Search,
-        crate::app::screen::TabId::Secrets,
+        area,
+        &input,
+        SECRETS_PLACEHOLDER,
+        |frame, shell, pane, rect| match pane {
+            Pane::Table => render_table(frame, shell, screen, store, rect),
+            Pane::Details => render_details(frame, shell, screen, store, rect),
+        },
     );
-
-    match Shell::panes(area.width) {
-        Panes::SideBySide => {
-            let [table, details] = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(body);
-            render_table(frame, shell, screen, store, table);
-            render_details(frame, shell, screen, store, details);
-        }
-        Panes::Stacked => {
-            let [table, details] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(body);
-            render_table(frame, shell, screen, store, table);
-            render_details(frame, shell, screen, store, details);
-        }
-        // Only one pane fits; `Tab` says which.
-        Panes::One if shell.focus == Focus::Details => {
-            render_details(frame, shell, screen, store, body);
-        }
-        Panes::One => render_table(frame, shell, screen, store, body),
-    }
 }
 
 /// The table itself. The screen has already decided which rows are shown and
@@ -81,9 +59,8 @@ pub fn render_table(
     let columns = screen.layout.visible_columns(available);
 
     let now = Timestamp::now();
-    let mut highlighter = Highlighter::new(
-        &crate::filter::Query::parse(screen.input.text(), crate::app::secrets::SCHEMA).words,
-    );
+    let mut highlighter =
+        Query::new(&crate::filter::Query::parse(screen.input.text(), SCHEMA).words);
 
     // `window` is what records the viewport on the cursor, so a page and an
     // End know how far to move; taking a slice by hand would leave the
@@ -114,7 +91,7 @@ pub fn render_table(
         shell.region(rect, Target::Row(index));
     }
     for (column, rect) in hits.headers {
-        shell.region(rect, Target::Header(column.key()));
+        shell.region(rect, Target::Header(column));
     }
     render_scrollbar(
         frame,
@@ -142,40 +119,18 @@ pub fn render_details(
     store: &Store,
     area: Rect,
 ) {
-    let palette = theme();
     let focused = shell.focus == Focus::Details;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(palette.border_type)
-        .border_style(Style::default().fg(if focused {
-            palette.border_focused
-        } else {
-            palette.border
-        }))
-        .title(Line::from(" Details ").style(Style::default().fg(palette.accent)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    shell.region(area, Target::Details);
-
-    let Some(row) = screen.selected(store).cloned() else {
-        frame.render_widget(
-            Paragraph::new("Nothing selected").style(Style::default().fg(palette.muted)),
-            inner,
-        );
-        return;
+    let lines = match screen.selected(store).cloned() {
+        Some(row) => detail_lines(screen, store, &row, pane_width(area), Timestamp::now()),
+        None => vec![quiet("Nothing selected")],
     };
-
-    let now = Timestamp::now();
-    let lines = detail_lines(screen, store, &row, inner.width, now);
-    screen
-        .details_scroll
-        .set_viewport(usize::from(inner.height), lines.len());
-    let offset = u16::try_from(screen.details_scroll.offset).unwrap_or(0);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        inner,
+    render_pane(
+        frame,
+        shell,
+        area,
+        focused,
+        &mut screen.details_scroll,
+        lines,
     );
 }
 
@@ -235,12 +190,7 @@ fn detail_lines(
     if row.managed {
         lines.push(field("Managed", "yes — a certificate's backing secret"));
     }
-    if let Some(vault) = store
-        .inventory
-        .vaults
-        .iter()
-        .find(|vault| vault.name == row.vault)
-    {
+    if let Some(vault) = store.vault(&row.vault) {
         lines.push(link_field(
             "Id",
             format!("{}secrets/{}", vault.uri, row.name),
@@ -251,27 +201,16 @@ fn detail_lines(
     lines.push(Line::from(""));
     lines.push(section("Versions", width));
     match versions {
-        None => lines.push(Line::from(Span::styled(
-            "reading…",
-            Style::default().fg(palette.muted),
-        ))),
-        Some(Err(message)) => lines.push(Line::from(Span::styled(
-            message.clone(),
-            Style::default().fg(palette.error),
-        ))),
-        Some(Ok(versions)) if versions.is_empty() => lines.push(Line::from(Span::styled(
-            "none",
-            Style::default().fg(palette.muted),
-        ))),
+        None => lines.push(quiet("reading…")),
+        Some(Err(message)) => lines.push(refused(message.clone())),
+        Some(Ok(versions)) if versions.is_empty() => lines.push(quiet("none")),
         Some(Ok(versions)) => {
             let current = screen.revealed_here(row).map(|held| held.version.clone());
             for version in versions {
                 let short: String = version.version.chars().take(8).collect();
                 let mut said = format!(
                     "{short}…  {:<5} {}",
-                    version
-                        .created
-                        .map_or_else(|| "—".to_owned(), |at| at.relative_age(now)),
+                    age(version.created, now),
                     if version.enabled {
                         "enabled"
                     } else {
@@ -368,7 +307,7 @@ fn row_cells(
     row: &SecretRow,
     columns: &[ColumnConfig],
     store: &Store,
-    highlighter: &mut Highlighter,
+    highlighter: &mut Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let palette = theme();
@@ -418,10 +357,6 @@ fn row_cells(
         .collect()
 }
 
-fn age(stamp: Option<Timestamp>, now: Timestamp) -> String {
-    stamp.map_or_else(|| "—".to_owned(), |stamp| stamp.relative_age(now))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,10 +370,8 @@ mod tests {
         Vault {
             id: format!("/vaults/{name}"),
             name: name.to_owned(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "standard".into(),
             uri: format!("https://{name}.vault.azure.net/"),
         }
     }
@@ -579,11 +512,11 @@ mod tests {
         assert_eq!(row.1, 0);
         let header = (0..14)
             .find_map(|y| match shell.hit(4, y) {
-                Some(Target::Header(key)) => Some(*key),
+                Some(Target::Header(column)) => Some(*column),
                 _ => None,
             })
             .expect("a header region");
-        assert_eq!(header, "vault");
+        assert_eq!(header, ColumnId::Vault);
     }
 
     #[test]

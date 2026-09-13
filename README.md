@@ -75,12 +75,16 @@ It exits 0 when everything answered and 1 otherwise, so it works in a script.
 ## From a shell
 
 The same reads without the screen, for scripts and agents. Each reads the
-cache when it is younger than the refresh interval and Azure otherwise.
+cache when it is younger than the refresh interval and Azure otherwise; with
+`refresh = 0` in `config.toml` the cache is used whatever its age, and
+`--refresh` reads Azure regardless. The global flags (`--config`, `--cache`,
+`--no-cache`, `--subscription`, `--theme`) may come before or after the
+subcommand.
 
 ```console
 az-tui secrets [QUERY] [--vault NAME]... [--json] [--refresh]
 az-tui secret get NAME [--vault NAME] [--version ID] [--json]
-az-tui repos [QUERY] [--registry NAME]... [--json]
+az-tui repos [QUERY] [--registry NAME]... [--json] [--refresh]
 az-tui tags REPO [--registry NAME] [--json]
 az-tui doctor
 ```
@@ -103,8 +107,8 @@ with no trailing newline of its own, so `$(az-tui secret get NAME)` is the
 value byte for byte, and a value that ends in a newline keeps it. A name that
 is in more than one vault is an error listing them rather than a guess.
 
-Exit codes: **0** it worked, **1** a read failed, **2** the arguments were
-wrong.
+Exit codes: **0** it worked, **1** a read failed (the rows that did answer
+are still printed first), **2** the arguments were wrong.
 
 ## Keys
 
@@ -115,14 +119,14 @@ wrong.
 | `Tab` | focus the table or the details pane |
 | `/` | search; `Esc` or `Enter` leaves the box and keeps the filter; `Esc` again clears it; `Ctrl-U` clears the box |
 | `Enter` | Secrets: reveal (same as `v`). Registries: open the repository's tags |
-| `Backspace`, `h` | Registries: back up to the repositories |
+| `Backspace`, `h`, `Esc` | Registries: back up to the repositories (`Esc` clears a query first) |
 | `v` | show the secret's value for 60 s; again hides it |
 | `y` | copy the value (secret), the pull reference (repository or tag) |
 | `Y` | copy the name (secret), the digest reference `repo@sha256:…` (tag) |
 | `o` | open the vault or registry in the Azure portal |
 | `s` / `S` | next sort column / flip the direction; a header click does the same |
 | `r` | refresh now |
-| `?` | help, generated from the same table the keys are matched on |
+| `?` | help: the keys and the search grammar, generated from the same key table |
 | `q`, `Ctrl-C` | quit |
 
 The mouse: click a row, a tab, a column header or the search row; the wheel
@@ -191,6 +195,7 @@ subscriptions = ["<guid>"]                # left out: every subscription the log
 vaults = ["kv-dev", "kv-qa", "kv-prod"]   # only these, in this order; left out: all
 registries = ["acrdev", "acrqa", "acrprod"]
 refresh = 300                             # seconds between background refreshes; 0 = only `r`
+parallel = 8                              # vaults or repositories read at once during a refresh
 
 [theme]
 preset = "terminal"                       # terminal · terminal-light · mono · custom
@@ -238,7 +243,8 @@ Terminal, and VS Code's.
    line in the footer; the other vaults' rows stay on screen and are marked
    stale. It starts with no `az login` at all and says so.
 4. **The UI thread never blocks on the network.** Every HTTPS call and every
-   `az` shell-out happens on one worker thread.
+   `az` shell-out happens off it, and a refresh reads up to `parallel` vaults
+   and repositories at once (eight, unless `config.toml` says otherwise).
 
 ## How it was built
 

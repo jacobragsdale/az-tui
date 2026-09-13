@@ -2,23 +2,28 @@
 //! one repository's tags — and the details pane beside it.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::details::{field, link_field, section, subtitle, title, with_hint};
+use super::details::{
+    field, link_field, pane_width, quiet, refused, render_pane, section, subtitle, title, with_hint,
+};
 use super::table::{Cell, TableSpec, render_list_table, table_geometry};
 use super::theme::theme;
-use super::widgets::{render_scrollbar, render_search_row};
-use crate::app::registries::{Level, RegistriesScreen, TAGS_IN_PANE};
+use super::widgets::{
+    Pane, REPOSITORIES_PLACEHOLDER, TAGS_PLACEHOLDER, render_panes, render_scrollbar,
+};
+use crate::app::registries::{
+    Level, REPOSITORY_SCHEMA, RegistriesScreen, TAG_SCHEMA, TAGS_IN_PANE,
+};
 use crate::app::screen::Target;
-use crate::app::shell::{Focus, Panes, Shell};
+use crate::app::shell::{Focus, Shell};
 use crate::azure::acr::{human_size, short_digest};
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
-use crate::search::Highlighter;
+use crate::search::Query;
 use crate::store::Store;
-use crate::timestamp::Timestamp;
+use crate::timestamp::{Timestamp, age};
 
 pub fn render(
     frame: &mut Frame,
@@ -27,45 +32,24 @@ pub fn render(
     store: &Store,
     area: Rect,
 ) {
-    let [search, body] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
-        .areas(area);
-    let focused = shell.focus == Focus::Search;
     // Each level keeps its own box, so going down and back restores the
-    // query that was typed at each.
+    // query that was typed at each — and each names its own grammar.
     let input = screen.input().clone();
-    render_search_row(
+    let placeholder = match screen.level {
+        Level::Repositories => REPOSITORIES_PLACEHOLDER,
+        Level::Tags { .. } => TAGS_PLACEHOLDER,
+    };
+    render_panes(
         frame,
         shell,
-        search,
+        area,
         &input,
-        focused,
-        crate::app::screen::TabId::Registries,
+        placeholder,
+        |frame, shell, pane, rect| match pane {
+            Pane::Table => render_table(frame, shell, screen, store, rect),
+            Pane::Details => render_details(frame, shell, screen, store, rect),
+        },
     );
-
-    match Shell::panes(area.width) {
-        Panes::SideBySide => {
-            let [table, details] = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(body);
-            render_table(frame, shell, screen, store, table);
-            render_details(frame, shell, screen, store, details);
-        }
-        Panes::Stacked => {
-            let [table, details] = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(body);
-            render_table(frame, shell, screen, store, table);
-            render_details(frame, shell, screen, store, details);
-        }
-        Panes::One if shell.focus == Focus::Details => {
-            render_details(frame, shell, screen, store, body);
-        }
-        Panes::One => render_table(frame, shell, screen, store, body),
-    }
 }
 
 fn render_table(
@@ -80,8 +64,14 @@ fn render_table(
     screen.note_width(available);
     let now = Timestamp::now();
     let columns = screen.table().layout.visible_columns(available);
+    // Parsed with the level's own schema, so a `registry:` filter is a field
+    // here as it was in the filter, not a word lit up nowhere.
+    let schema = match screen.level {
+        Level::Repositories => REPOSITORY_SCHEMA,
+        Level::Tags { .. } => TAG_SCHEMA,
+    };
     let mut highlighter =
-        Highlighter::new(&crate::filter::Query::parse(screen.input().text(), &[]).words);
+        Query::new(&crate::filter::Query::parse(screen.input().text(), schema).words);
 
     let title = screen.title();
     let status = screen.status(store);
@@ -145,7 +135,7 @@ fn render_table(
         shell.region(rect, Target::Row(index));
     }
     for (column, rect) in hits.headers {
-        shell.region(rect, Target::Header(column.key()));
+        shell.region(rect, Target::Header(column));
     }
     render_scrollbar(
         frame,
@@ -165,7 +155,7 @@ fn repository_cells(
     row: &crate::azure::Repository,
     columns: &[ColumnConfig],
     store: &Store,
-    highlighter: &mut Highlighter,
+    highlighter: &mut Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let palette = theme();
@@ -199,7 +189,7 @@ fn repository_cells(
 fn tag_cells(
     tag: &crate::azure::Tag,
     columns: &[ColumnConfig],
-    highlighter: &mut Highlighter,
+    highlighter: &mut Query,
     now: Timestamp,
 ) -> Vec<Cell> {
     let base = Style::default();
@@ -238,40 +228,20 @@ fn render_details(
     store: &Store,
     area: Rect,
 ) {
-    let palette = theme();
     let focused = shell.focus == Focus::Details;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(palette.border_type)
-        .border_style(Style::default().fg(if focused {
-            palette.border_focused
-        } else {
-            palette.border
-        }))
-        .title(Line::from(" Details ").style(Style::default().fg(palette.accent)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    shell.region(area, Target::Details);
-
+    let width = pane_width(area);
     let lines = match screen.level.clone() {
-        Level::Repositories => repository_lines(screen, store, inner.width),
-        Level::Tags { registry, repo } => tag_lines(screen, store, &registry, &repo, inner.width),
+        Level::Repositories => repository_lines(screen, store, width),
+        Level::Tags { registry, repo } => tag_lines(screen, store, &registry, &repo, width),
     };
-    let lines = lines.unwrap_or_else(|| {
-        vec![Line::from(Span::styled(
-            nothing_to_show(screen, store),
-            Style::default().fg(palette.muted),
-        ))]
-    });
-    screen
-        .details_scroll
-        .set_viewport(usize::from(inner.height), lines.len());
-    let offset = u16::try_from(screen.details_scroll.offset).unwrap_or(0);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        inner,
+    let lines = lines.unwrap_or_else(|| vec![quiet(nothing_to_show(screen, store))]);
+    render_pane(
+        frame,
+        shell,
+        area,
+        focused,
+        &mut screen.details_scroll,
+        lines,
     );
 }
 
@@ -297,9 +267,8 @@ fn repository_lines(
 ) -> Option<Vec<Line<'static>>> {
     let palette = theme();
     let row = screen.selected_repository(store)?;
-    let login = screen
-        .login_server(store, &row.registry)
-        .unwrap_or(&row.registry);
+    let registry = store.registry(&row.registry);
+    let login = registry.map_or(row.registry.as_str(), |held| held.login_server.as_str());
     let now = Timestamp::now();
 
     let mut said = vec![login.to_owned()];
@@ -323,12 +292,7 @@ fn repository_lines(
         "y",
         width,
     ));
-    if let Some(registry) = store
-        .inventory
-        .registries
-        .iter()
-        .find(|held| held.name == row.registry)
-    {
+    if let Some(registry) = registry {
         lines.push(link_field(
             "Portal",
             crate::azure::portal_url(&registry.id),
@@ -339,18 +303,9 @@ fn repository_lines(
     lines.push(section("Tags", width));
 
     match store.tags.get(&(row.registry.clone(), row.name.clone())) {
-        None => lines.push(Line::from(Span::styled(
-            "reading…",
-            Style::default().fg(palette.muted),
-        ))),
-        Some(Err(message)) => lines.push(Line::from(Span::styled(
-            message.clone(),
-            Style::default().fg(palette.error),
-        ))),
-        Some(Ok(tags)) if tags.is_empty() => lines.push(Line::from(Span::styled(
-            "none",
-            Style::default().fg(palette.muted),
-        ))),
+        None => lines.push(quiet("reading…")),
+        Some(Err(message)) => lines.push(refused(message.clone())),
+        Some(Ok(tags)) if tags.is_empty() => lines.push(quiet("none")),
         Some(Ok(tags)) => {
             for tag in tags.iter().take(TAGS_IN_PANE) {
                 lines.push(Line::from(Span::styled(
@@ -358,16 +313,15 @@ fn repository_lines(
                         "{:<16} {:<20} {}",
                         tag.name,
                         short_digest(&tag.digest),
-                        tag.updated
-                            .map_or_else(|| "—".to_owned(), |at| at.relative_age(now))
+                        age(tag.updated, now)
                     ),
                     Style::default().fg(palette.body),
                 )));
             }
             if tags.len() > TAGS_IN_PANE {
-                lines.push(Line::from(Span::styled(
-                    format!("and {} more — Enter", tags.len() - TAGS_IN_PANE),
-                    Style::default().fg(palette.muted),
+                lines.push(quiet(format!(
+                    "and {} more — Enter",
+                    tags.len() - TAGS_IN_PANE
                 )));
             }
         }
@@ -384,7 +338,9 @@ fn tag_lines(
 ) -> Option<Vec<Line<'static>>> {
     let palette = theme();
     let tag = screen.selected_tag(store)?;
-    let login = screen.login_server(store, registry).unwrap_or(registry);
+    let login = store
+        .registry(registry)
+        .map_or(registry, |held| held.login_server.as_str());
     let now = Timestamp::now();
 
     let mut lines = vec![
@@ -472,10 +428,8 @@ mod tests {
         let registry = |name: &str| Registry {
             id: format!("/registries/{name}"),
             name: name.to_owned(),
-            subscription_id: "s".into(),
             resource_group: "rg".into(),
             location: "eastus".into(),
-            sku: "Premium".into(),
             login_server: format!("{name}.azurecr.io"),
         };
         let mut store = Store::default();

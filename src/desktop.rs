@@ -65,7 +65,7 @@ pub fn browser_commands(url: &str, wsl: bool) -> Vec<Command> {
     commands
 }
 
-fn command(program: &str, args: &[&str]) -> Command {
+pub(crate) fn command(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
@@ -86,7 +86,10 @@ pub fn cmd_escape(url: &str) -> String {
         })
 }
 
-fn is_wsl() -> bool {
+/// WSL 1 reports `…-Microsoft`, WSL 2 `…-microsoft-standard-WSL2`. The file
+/// is read rather than `WSL_DISTRO_NAME`, which an ssh session does not
+/// carry.
+pub(crate) fn is_wsl() -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }

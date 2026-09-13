@@ -1,5 +1,6 @@
 //! What a tab is, and what the shell may ask one to do.
 
+use crate::columns::ColumnId;
 use crate::worker;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -56,8 +57,8 @@ pub enum Target {
     Tab(TabId),
     /// A row of the table, by its index among the rows currently shown.
     Row(usize),
-    /// A column header, by the column's stable key.
-    Header(&'static str),
+    /// A column header.
+    Header(ColumnId),
     SearchField,
     ClearSearch,
     Details,

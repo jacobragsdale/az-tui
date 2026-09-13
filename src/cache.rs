@@ -70,7 +70,12 @@ pub fn save(path: &Path, snapshot: &Snapshot) -> Result<()> {
         .with_context(|| format!("failed to make {}", directory.display()))?;
     let mut file = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("failed to write in {}", directory.display()))?;
-    serde_json::to_writer(&mut file, snapshot).context("failed to write the cache")?;
+    // Serialised whole and written once: a bare temp file is unbuffered, and
+    // `to_writer` on one is a syscall per token — forty thousand rows took a
+    // second and a half of the run loop that way.
+    let bytes = serde_json::to_vec(snapshot).context("failed to write the cache")?;
+    file.write_all(&bytes)
+        .context("failed to write the cache")?;
     file.flush().context("failed to write the cache")?;
     restrict(file.as_file())?;
     file.persist(path)
@@ -104,10 +109,8 @@ mod tests {
                 vaults: vec![Vault {
                     id: "/id".into(),
                     name: "kv-prod".into(),
-                    subscription_id: "s".into(),
                     resource_group: "rg".into(),
                     location: "eastus".into(),
-                    sku: "standard".into(),
                     uri: "https://kv-prod.vault.azure.net/".into(),
                 }],
                 registries: Vec::new(),

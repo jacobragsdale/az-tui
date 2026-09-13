@@ -113,6 +113,12 @@ impl Timestamp {
     }
 }
 
+/// A stamp's age for a cell, or a dash where there is no stamp.
+#[must_use]
+pub fn age(stamp: Option<Timestamp>, now: Timestamp) -> String {
+    stamp.map_or_else(|| "—".to_owned(), |stamp| stamp.relative_age(now))
+}
+
 impl fmt::Display for Timestamp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.to_rfc3339())

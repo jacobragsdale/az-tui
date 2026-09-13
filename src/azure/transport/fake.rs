@@ -5,6 +5,7 @@
 //! asked and which plane's token signed it.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use super::*;
@@ -54,15 +55,30 @@ pub struct FakeTransport {
     answers: Arc<Mutex<VecDeque<Answer>>>,
     sent: Arc<Mutex<Vec<Request>>>,
     watcher: Arc<Mutex<Option<Watcher>>>,
+    /// How long every answer takes, and the most that were in flight at one
+    /// moment — which is how a test sees two calls overlap.
+    delay: Duration,
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl FakeTransport {
     pub fn answering(answers: impl IntoIterator<Item = Answer>) -> Self {
         Self {
             answers: Arc::new(Mutex::new(answers.into_iter().collect())),
-            sent: Arc::new(Mutex::new(Vec::new())),
-            watcher: Arc::new(Mutex::new(None)),
+            ..Self::default()
         }
+    }
+
+    /// Every answer takes this long.
+    #[must_use]
+    pub fn slow(self, delay: Duration) -> Self {
+        Self { delay, ..self }
+    }
+
+    /// The most calls that were in flight at the same moment.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Relaxed)
     }
 
     /// Runs `watch` on every request as it goes out.
@@ -99,8 +115,14 @@ impl Transport for FakeTransport {
         if let Some(watch) = watcher {
             watch(&request);
         }
+        let now = self.in_flight.fetch_add(1, Relaxed) + 1;
+        self.peak.fetch_max(now, Relaxed);
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
         let answer = self.answers.lock().unwrap().pop_front();
         self.sent.lock().unwrap().push(request.clone());
+        self.in_flight.fetch_sub(1, Relaxed);
         let answer = answer
             .with_context(|| format!("the fake transport ran out of answers at {}", request.url))?;
         Ok(Response {
