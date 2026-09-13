@@ -12,9 +12,9 @@
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -882,25 +882,31 @@ pub(crate) fn run_capped(mut command: Command, cap: Duration) -> Result<String> 
             .try_wait()
             .with_context(|| format!("{program} could not be waited for"))?
         {
-            break Some(status);
+            break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break None;
+            // The drains are not joined: a credential plugin the child spawned
+            // inherits the pipes and holds them open for as long as it polls,
+            // which is the very wait the cap is for. Each thread ends on its
+            // own when the pipe finally closes.
+            // ponytail: one parked thread per timed-out call; a process group
+            // killed as one if that ever shows in a profile.
+            bail!(
+                "{program} did not answer in {}s — a kubelogin waiting for a device-code login \
+                 looks like this; run `kubelogin convert-kubeconfig -l azurecli`",
+                cap.as_secs()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     };
     let out = stdout.join().unwrap_or_default();
     let err = stderr.join().unwrap_or_default();
-    match status {
-        None => bail!(
-            "{program} did not answer in {}s — a kubelogin waiting for a device-code login \
-             looks like this; run `kubelogin convert-kubeconfig -l azurecli`",
-            cap.as_secs()
-        ),
-        Some(status) if status.success() => Ok(out),
-        Some(_) => bail!("{}", kubectl_error(&err)),
+    if status.success() {
+        Ok(out)
+    } else {
+        bail!("{}", kubectl_error(&err))
     }
 }
 
@@ -1385,9 +1391,12 @@ pub struct Watcher {
     /// When the open tab's kind, when it is not pods, is next read.
     kind_cadence: Cadence,
     fast: Duration,
-    /// The stream on, the process behind it, and the flag that tells its
-    /// reader the pane has moved on.
-    follow: Option<(LogFollow, Option<Child>, Arc<AtomicBool>)>,
+    /// The stream on and the flag that tells its reader the pane has moved
+    /// on.
+    follow: Option<(LogFollow, Arc<AtomicBool>)>,
+    /// The process behind the stream, in a slot the [`Handle`] shares: a
+    /// quit that gives up waiting for this thread still kills it.
+    follow_child: Arc<Mutex<Option<Child>>>,
 }
 
 impl Watcher {
@@ -1397,6 +1406,7 @@ impl Watcher {
         events: Sender<Event>,
         scopes: Vec<Scope>,
         fast: Duration,
+        follow_child: Arc<Mutex<Option<Child>>>,
     ) -> Self {
         Self {
             source,
@@ -1409,6 +1419,7 @@ impl Watcher {
             kind_cadence: Cadence::new(fast),
             fast,
             follow: None,
+            follow_child,
         }
     }
 
@@ -1474,7 +1485,11 @@ impl Watcher {
                 stderr,
             }) => {
                 let cancelled = Arc::new(AtomicBool::new(false));
-                self.follow = Some((target.clone(), child, Arc::clone(&cancelled)));
+                *self
+                    .follow_child
+                    .lock()
+                    .unwrap_or_else(|held| held.into_inner()) = child;
+                self.follow = Some((target.clone(), Arc::clone(&cancelled)));
                 let events = self.events.clone();
                 let _ = thread::Builder::new()
                     .name("az-tui-log".into())
@@ -1493,19 +1508,16 @@ impl Watcher {
     /// Closes the stream: the process is killed and reaped, and its reader
     /// told to say nothing more.
     fn unfollow(&mut self) {
-        if let Some((_, child, cancelled)) = self.follow.take() {
+        if let Some((_, cancelled)) = self.follow.take() {
             cancelled.store(true, Ordering::SeqCst);
-            if let Some(mut child) = child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            kill(&self.follow_child);
         }
     }
 
     /// What the stream is on, for a test.
     #[cfg(test)]
     fn following(&self) -> Option<&LogFollow> {
-        self.follow.as_ref().map(|(target, _, _)| target)
+        self.follow.as_ref().map(|(target, _)| target)
     }
 
     /// One request. Answers whether to keep going.
@@ -1734,6 +1746,14 @@ impl Drop for Watcher {
     }
 }
 
+/// Kills and reaps whatever process the slot holds.
+fn kill(slot: &Mutex<Option<Child>>) {
+    if let Some(mut child) = slot.lock().unwrap_or_else(|held| held.into_inner()).take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// The reader behind a follow: one event per line until the stream ends, then
 /// one saying so, with whatever `kubectl` complained about on the way out.
 // ponytail: one event per line; read with fill_buf and split if a chatty pod
@@ -1745,10 +1765,22 @@ fn stream(
     cancelled: &AtomicBool,
     events: &Sender<Event>,
 ) {
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    // Bytes, not `lines()`: one line a pod prints that is not UTF-8 would
+    // otherwise end the stream where the pod is still writing.
+    let mut reader = BufReader::new(stdout);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         if cancelled.load(Ordering::SeqCst) {
             return;
         }
+        let line = String::from_utf8_lossy(&bytes)
+            .trim_end_matches(['\n', '\r'])
+            .to_owned();
         let sent = events.send(Event::LogLines {
             target: target.clone(),
             lines: vec![line],
@@ -1786,6 +1818,9 @@ pub struct Handle {
     /// before the process is: a process on its way out runs no destructor
     /// on another thread.
     thread: Option<thread::JoinHandle<()>>,
+    /// The followed log's process, shared with the worker, for a quit that
+    /// gives up on the join before the worker could kill it.
+    follow_child: Arc<Mutex<Option<Child>>>,
 }
 
 /// How long a quit waits for the worker to finish what it has in hand. A
@@ -1799,11 +1834,13 @@ impl Handle {
     pub fn spawn(source: Box<dyn KubeSource>, scopes: Vec<Scope>, fast: Duration) -> Result<Self> {
         let (request_sender, request_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
+        let follow_child = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&follow_child);
         let thread = thread::Builder::new()
             .name("az-tui-kube".into())
             .spawn(move || {
                 watch(
-                    Watcher::new(source, event_sender, scopes, fast),
+                    Watcher::new(source, event_sender, scopes, fast, slot),
                     &request_receiver,
                 );
             })
@@ -1813,6 +1850,7 @@ impl Handle {
             events: event_receiver,
             stopped: Cell::new(false),
             thread: Some(thread),
+            follow_child,
         })
     }
 
@@ -1852,6 +1890,9 @@ impl Drop for Handle {
                 let _ = done.send(());
             });
         let _ = finished.recv_timeout(STOP_GRACE);
+        // A worker still inside a read has not run its own drop: the stream's
+        // process is killed from here rather than left to outlive the TUI.
+        kill(&self.follow_child);
     }
 }
 
@@ -2242,6 +2283,8 @@ pub(crate) mod tests {
         /// can see it killed; its pids are kept here.
         pub with_children: Arc<AtomicBool>,
         pub children: Arc<Mutex<Vec<u32>>>,
+        /// How long a pods read takes, for a case about a worker mid-read.
+        pub read_delay: Arc<Mutex<Duration>>,
     }
 
     impl FakeKube {
@@ -2255,6 +2298,7 @@ pub(crate) mod tests {
     impl KubeSource for FakeKube {
         fn pods(&self, scope: &Scope) -> Result<Vec<Pod>> {
             self.reads.lock().unwrap().push(scope.clone());
+            thread::sleep(*self.read_delay.lock().unwrap());
             let answers = self.answers.lock().unwrap();
             match answers.iter().find(|(held, _)| held == scope) {
                 Some((_, Ok(pods))) => Ok(pods.clone()),
@@ -2873,7 +2917,13 @@ pub(crate) mod tests {
     fn watcher(fake: &FakeKube, fast: Duration) -> (Watcher, Receiver<Event>) {
         let (sender, receiver) = mpsc::channel();
         (
-            Watcher::new(Box::new(fake.clone()), sender, scopes(), fast),
+            Watcher::new(
+                Box::new(fake.clone()),
+                sender,
+                scopes(),
+                fast,
+                Arc::default(),
+            ),
             receiver,
         )
     }
@@ -3073,5 +3123,79 @@ pub(crate) mod tests {
         }
         assert_eq!(stopped, 1);
         assert!(handle.try_event().is_none(), "Stopped is said once");
+    }
+
+    #[test]
+    fn the_cap_holds_when_a_grandchild_keeps_the_pipes_open() {
+        // What a credential plugin does: kubectl is killed at the cap, but the
+        // plugin it spawned still holds stderr, and the drains must not be
+        // waited for.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & sleep 5"]);
+        let started = Instant::now();
+        let error = run_capped(command, Duration::from_millis(200)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("did not answer"), "{error:#}");
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_end_the_stream() {
+        let (sender, receiver) = mpsc::channel();
+        let text: &[u8] = b"ok\n\xffbad\r\nafter\n";
+        stream(
+            Box::new(std::io::Cursor::new(text.to_vec())),
+            None,
+            follow(0, "a"),
+            &AtomicBool::new(false),
+            &sender,
+        );
+        let lines: Vec<(Vec<String>, bool)> = receiver
+            .try_iter()
+            .map(|event| match event {
+                Event::LogLines {
+                    lines, finished, ..
+                } => (lines, finished),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (vec!["ok".to_owned()], false),
+                (vec!["\u{fffd}bad".to_owned()], false),
+                (vec!["after".to_owned()], false),
+                (Vec::new(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quit_that_gives_up_on_a_worker_mid_read_still_kills_the_stream() {
+        let fake = FakeKube::default();
+        fake.with_children.store(true, Ordering::SeqCst);
+        let handle =
+            Handle::spawn(Box::new(fake.clone()), scopes(), Duration::from_secs(5)).unwrap();
+        handle.send(Request::Follow(follow(0, "a"))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fake.children.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let pid = fake.children.lock().unwrap()[0];
+        assert!(alive(pid), "the stream is running");
+        // The next read takes longer than the quit is willing to wait.
+        *fake.read_delay.lock().unwrap() = STOP_GRACE * 3;
+        let reads = fake.reads.lock().unwrap().len();
+        handle.send(Request::Refresh(0)).unwrap();
+        while fake.reads.lock().unwrap().len() == reads && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        drop(handle);
+        assert!(started.elapsed() < STOP_GRACE * 2, "gave up on the join");
+        assert!(!alive(pid), "and the stream went with the handle");
     }
 }
