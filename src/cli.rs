@@ -55,8 +55,17 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Check the login, the tokens and what the subscriptions hold.
+    /// Check the az login and tokens, every vault and registry, then
+    /// kubectl, kubelogin and every AKS scope in config.toml.
     Doctor,
+
+    /// Fetch credentials for every AKS cluster the login can see and print a
+    /// [[clusters]] block for each.
+    Setup {
+        /// Write the blocks to config.toml when there is no file yet.
+        #[arg(long)]
+        write: bool,
+    },
 
     /// One line per secret: vault, name, enabled, expires, updated.
     ///
@@ -202,6 +211,11 @@ mod tests {
     fn the_subcommands_parse_and_the_global_flags_may_follow_them() {
         let cli = Cli::parse_from(["az-tui", "doctor"]);
         assert!(matches!(cli.command, Some(Command::Doctor)));
+        let cli = Cli::parse_from(["az-tui", "doctor", "--config", "x.toml"]);
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+        assert_eq!(cli.config.as_deref(), Some(std::path::Path::new("x.toml")));
+        let cli = Cli::parse_from(["az-tui", "setup", "--write"]);
+        assert!(matches!(cli.command, Some(Command::Setup { write: true })));
 
         // The natural order in a script: the command first, then how to run
         // it. Only the flags no subcommand names for itself are global.

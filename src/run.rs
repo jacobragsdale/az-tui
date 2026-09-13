@@ -40,15 +40,25 @@ pub fn run() -> Result<()> {
     ui::theme::set_theme(theme);
 
     match cli.command.take() {
-        Some(Command::Doctor) => {
-            if doctor::run(&config.azure)? {
-                Ok(())
-            } else {
-                std::process::exit(commands::FAILED)
-            }
-        }
+        Some(Command::Doctor) => finish(doctor::run(&mut io::stdout().lock(), &config)?),
+        Some(Command::Setup { write }) => finish(doctor::setup(
+            &mut io::stdout().lock(),
+            write,
+            &config_path,
+        )?),
         Some(command) => shell(&cli, &config, command),
         None => tui(&cli, config),
+    }
+}
+
+/// `Ok` when a check passed, else the shell's failure code — after what was
+/// printed has landed.
+fn finish(ok: bool) -> Result<()> {
+    io::stdout().flush()?;
+    if ok {
+        Ok(())
+    } else {
+        std::process::exit(commands::FAILED)
     }
 }
 
@@ -65,7 +75,7 @@ fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
     };
     let mut out = io::stdout().lock();
     let done = match command {
-        Command::Doctor => unreachable!("handled above"),
+        Command::Doctor | Command::Setup { .. } => unreachable!("handled above"),
         Command::Secrets {
             query,
             vaults,
