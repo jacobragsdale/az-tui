@@ -65,18 +65,27 @@ pub fn load(path: &Path) -> Option<Snapshot> {
 /// a rename. A start that races a save reads one file or the other, never
 /// half of one.
 pub fn save(path: &Path, snapshot: &Snapshot) -> Result<()> {
+    // Serialised whole and written once: a bare temp file is unbuffered, and
+    // `to_writer` on one is a syscall per token — forty thousand rows took a
+    // second and a half of the run loop that way.
+    let bytes = serde_json::to_vec(snapshot).context("failed to write the cache")?;
+    write_private(path, &bytes)
+}
+
+/// The one way a file of this program's own reaches disk: a temporary file
+/// in the same directory, `0600` on unix, then a rename over `path`. The
+/// session goes through here too, so both files carry the same permissions
+/// and the same all-or-nothing write.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(directory)
         .with_context(|| format!("failed to make {}", directory.display()))?;
     let mut file = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("failed to write in {}", directory.display()))?;
-    // Serialised whole and written once: a bare temp file is unbuffered, and
-    // `to_writer` on one is a syscall per token — forty thousand rows took a
-    // second and a half of the run loop that way.
-    let bytes = serde_json::to_vec(snapshot).context("failed to write the cache")?;
-    file.write_all(&bytes)
-        .context("failed to write the cache")?;
-    file.flush().context("failed to write the cache")?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to write {}", path.display()))?;
     restrict(file.as_file())?;
     file.persist(path)
         .with_context(|| format!("failed to replace {}", path.display()))?;
@@ -87,7 +96,7 @@ pub fn save(path: &Path, snapshot: &Snapshot) -> Result<()> {
 fn restrict(file: &std::fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .context("failed to restrict the cache file")
+        .context("failed to restrict the file")
 }
 
 #[cfg(not(unix))]

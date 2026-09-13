@@ -11,16 +11,17 @@
 //! layout, not a start.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::write_private;
+
 /// Bumped when a stored layout would read wrong: 2 hid the vault and
-/// registry columns behind the environment, which a version-1 file would
-/// have shown again.
-const VERSION: u32 = 2;
+/// registry columns behind the environment; 3 added the AKS tabs and each
+/// tab's `kind`.
+const VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -28,16 +29,22 @@ pub struct Session {
     /// the way in.
     #[serde(default)]
     pub version: u32,
-    /// `"secrets"` or `"registries"`. An unknown name falls back to the
-    /// first tab.
+    /// The open tab's key — `qa/dev`, `prod/prod`, `secrets`, `registries`
+    /// ([`crate::config::Tab::key`]). One this run does not have falls back
+    /// to the first tab.
     #[serde(default)]
     pub tab: Option<String>,
+    /// One entry per tab, under the same keys.
     #[serde(default)]
     pub tabs: BTreeMap<String, TabSession>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TabSession {
+    /// `"pods"`, `"events"`, `"configmaps"` or `"secrets"` on an AKS tab;
+    /// absent elsewhere.
+    #[serde(default)]
+    pub kind: Option<String>,
     /// `["name", "asc"]`. Kept as two strings so a column this build does
     /// not know is dropped on the way in rather than refused.
     #[serde(default)]
@@ -67,23 +74,13 @@ impl Session {
             .unwrap_or_default()
     }
 
-    /// Writes the session atomically. A failure is worth saying once in the
-    /// status bar and nothing more: the layout is not the work.
+    /// Writes the session atomically, `0600`, through the cache's writer. A
+    /// failure is worth saying once in the status bar and nothing more: the
+    /// layout is not the work.
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.version = VERSION;
-        let directory = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(directory)
-            .with_context(|| format!("failed to make {}", directory.display()))?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)
-            .with_context(|| format!("failed to write in {}", directory.display()))?;
-        // Whole, then once: the temp file is unbuffered.
         let bytes = serde_json::to_vec_pretty(self).context("failed to write the session")?;
-        file.write_all(&bytes)
-            .context("failed to write the session")?;
-        file.flush().context("failed to write the session")?;
-        file.persist(path)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
-        Ok(())
+        write_private(path, &bytes)
     }
 
     pub fn tab(&mut self, name: &str) -> &mut TabSession {
@@ -114,6 +111,7 @@ mod tests {
                 visible: Some(false),
             },
         ];
+        session.tab("qa/dev").kind = Some("pods".into());
         session
     }
 
@@ -135,6 +133,8 @@ mod tests {
         assert_eq!(tab.columns.len(), 2);
         assert_eq!(tab.columns[0].width, Some(12));
         assert_eq!(tab.columns[1].visible, Some(false));
+        assert_eq!(read.tabs["qa/dev"].kind.as_deref(), Some("pods"));
+        assert!(tab.kind.is_none(), "an Azure tab has no kind");
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         let path = dir.path().join("session.json");
         std::fs::write(
             &path,
-            r#"{"version":2,"tab":"secrets","tabs":{"secrets":{"columns":[{"key":"from_the_future","width":9}]}}}"#,
+            r#"{"version":3,"tab":"secrets","tabs":{"secrets":{"columns":[{"key":"from_the_future","width":9}]}}}"#,
         )
         .unwrap();
         let read = Session::load(&path);
@@ -179,8 +179,26 @@ mod tests {
         // There is no field for any of these, which is the point; this is
         // the check from the outside that keeps it that way. ("secrets" is
         // in there — it is the tab's name, and a tab name is a layout.)
-        for absent in ["query", "cursor", "db-password", "\"value\""] {
+        for absent in [
+            "query",
+            "cursor",
+            "db-password",
+            "orders-api",
+            "\"value\"",
+            "log",
+        ] {
             assert!(!written.contains(absent), "{absent} in {written}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_session_is_readable_only_by_the_user_who_wrote_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        session().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
