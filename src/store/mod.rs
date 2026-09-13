@@ -8,7 +8,8 @@ pub mod azure;
 pub use azure::{AzureStore, problem_line};
 
 use crate::app::screen::Tab;
-use crate::cache::Snapshot;
+use crate::cache::{CachedTab, Snapshot};
+use crate::config;
 use crate::kube::{ConfigMap, Event, K8sEvent, Kind, Pod, SecretMeta};
 use crate::timestamp::Timestamp;
 
@@ -122,6 +123,14 @@ impl ScopeData {
     }
 }
 
+/// The scope tabs, in order: the ones with a store slot.
+fn scope_tabs(tabs: &[Tab]) -> impl Iterator<Item = &config::Tab> {
+    tabs.iter().filter_map(|tab| match tab {
+        Tab::Scope(tab) => Some(tab),
+        Tab::Secrets | Tab::Registries => None,
+    })
+}
+
 #[derive(Default)]
 pub struct Store {
     pub azure: AzureStore,
@@ -139,20 +148,40 @@ impl Store {
         }
     }
 
-    /// The store as the last run left it.
+    /// The store as the last run left it: each scope tab's pods, found by
+    /// the tab's key rather than its position, so a reordered `config.toml`
+    /// still lands every cached read on its own tab; and the Azure half.
     #[must_use]
-    pub fn from_cache(snapshot: &Snapshot) -> Self {
-        Self {
-            azure: AzureStore::from_cache(snapshot),
-            scopes: Vec::new(),
+    pub fn from_cache(snapshot: &Snapshot, tabs: &[Tab]) -> Self {
+        let mut store = Self::new(scope_tabs(tabs).count());
+        store.azure = AzureStore::from_cache(snapshot);
+        for (tab, slot) in scope_tabs(tabs).zip(&mut store.scopes) {
+            if let Some(CachedTab::Scope { read_at, pods }) = snapshot.tabs.get(&tab.key()) {
+                slot.pods.rows.clone_from(pods);
+                slot.pods.read_at = Some(*read_at);
+            }
         }
+        store
     }
 
-    /// What the next save writes. Empty until something has been read, and
-    /// then not worth a file.
+    /// What the next save writes: every scope tab whose pods have been read,
+    /// under its key, and the Azure half once it has read anything. Empty
+    /// until then, and then not worth a file.
     #[must_use]
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self.azure.snapshot())
+    pub fn snapshot(&self, tabs: &[Tab]) -> Snapshot {
+        let mut cached = self.azure.snapshot();
+        for (tab, slot) in scope_tabs(tabs).zip(&self.scopes) {
+            if let Some(read_at) = slot.pods.read_at {
+                cached.insert(
+                    tab.key(),
+                    CachedTab::Scope {
+                        read_at,
+                        pods: slot.pods.rows.clone(),
+                    },
+                );
+            }
+        }
+        Snapshot::new(cached)
     }
 
     #[must_use]
@@ -253,7 +282,76 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::screen::tabs;
     use crate::kube::tests::{crashing, pod};
+
+    fn two_clusters(source: &str) -> Vec<Tab> {
+        tabs(config::parse(source).unwrap().tabs())
+    }
+
+    #[test]
+    fn the_cache_round_trips_by_key_not_by_position_and_holds_pods_only() {
+        let held = two_clusters(
+            "[[clusters]]\nname = \"qa\"\ncontext = \"aks-qa\"\nnamespaces = [\"dev\", \"qa\", \"uat\"]\n[[clusters]]\nname = \"prod\"\nnamespaces = [\"prod\"]\n",
+        );
+        let mut store = Store::new(4);
+        store.apply_kube(Event::Pods {
+            scope: 3,
+            pods: Ok(vec![pod("prod", "prod", "a", "Running")]),
+        });
+        store.apply_kube(Event::Events {
+            scope: 3,
+            events: Ok(Vec::new()),
+        });
+        let snapshot = store.snapshot(&held);
+        assert_eq!(
+            snapshot.tabs.keys().collect::<Vec<_>>(),
+            ["prod/prod"],
+            "only what has been read; the Azure half never read, so no secrets or registries entry"
+        );
+        let written = serde_json::to_string(&snapshot).unwrap();
+        assert!(!written.contains("events"), "{written}");
+        assert!(!written.contains("secret"), "{written}");
+        assert!(!written.contains("registries"), "{written}");
+
+        // The same file, read into a config that lists prod first.
+        let reordered = two_clusters(
+            "[[clusters]]\nname = \"prod\"\nnamespaces = [\"prod\"]\n[[clusters]]\nname = \"qa\"\ncontext = \"aks-qa\"\nnamespaces = [\"dev\"]\n",
+        );
+        let restored = Store::from_cache(&snapshot, &reordered);
+        assert_eq!(restored.scopes.len(), 2, "one slot per scope tab");
+        assert_eq!(
+            restored.scopes[0].pods.rows.len(),
+            1,
+            "prod's rows landed on prod's tab"
+        );
+        assert!(restored.scopes[0].pods.read_at.is_some());
+        assert_eq!(
+            restored.scopes[0].pods.reads, 0,
+            "from the cache is not a read"
+        );
+        assert!(restored.scopes[1].pods.rows.is_empty());
+        assert!(restored.azure.read_at.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_with_both_halves_puts_both_back() {
+        let held = two_clusters("[[clusters]]\nname = \"qa\"\nnamespaces = [\"dev\"]\n");
+        let mut store = Store::new(1);
+        store.apply_kube(Event::Pods {
+            scope: 0,
+            pods: Ok(vec![pod("qa", "dev", "a", "Running")]),
+        });
+        store.azure.read_at = Some(Timestamp::now());
+        let snapshot = store.snapshot(&held);
+        assert_eq!(
+            snapshot.tabs.keys().collect::<Vec<_>>(),
+            ["qa/dev", "registries", "secrets"]
+        );
+        let restored = Store::from_cache(&snapshot, &held);
+        assert_eq!(restored.scopes[0].pods.rows.len(), 1);
+        assert!(restored.azure.read_at.is_some());
+    }
 
     #[test]
     fn a_read_replaces_one_scopes_rows_and_a_failure_keeps_them_with_a_message() {

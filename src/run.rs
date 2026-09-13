@@ -1,7 +1,9 @@
-//! The terminal loop: take the terminal, drain the worker, draw, read a key,
-//! give the terminal back — on every exit path, including a panic.
+//! The terminal loop: take the terminal, start both workers, draw, read a
+//! key, drain the workers, give the terminal back — on every exit path,
+//! including a panic.
 
 use std::io::{self, Write as _};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,23 +13,30 @@ use crossterm::event::{
     Event,
 };
 use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 
 use crate::app::App;
-use crate::app::screen::AppAction;
+use crate::app::screen::{AppAction, Tab};
 use crate::azure::auth::AzCli;
 use crate::azure::transport::{Client, Https};
 use crate::cli::{Cli, Command, SecretCommand};
+use crate::kube::{self, Handle, Kubectl};
 use crate::store::Store;
 use crate::worker::{Request, Worker};
 use crate::{cache, clipboard, commands, config, desktop, doctor, paths, session, ui};
 
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
-/// Seconds between background refreshes when nothing says otherwise.
+/// Seconds between background refreshes of the vaults and registries when
+/// nothing says otherwise. The AKS cadence is `config.refresh`, in the
+/// kube worker.
 const DEFAULT_REFRESH: u64 = 300;
-/// How long a layout has to stop changing before it is written. Holding `s`
+/// How long a layout has to stop changing before it is written. Holding `S`
 /// through six columns is one save, not six.
 const SETTLE: Duration = Duration::from_millis(500);
+/// How often the cache is rewritten while reads keep landing. Every pod read
+/// would be a file write every few seconds for nothing anyone can see.
+const CACHE_EVERY: Duration = Duration::from_secs(30);
 
 pub fn run() -> Result<()> {
     let mut cli = Cli::parse();
@@ -126,20 +135,32 @@ fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
 }
 
 fn tui(cli: &Cli, config: config::Config) -> Result<()> {
+    let tabs = crate::app::screen::tabs(config.tabs());
+    let scopes: Vec<_> = tabs
+        .iter()
+        .filter_map(|tab| match tab {
+            Tab::Scope(tab) => Some(tab.scope.clone()),
+            Tab::Secrets | Tab::Registries => None,
+        })
+        .collect();
     // The cache is read before the terminal is taken, so the first frame is
     // painted from it rather than after it.
     let cache_path = paths::cache_file(cli.cache.as_deref());
     let store = match (cli.no_cache, cache::load(&cache_path)) {
-        (false, Some(snapshot)) => Store::from_cache(&snapshot),
-        _ => Store::default(),
+        (false, Some(snapshot)) => Store::from_cache(&snapshot, &tabs),
+        _ => Store::new(scopes.len()),
     };
 
     let client = Client::new(Box::new(AzCli), Box::new(Https::new()));
-    // The worker starts knowing whatever the cache knew, so a key pressed on
-    // the first frame reaches the right host without waiting for the refresh
-    // behind it.
-    let worker = Worker::start(config.azure.clone(), client, store.azure.inventory.clone());
-    worker.send(Request::Refresh);
+    // The Azure worker starts knowing whatever the cache knew, so a key
+    // pressed on the first frame reaches the right host without waiting for
+    // the refresh behind it.
+    let azure = Worker::start(config.azure.clone(), client, store.azure.inventory.clone());
+    azure.send(Request::Refresh);
+    let fast = config
+        .refresh
+        .map_or(kube::DEFAULT_REFRESH, Duration::from_secs);
+    let kube = Handle::spawn(Box::new(Kubectl), scopes, fast)?;
 
     let every = Duration::from_secs(config.azure.refresh.unwrap_or(DEFAULT_REFRESH));
     // An interval too far off to represent is "never", which is what a
@@ -148,13 +169,18 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
         .then(|| Instant::now().checked_add(every))
         .flatten();
 
-    let mut app = App::new(crate::app::screen::tabs(config.tabs()), store);
+    let mut app = App::new(tabs, store);
     // Before the first frame, so nothing is drawn in a layout that is about
-    // to change.
+    // to change — and so the kube worker reads the tab that will actually
+    // show.
     let session_path = paths::session_file();
     app.restore(&session::Session::load(&session_path));
+    if let Some(kind) = app.kind() {
+        kube.send(kube::Request::Showing(app.tab, kind))?;
+    }
     let mut saved = serde_json::to_string(&app.session()).unwrap_or_default();
     let mut settling: Option<Instant> = None;
+    let mut cache_written = Instant::now();
     let started = Instant::now();
 
     let mut terminal = ratatui::init();
@@ -177,40 +203,57 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
                 Event::Paste(text) => app.handle_paste(&text),
                 _ => AppAction::None,
             };
-            if act(&mut app, &worker, action) {
-                // The layout goes with the run, settle timer or not.
-                let _ = app.session().save(&session_path);
-                return Ok(());
+            match act(&mut app, &azure, &kube, action) {
+                Outcome::Quit => {
+                    // The layout and the cache go with the run, timers or
+                    // not. A store that has never read anything is not
+                    // worth a file, and its snapshot is empty.
+                    let _ = app.session().save(&session_path);
+                    let snapshot = app.store.snapshot(&app.tabs);
+                    if !cli.no_cache && !snapshot.tabs.is_empty() {
+                        let _ = cache::save(&cache_path, &snapshot);
+                    }
+                    return Ok(());
+                }
+                // Whatever ratatui thought was on screen died with the frame
+                // the shell drew over.
+                Outcome::Repaint => terminal.clear().context("failed to repaint")?,
+                Outcome::Continue => {}
             }
         }
 
-        // Everything the worker has said since the last frame.
-        while let Some(event) = worker.try_recv() {
+        // Everything the Azure worker has said since the last frame. A
+        // finished refresh is worth a cache write once it read anything.
+        while let Some(event) = azure.try_recv() {
             let idle = matches!(event, crate::worker::Event::Idle);
             let action = app.apply_azure(event, Instant::now());
-            if act(&mut app, &worker, action) {
-                return Ok(());
+            act(&mut app, &azure, &kube, action);
+            app.cache_dirty |= idle && app.store.azure.read_at.is_some();
+        }
+        // And the kube worker.
+        while let Some(event) = kube.try_event() {
+            if matches!(event, kube::Event::Stopped) {
+                app.shell
+                    .set_error("the cluster worker stopped; restart az-tui");
             }
-            // A store that has never read anything is not worth a file, and
-            // its snapshot is empty.
-            if idle
-                && !cli.no_cache
-                && let snapshot = app.store.snapshot()
-                && !snapshot.tabs.is_empty()
-                && let Err(error) = cache::save(&cache_path, &snapshot)
-            {
+            let action = app.apply_kube(event);
+            act(&mut app, &azure, &kube, action);
+        }
+
+        // What has run out, what the pane should be following now, and what
+        // the cursor has settled on long enough to be worth asking about.
+        for action in app.tick(Instant::now()) {
+            act(&mut app, &azure, &kube, action);
+        }
+
+        if app.cache_dirty && !cli.no_cache && cache_written.elapsed() >= CACHE_EVERY {
+            cache_written = Instant::now();
+            app.cache_dirty = false;
+            if let Err(error) = cache::save(&cache_path, &app.store.snapshot(&app.tabs)) {
                 // A cache that will not save is a slower next start, not a
                 // reason to stop.
                 app.shell
                     .set_error(format!("could not save the cache: {error:#}"));
-            }
-        }
-
-        // What has run out, and what the cursor has settled on long enough
-        // to be worth asking about.
-        for action in app.tick(Instant::now()) {
-            if act(&mut app, &worker, action) {
-                return Ok(());
             }
         }
 
@@ -234,22 +277,71 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
         if let Some(due) = next_refresh
             && Instant::now() >= due
         {
-            worker.send(Request::Refresh);
+            azure.send(Request::Refresh);
             next_refresh = Instant::now().checked_add(every);
         }
     }
 }
 
-/// Does what a screen asked for. Returns true when the run is over.
+/// What the loop does after an action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    Continue,
+    /// Something else drew on the terminal; the next frame is a full one.
+    Repaint,
+    Quit,
+}
+
+/// Does what a screen asked for.
 ///
 /// The clipboard is the one place a value leaves the program, and the status
 /// it sets names only what was copied — never what it was.
-fn act(app: &mut App, worker: &Worker, action: AppAction) -> bool {
+fn act(app: &mut App, azure: &Worker, kube: &Handle, action: AppAction) -> Outcome {
     match action {
-        AppAction::Quit => return true,
-        AppAction::Azure(request) => worker.send(request),
-        // Wired to the kube worker once the scope tabs are in the app.
-        AppAction::Kube(_) | AppAction::Exec { .. } => {}
+        AppAction::Quit => return Outcome::Quit,
+        AppAction::Azure(request) => azure.send(request),
+        AppAction::Kube(request) => {
+            if let Err(error) = kube.send(request) {
+                app.shell.set_error(format!("{error:#}"));
+            }
+        }
+        AppAction::Exec {
+            context,
+            namespace,
+            pod,
+            container,
+        } => {
+            // bash when the image has it, sh when it does not, in this
+            // terminal, with the TUI out of the way until the shell exits.
+            let mut command = std::process::Command::new("kubectl");
+            command.args(["--context", &context, "exec", "-it", "-n", &namespace, &pod]);
+            if let Some(container) = &container {
+                command.args(["-c", container]);
+            }
+            command.args([
+                "--",
+                "sh",
+                "-c",
+                "command -v bash >/dev/null 2>&1 && exec bash || exec sh",
+            ]);
+            let status = released_terminal(|| {
+                command
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+            });
+            match status {
+                Ok(status) if status.success() => {}
+                Ok(status) => app
+                    .shell
+                    .set_error(format!("kubectl exec on {pod} exited with {status}")),
+                Err(error) => app
+                    .shell
+                    .set_error(format!("kubectl could not be run: {error}")),
+            }
+            return Outcome::Repaint;
+        }
         AppAction::Copy { text, label } => match clipboard::copy(&text) {
             Ok(clipboard::Channel::Command) => app.shell.set_status(label),
             // The escape went out and nothing confirmed it; a terminal that
@@ -266,7 +358,36 @@ fn act(app: &mut App, worker: &Worker, action: AppAction) -> bool {
         }
         AppAction::None => {}
     }
-    false
+    Outcome::Continue
+}
+
+/// Runs `body` with the terminal handed back to the shell, and takes it back
+/// however `body` went. The caller repaints.
+fn released_terminal<T>(body: impl FnOnce() -> T) -> T {
+    release_terminal();
+    let outcome = body();
+    if let Err(error) = claim_terminal() {
+        // Nothing can be reported through a TUI that is not there, so this
+        // goes where the shell's own output went.
+        eprintln!("az-tui could not take the terminal back: {error:#}");
+    }
+    outcome
+}
+
+/// Puts the terminal back the way the TUI found it: the input features, then
+/// raw mode and the alternate screen. The end of a run and the shell hand-off
+/// both leave this way.
+fn release_terminal() {
+    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    ratatui::restore();
+}
+
+/// Takes the terminal back after [`release_terminal`] gave it away, in the
+/// same order `ratatui::init` and the TUI's own startup take it.
+fn claim_terminal() -> Result<()> {
+    enable_raw_mode().context("failed to take raw mode back")?;
+    execute!(io::stdout(), EnterAlternateScreen).context("failed to take the screen back")?;
+    enable_terminal_input()
 }
 
 struct TerminalRestore;
@@ -275,8 +396,7 @@ impl Drop for TerminalRestore {
     fn drop(&mut self) {
         // Best effort: the run is over either way, and a terminal that
         // refuses one of these is not something the exit can fix.
-        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
-        ratatui::restore();
+        release_terminal();
     }
 }
 

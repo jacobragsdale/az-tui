@@ -2255,7 +2255,7 @@ pub(crate) mod tests {
                 label: "Copied password of db".to_owned()
             }
         );
-        let written = serde_json::to_string(&app.store.snapshot()).unwrap();
+        let written = serde_json::to_string(&app.store.snapshot(&app.tabs)).unwrap();
         assert!(
             !written.contains("hunter2") && !written.contains("password"),
             "{written}"
