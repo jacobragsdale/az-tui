@@ -29,7 +29,7 @@ use crate::timestamp::Timestamp;
 
 /// The schema this build writes. A file of any other version is ignored
 /// rather than migrated: it is a cache, and the next refresh rewrites it.
-/// 2 keyed the file by tab and merged aks-tui's pod lists in; a version-1
+/// 2 keyed the file by tab and merged the AKS pod lists in; a version-1
 /// file from either program is ignored, and the refresh behind the first
 /// frame rewrites it.
 const VERSION: u32 = 2;

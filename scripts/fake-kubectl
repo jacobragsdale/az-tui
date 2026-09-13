@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""A kubectl that answers from fixtures, for driving az-tui without a cluster.
+
+Put this directory first on PATH. Two contexts: aks-qa with the namespaces
+dev, qa and uat, and aks-prod with prod. Set FAKE_KUBECTL_LOG to a directory
+and every call is appended to calls.log there; set FAKE_KUBECTL_DOWN to a
+context name and that cluster cannot be reached.
+"""
+import json
+import os
+import signal
+import sys
+import time
+
+args = sys.argv[1:]
+
+
+def take(flag):
+    if flag in args:
+        i = args.index(flag)
+        value = args[i + 1]
+        del args[i : i + 2]
+        return value
+    return None
+
+
+if args[:2] == ["version", "--client"]:
+    print(json.dumps({"clientVersion": {"gitVersion": "v1.31.2-fake"}}))
+    sys.exit(0)
+
+context = take("--context")
+args[:] = [a for a in args if not a.startswith("--request-timeout")]
+ns = take("-n")
+container = take("-c")
+all_ns = "--all-namespaces" in args or "-A" in args
+args[:] = [a for a in args if a not in ("--all-namespaces", "-A")]
+
+log_dir = os.environ.get("FAKE_KUBECTL_LOG")
+if log_dir:
+    with open(os.path.join(log_dir, "calls.log"), "a") as f:
+        f.write(" ".join(sys.argv[1:]) + "\n")
+
+CONTEXTS = {"aks-qa": "qa", "aks-prod": "prod"}
+if context not in CONTEXTS:
+    sys.stderr.write(f'error: context "{context}" does not exist\n')
+    sys.exit(1)
+if os.environ.get("FAKE_KUBECTL_DOWN") == context:
+    sys.stderr.write(
+        "E0912 12:00:00.000000   12345 memcache.go:265] couldn't get current server API group list\n"
+        "Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout\n"
+    )
+    sys.exit(1)
+cluster = CONTEXTS[context]
+
+
+def pod(name, ns, owner, image, status, ready=True, restarts=0, containers=None,
+        deleting=False, hash_="7d9f5b", kind="ReplicaSet", node="aks-np1-vmss000000"):
+    cs = containers or [("api", image)]
+    statuses = []
+    for cname, cimage in cs:
+        st = {"name": cname, "image": cimage, "ready": ready, "restartCount": restarts}
+        if status == "CrashLoopBackOff":
+            st["state"] = {"waiting": {"reason": "CrashLoopBackOff", "message": "back-off 5m0s"}}
+            st["lastState"] = {"terminated": {"reason": "Error", "exitCode": 1}}
+            st["ready"] = False
+        elif status == "ImagePullBackOff":
+            st["state"] = {"waiting": {"reason": "ImagePullBackOff"}}
+            st["ready"] = False
+        elif status == "Completed":
+            st["state"] = {"terminated": {"reason": "Completed", "exitCode": 0}}
+            st["ready"] = False
+        elif status == "Pending":
+            st["state"] = {"waiting": {"reason": "ContainerCreating"}}
+            st["ready"] = False
+        else:
+            st["state"] = {"running": {"startedAt": "2026-09-12T09:00:00Z"}}
+        statuses.append(st)
+    phase = {"Completed": "Succeeded", "Pending": "Pending"}.get(status, "Running")
+    owner_name = f"{owner}-{hash_}" if kind == "ReplicaSet" else owner
+    item = {
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "creationTimestamp": "2026-09-10T08:00:00Z",
+            "labels": {"app": owner, "pod-template-hash": hash_},
+            "ownerReferences": [{"kind": kind, "name": owner_name, "controller": True}],
+        },
+        "spec": {"nodeName": node, "containers": [{"name": c, "image": i} for c, i in cs]},
+        "status": {"phase": phase, "podIP": "10.244.0.7", "containerStatuses": statuses},
+    }
+    if deleting:
+        item["metadata"]["deletionTimestamp"] = "2026-09-12T12:00:00Z"
+    return item
+
+
+ACR = "myacr.azurecr.io/team"
+FIX = {
+    ("qa", "dev"): [
+        pod("orders-api-7d9f5b-abc12", "dev", "orders-api", f"{ACR}/orders-api:1.2.3", "Running", restarts=2),
+        pod("orders-api-7d9f5b-k9x2p", "dev", "orders-api", f"{ACR}/orders-api:1.2.3", "Running"),
+        pod("orders-worker-5c4d3e-q8zt", "dev", "orders-worker", f"{ACR}/orders-worker:1.2.3",
+            "CrashLoopBackOff", restarts=17, hash_="5c4d3e"),
+        pod("billing-api-1a2b3c-qq111", "dev", "billing-api", f"{ACR}/billing-api:0.9.0", "Running",
+            containers=[("api", f"{ACR}/billing-api:0.9.0"), ("proxy", "mcr.microsoft.com/oss/envoy:1.28")],
+            hash_="1a2b3c"),
+        pod("redis-0", "dev", "redis", "redis:7", "Running", kind="StatefulSet"),
+    ],
+    ("qa", "qa"): [
+        pod("orders-api-7d9f5b-zz901", "qa", "orders-api", f"{ACR}/orders-api:1.2.2", "Running"),
+        pod("billing-api-1a2b3c-zz902", "qa", "billing-api", f"{ACR}/billing-api:0.9.0", "Running", hash_="1a2b3c"),
+        pod("nightly-report-29-k8s7f", "qa", "nightly-report", f"{ACR}/nightly-report:3", "Completed",
+            hash_="29", kind="Job"),
+    ],
+    ("qa", "uat"): [
+        pod("orders-api-8e0a6c-uat01", "uat", "orders-api", f"{ACR}/orders-api:1.3.0-rc1", "Pending", hash_="8e0a6c"),
+        pod("billing-api-9f1b7d-uat02", "uat", "billing-api", f"{ACR}/billing-api:0.10.0", "ImagePullBackOff",
+            hash_="9f1b7d"),
+    ],
+    ("prod", "prod"): [
+        pod("orders-api-7d9f5b-prd01", "prod", "orders-api", f"{ACR}/orders-api:1.2.2", "Running"),
+        pod("orders-api-7d9f5b-prd02", "prod", "orders-api", f"{ACR}/orders-api:1.2.2", "Running", deleting=True),
+        pod("orders-api-7d9f5b-prd03", "prod", "orders-api", f"{ACR}/orders-api:1.2.2", "Running"),
+        pod("billing-api-1a2b3c-prd77", "prod", "billing-api", f"{ACR}/billing-api:0.9.0", "Running", hash_="1a2b3c"),
+        pod("redis-0", "prod", "redis", "redis:7", "Running", kind="StatefulSet"),
+    ],
+}
+
+if args[:2] == ["get", "namespaces"]:
+    print("\n".join(f"namespace/{n}" for n in ["default", "kube-system", "dev", "qa", "uat"] if cluster == "qa" or n in ("default", "kube-system", "prod")))
+    sys.exit(0)
+
+if args[:2] == ["get", "pods"]:
+    args[:] = [a for a in args if not a.startswith("--limit")]
+    if "name" in args and "-o" in args:
+        items = [p for (c, n), pods in FIX.items() if c == cluster and (all_ns or n == ns) for p in pods]
+        print("\n".join(f"pod/{p['metadata']['name']}" for p in items[:1]))
+        sys.exit(0)
+    if ns == "forbidden":
+        sys.stderr.write(
+            'Error from server (Forbidden): pods is forbidden: User "jacob" cannot list resource '
+            '"pods" in API group "" in the namespace "forbidden"\n'
+        )
+        sys.exit(1)
+    items = []
+    for (c, n), pods in FIX.items():
+        if c == cluster and (all_ns or n == ns):
+            items += pods
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+def event(name, ns, kind, obj, reason, message, typ="Normal", count=1, last="2026-09-12T12:00:00Z"):
+    return {
+        "metadata": {"name": name, "namespace": ns, "creationTimestamp": "2026-09-12T11:00:00Z"},
+        "type": typ, "reason": reason, "count": count, "message": message,
+        "firstTimestamp": "2026-09-12T11:00:00Z", "lastTimestamp": last,
+        "involvedObject": {"kind": kind, "name": obj, "namespace": ns},
+        "source": {"component": "kubelet"},
+    }
+
+
+EVENTS = {
+    ("qa", "dev"): [
+        event("orders-worker.1", "dev", "Pod", "orders-worker-5c4d3e-q8zt", "BackOff",
+              "Back-off restarting failed container api in pod orders-worker-5c4d3e-q8zt", "Warning", 17,
+              "2026-09-12T12:30:00Z"),
+        event("orders-api.1", "dev", "Pod", "orders-api-7d9f5b-abc12", "Pulled",
+              "Container image already present on machine"),
+        event("orders-api.2", "dev", "Deployment", "orders-api", "ScalingReplicaSet",
+              "Scaled up replica set orders-api-7d9f5b to 2", last="2026-09-12T10:00:00Z"),
+    ],
+    ("qa", "uat"): [
+        event("billing.1", "uat", "Pod", "billing-api-9f1b7d-uat02", "Failed",
+              'Failed to pull image "myacr.azurecr.io/team/billing-api:0.10.0": not found', "Warning", 40),
+    ],
+}
+
+CONFIGMAPS = {
+    ("qa", "dev"): [
+        {"metadata": {"name": "orders-config", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "data": {"LOG_LEVEL": "info", "FEATURES": "a=1\nb=2\nc=3\n", "DB_HOST": "orders-db.dev.svc"}},
+        {"metadata": {"name": "kube-root-ca.crt", "namespace": "dev", "creationTimestamp": "2026-01-01T00:00:00Z"},
+         "data": {"ca.crt": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"}},
+    ],
+    ("prod", "prod"): [
+        {"metadata": {"name": "orders-config", "namespace": "prod", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "data": {"LOG_LEVEL": "warn", "DB_HOST": "orders-db.prod.svc"}},
+    ],
+}
+
+SECRETS = {
+    ("qa", "dev"): [
+        {"metadata": {"name": "orders-db", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "type": "Opaque", "data": {"password": "aHVudGVyMg==", "username": "b3JkZXJz"}},
+        {"metadata": {"name": "orders-tls", "namespace": "dev", "creationTimestamp": "2026-09-01T00:00:00Z"},
+         "type": "kubernetes.io/tls", "data": {"tls.crt": "LS0tLS1CRUdJTg==", "tls.key": "LS0tLS1CRUdJTg=="}},
+    ],
+}
+
+if args[:2] == ["get", "events"]:
+    items = []
+    for (c, n), events in EVENTS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += events
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "configmaps"]:
+    items = []
+    for (c, n), maps in CONFIGMAPS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += maps
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "secrets"]:
+    if cluster == "prod":
+        sys.stderr.write('Error from server (Forbidden): secrets is forbidden: User "jacob" cannot list resource '
+                         '"secrets" in API group "" in the namespace "prod"\n')
+        sys.exit(1)
+    items = []
+    for (c, n), secrets in SECRETS.items():
+        if c == cluster and (all_ns or n == ns):
+            items += secrets
+    print(json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
+    sys.exit(0)
+
+if args[:2] == ["get", "secret"] and "json" in args:
+    for (c, n), secrets in SECRETS.items():
+        for secret in secrets:
+            if c == cluster and n == ns and secret["metadata"]["name"] == args[2]:
+                print(json.dumps(secret))
+                sys.exit(0)
+    sys.stderr.write(f'Error from server (NotFound): secrets "{args[2]}" not found\n')
+    sys.exit(1)
+
+if args[:1] == ["logs"]:
+    name = args[1]
+    previous = "-p" in args
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    tag = f"{container or 'api'}{' previous' if previous else ''}"
+    try:
+        for i in range(1, 10_000):
+            level = "ERROR" if i % 7 == 0 else ("WARN" if i % 5 == 0 else "INFO")
+            print(f"2026-09-12T12:{i // 60:02d}:{i % 60:02d}Z {level} {name} {tag} line {i}", flush=True)
+            time.sleep(0.3)
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    sys.exit(0)
+
+if args[:2] == ["describe", "pod"]:
+    name = args[2]
+    print(
+        f"Name:         {name}\nNamespace:    {ns}\nNode:         aks-np1-vmss000000\n"
+        "Status:       Running\nIP:           10.244.0.7\nContainers:\n  api:\n"
+        "    Image:  myacr.azurecr.io/team/x:1\nEvents:\n"
+        "  Normal  Pulled  2m  kubelet  Successfully pulled image"
+    )
+    sys.exit(0)
+
+if args[:2] == ["delete", "pod"]:
+    print(f'pod "{args[2]}" deleted')
+    sys.exit(0)
+
+if args[:2] == ["rollout", "restart"]:
+    print(f"{args[2]} restarted")
+    sys.exit(0)
+
+if args[:1] == ["scale"]:
+    print(f"{args[1]} scaled")
+    sys.exit(0)
+
+if args[:1] == ["get"] and "/" in args[1] and "-o" in args and "json" in args:
+    kind, name = args[1].split("/", 1)
+    print(json.dumps({
+        "apiVersion": "apps/v1", "kind": kind.capitalize(),
+        "metadata": {"name": name, "namespace": ns},
+        "spec": {"replicas": 3},
+        "status": {"readyReplicas": 3, "replicas": 3},
+    }))
+    sys.exit(0)
+
+if args[:1] == ["get"] and "/" in args[1] and "yaml" in args:
+    kind, name = args[1].split("/", 1)
+    print(f"apiVersion: apps/v1\nkind: {kind.capitalize()}\nmetadata:\n  name: {name}\n  namespace: {ns}\n")
+    sys.exit(0)
+
+if args[:1] == ["get"] and len(args) >= 3 and "yaml" in args:
+    print(f"apiVersion: v1\nkind: {args[1].capitalize()}\nmetadata:\n  name: {args[2]}\n  namespace: {ns}\nspec:\n  nodeName: aks-np1-vmss000000\n")
+    sys.exit(0)
+
+if args[:1] == ["exec"]:
+    # What a shell in the pod would do: print and leave, so the TUI repaints.
+    print(f"fake shell in {args[args.index('-n') + 2] if '-n' in args else args[-1]}")
+    sys.exit(0)
+
+sys.stderr.write("error: fake kubectl does not know: " + " ".join(sys.argv[1:]) + "\n")
+sys.exit(2)

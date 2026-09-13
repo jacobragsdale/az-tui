@@ -2,7 +2,24 @@
 
 ## 0.1.0 — unreleased
 
-The first version. Two tabs, read only.
+The first version. AKS namespaces, Key Vault secrets and Container Registry
+images, one binary.
+
+- **AKS tabs.** aks-tui is merged in: one tab per cluster namespace ahead of
+  Secrets and Registries, with pods, events, configmaps and secrets on
+  `p e m s`, logs following in a text pane, bash / restart / scale, and
+  `az-tui setup` to fetch credentials and print `[[clusters]]` blocks.
+  `doctor` runs the Azure checks, then kubectl, kubelogin and every scope.
+- One `config.toml`: `[[clusters]]` and a top-level `refresh` (the AKS
+  cadence, what `--refresh` sets) beside `[azure]`, whose own `refresh` is
+  the vault and registry cadence and config-only now.
+- One cache keyed by tab (`qa/dev`, `secrets`, `registries`), version 2; one
+  session, version 3, keyed the same way. Both written `0600` through one
+  atomic writer. Earlier files from either program are ignored, not
+  migrated.
+- `S` sorts and `R` reverses on every tab (`s` was the sort key on the Azure
+  tabs and is the Secrets kind on AKS ones); `1-9`, `[ ]`, `← →` switch
+  tabs everywhere; `?` shows the open tab's keys and search grammar.
 
 - **Secrets**: every secret in every Key Vault the `az` login can reach, as
   one flat table sorted so that one secret's dev, qa and prod rows are

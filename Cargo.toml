@@ -3,7 +3,7 @@ name = "az-tui"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A fast read-only terminal browser for Azure Key Vault secrets and Container Registry images"
+description = "A fast terminal browser for AKS namespaces, Azure Key Vault secrets and Container Registry images"
 license = "MIT"
 repository = "https://github.com/jacobragsdale/az-tui"
 

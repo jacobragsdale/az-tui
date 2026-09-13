@@ -1,5 +1,5 @@
-//! `az-tui`: a read-only terminal browser for Azure Key Vault secrets and
-//! Container Registry images.
+//! `az-tui`: a fast terminal browser for AKS namespaces, Azure Key Vault
+//! secrets and Container Registry images.
 
 fn main() {
     if let Err(error) = az_tui::run::run() {
