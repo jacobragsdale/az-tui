@@ -420,6 +420,7 @@ mod tests {
 
     use super::*;
     use crate::columns::{SECRET_COLUMNS, TAG_COLUMNS};
+    use crate::ui::screen_text;
 
     fn row(cells: &[&str]) -> Vec<Cell> {
         cells.iter().map(|text| Cell::new(*text)).collect()
@@ -465,22 +466,11 @@ mod tests {
         (terminal.backend().buffer().clone(), hits)
     }
 
-    fn text(buffer: &Buffer) -> String {
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn the_table_says_what_it_is_on_one_border_and_what_it_is_doing_on_the_other() {
         let mut cursor = ListCursor::default();
         let (buffer, hits) = draw(90, 10, &secrets(), &mut cursor, |_| {});
-        let drawn = text(&buffer);
+        let drawn = screen_text(&buffer);
 
         assert!(drawn.contains(" Secrets "), "{drawn}");
         assert!(drawn.contains("3/412 \u{b7} Name \u{2191}"), "{drawn}");
@@ -597,7 +587,7 @@ mod tests {
 
         let window = &all[cursor.scroll.offset..cursor.scroll.offset + 4];
         let (buffer, hits) = draw(90, 8, window, &mut cursor, |spec| spec.total = 40);
-        let drawn = text(&buffer);
+        let drawn = screen_text(&buffer);
 
         assert_eq!(
             hits.rows
@@ -620,7 +610,7 @@ mod tests {
     fn a_table_with_no_room_for_a_row_still_draws_its_frame() {
         let mut cursor = ListCursor::default();
         let (buffer, hits) = draw(90, 3, &secrets(), &mut cursor, |_| {});
-        assert!(text(&buffer).contains(" Secrets "));
+        assert!(screen_text(&buffer).contains(" Secrets "));
         assert!(hits.rows.is_empty(), "there is nowhere to put one");
         assert_eq!(cursor.scroll.viewport, 1, "and a page is never zero rows");
     }
@@ -653,7 +643,7 @@ mod tests {
             })
             .unwrap();
         let _ = hits;
-        let drawn = text(terminal.backend().buffer());
+        let drawn = screen_text(terminal.backend().buffer());
         assert!(drawn.contains("1.42.0"), "{drawn}");
         assert!(drawn.contains("Digest"), "{drawn}");
         assert!(

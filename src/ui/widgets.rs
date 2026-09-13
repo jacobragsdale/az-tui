@@ -1,5 +1,6 @@
-//! The pieces of the frame that are not a table: the tab bar, the search
-//! row, the status bar, the scrollbar, and the help modal.
+//! The pieces of the frame that are not a table: the tab bar with its kind
+//! pill, the search row, the status bar, the scrollbar, the help modal and
+//! the two drop-down menus.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -12,6 +13,7 @@ use crate::app::keys;
 use crate::app::screen::{TabId, Target};
 use crate::app::shell::{Focus, Level, Panes, Shell};
 use crate::filter::{ENV_CHOICES, Env};
+use crate::kube::Kind;
 use crate::store::{AzureStore, problem_line};
 use crate::text_input::{TextInput, field_window};
 use crate::timestamp::Timestamp;
@@ -25,6 +27,17 @@ const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
 pub const SECRETS_PLACEHOLDER: &str = "Type / to search, or env:prod enabled:no expires:<30d";
 pub const REPOSITORIES_PLACEHOLDER: &str = "Type / to search, or env:prod updated:<30d";
 pub const TAGS_PLACEHOLDER: &str = "Type / to search, or tag:1.4 digest:ab12 updated:<30d";
+
+/// What each kind's search row says on a scope tab.
+#[must_use]
+pub const fn placeholder(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Pods => "Type / to search pods, or status:crash owner:orders-api app: node:",
+        Kind::Events => "Type / to search events, or type:warning reason:backoff object: kind:",
+        Kind::ConfigMaps => "Type / to search configmaps, or key:LOG_LEVEL",
+        Kind::Secrets => "Type / to search secrets, or type:tls key:password",
+    }
+}
 
 /// The `key:value` filters each table takes, for the help. The README is
 /// otherwise the only place the grammar is written down.
@@ -51,6 +64,15 @@ const FILTERS: &[(TabId, &str, &str)] = &[
 pub enum Pane {
     Table,
     Details,
+}
+
+/// One tab as the bar draws it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TabLabel {
+    pub label: String,
+    /// What the bar falls back to when it is narrow.
+    pub short: String,
+    pub badge: Option<String>,
 }
 
 /// A tab's body: the search row, then the table and the details pane laid
@@ -100,32 +122,44 @@ pub fn spinner_frame(millis: u128) -> char {
     SPINNER[(millis / 120) as usize % SPINNER.len()]
 }
 
-/// The tab bar: the numbers, the names, and a badge where a screen has
-/// something to say. Names shorten before any of them is dropped.
+/// The tab bar: one tab per scope and Azure table, numbered for the first
+/// nine, with a badge where a tab has something to say; the kind pill (on a
+/// scope tab) and the `?` at the right end. Names shorten before any is
+/// dropped.
 pub fn render_tab_bar(
     frame: &mut Frame,
     shell: &mut Shell,
     area: Rect,
-    active: TabId,
-    badges: &[(TabId, Option<String>)],
+    active: usize,
+    tabs: &[TabLabel],
+    kind: Option<Kind>,
 ) {
     let palette = theme();
-    let short = area.width < 44;
+    // The pill, when there is one, and the `?` take the right end first.
+    let pill_label = kind.map(|kind| format!(" {} \u{25be} ", kind.label()));
+    let pill_width = pill_label
+        .as_ref()
+        .map_or(0, |label| u16::try_from(label.chars().count()).unwrap_or(8));
+    let right = pill_width.saturating_add(3);
+    let full_width: usize = tabs
+        .iter()
+        .map(|tab| {
+            tab.label.chars().count() + 4 + tab.badge.as_ref().map_or(0, |b| b.chars().count() + 1)
+        })
+        .sum();
+    let short = full_width + usize::from(right) > usize::from(area.width);
     let mut spans = Vec::new();
     let mut column = area.x;
-    for tab in TabId::ALL {
-        let badge = badges
-            .iter()
-            .find(|(held, _)| *held == tab)
-            .and_then(|(_, badge)| badge.clone());
-        let name = if short {
-            tab.short_label()
+    let tabs_right = area.right().saturating_sub(right);
+    for (index, tab) in tabs.iter().enumerate() {
+        let name = if short { &tab.short } else { &tab.label };
+        let label = if index < 9 {
+            format!(" {} {name}", index + 1)
         } else {
-            tab.label()
+            format!(" {name}")
         };
-        let label = format!(" {} {name}", tab.number());
         let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
-        let style = if tab == active {
+        let style = if index == active {
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -134,21 +168,40 @@ pub fn render_tab_bar(
         };
         spans.push(Span::styled(label, style));
         let mut hit_width = width;
-        if let Some(badge) = badge {
+        if let Some(badge) = &tab.badge {
             let badge = format!(" {badge}");
             hit_width += u16::try_from(badge.chars().count()).unwrap_or(0);
             spans.push(Span::styled(badge, Style::default().fg(palette.warning)));
         }
-        if column < area.right() {
+        if column < tabs_right {
             shell.region(
-                Rect::new(column, area.y, hit_width.min(area.right() - column), 1),
-                Target::Tab(tab),
+                Rect::new(column, area.y, hit_width.min(tabs_right - column), 1),
+                Target::Tab(index),
             );
         }
         column += hit_width;
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, tabs_right.saturating_sub(area.x), 1),
+    );
 
+    if let Some(pill_label) = pill_label
+        && area.width > right
+    {
+        let pill = Rect::new(area.right() - right, area.y, pill_width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                pill_label,
+                Style::default()
+                    .fg(palette.accent)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            pill,
+        );
+        shell.region(pill, Target::KindPill);
+    }
     // The `?` sits at the right end of the same row.
     if area.width > 2 {
         let help = Rect::new(area.right() - 2, area.y, 1, 1);
@@ -466,6 +519,62 @@ pub fn render_env_menu(
     }
 }
 
+/// The kind pill's menu, under the pill: every kind with a tick on the one
+/// showing and the keys' line lit. Drawn last so it sits over whatever is
+/// under it.
+pub fn render_kind_menu(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    anchor: Rect,
+    current: Kind,
+    highlighted: usize,
+) {
+    let palette = theme();
+    let width = 16;
+    let lines = u16::try_from(Kind::ALL.len()).unwrap_or(u16::MAX);
+    let area = Rect::new(
+        anchor.right().saturating_sub(width),
+        anchor.y.saturating_add(1),
+        width,
+        lines.saturating_add(2),
+    )
+    .intersection(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    for (at, kind) in Kind::ALL.iter().enumerate() {
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(at).unwrap_or(u16::MAX));
+        if y >= inner.bottom() {
+            break;
+        }
+        let line = Rect::new(inner.x, y, inner.width, 1);
+        let mark = if *kind == current { "\u{2713} " } else { "  " };
+        let mut style = Style::default().fg(palette.text);
+        if at == highlighted {
+            style = style
+                .bg(palette.selected_background)
+                .add_modifier(Modifier::BOLD);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{mark}{} ", kind.label()), style),
+                Span::styled(
+                    format!("{}", kind.key()),
+                    Style::default().fg(palette.muted),
+                ),
+            ])),
+            line,
+        );
+        shell.region(line, Target::KindOption(*kind));
+    }
+}
+
 /// A one-character scrollbar down the right edge of a pane, drawn only when
 /// there is more content than viewport.
 pub fn render_scrollbar(
@@ -501,6 +610,7 @@ pub fn render_scrollbar(
 mod tests {
     use super::*;
     use crate::azure::Inventory;
+    use crate::ui::screen_text;
     use crate::worker::Event;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -514,45 +624,79 @@ mod tests {
                 draw(frame, &mut shell);
             })
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        screen_text(terminal.backend().buffer())
+    }
+
+    fn tabs() -> Vec<TabLabel> {
+        [
+            ("qa/dev", "dev"),
+            ("qa/qa", "qa"),
+            ("qa/uat", "uat"),
+            ("prod", "prod"),
+            ("Secrets", "Sec"),
+            ("Registries", "Reg"),
+        ]
+        .into_iter()
+        .map(|(label, short)| TabLabel {
+            label: label.to_owned(),
+            short: short.to_owned(),
+            badge: None,
+        })
+        .collect()
     }
 
     #[test]
-    fn the_tab_bar_names_both_tabs_and_paints_a_badge() {
-        let drawn = screen(80, 1, |frame, shell| {
+    fn the_tab_bar_numbers_every_tab_paints_a_badge_and_wears_the_pill_on_a_scope() {
+        let mut tabs = tabs();
+        tabs[0].badge = Some("✗ 3".into());
+        tabs[4].badge = Some("⚠ 3".into());
+        let drawn = screen(90, 1, |frame, shell| {
             render_tab_bar(
                 frame,
                 shell,
-                Rect::new(0, 0, 80, 1),
-                TabId::Secrets,
-                &[(TabId::Secrets, Some("⚠ 3".into()))],
+                Rect::new(0, 0, 90, 1),
+                0,
+                &tabs,
+                Some(Kind::Pods),
             );
         });
-        assert!(drawn.contains("1 Secrets"), "{drawn}");
-        assert!(drawn.contains("⚠ 3"), "{drawn}");
-        assert!(drawn.contains("2 Registries"), "{drawn}");
+        assert!(drawn.contains("1 qa/dev ✗ 3"), "{drawn}");
+        assert!(drawn.contains("4 prod"), "{drawn}");
+        assert!(drawn.contains("5 Secrets ⚠ 3"), "{drawn}");
+        assert!(drawn.contains("6 Registries"), "{drawn}");
+        assert!(drawn.contains("Pods ▾"), "{drawn}");
+        assert!(drawn.trim_end().ends_with('?'), "{drawn}");
+
+        // On an Azure tab there is no kind to pick, so no pill.
+        let drawn = screen(90, 1, |frame, shell| {
+            render_tab_bar(frame, shell, Rect::new(0, 0, 90, 1), 4, &tabs, None);
+        });
+        assert!(drawn.contains("5 Secrets"), "{drawn}");
+        assert!(!drawn.contains('▾'), "{drawn}");
         assert!(drawn.trim_end().ends_with('?'), "{drawn}");
     }
 
     #[test]
     fn a_narrow_tab_bar_shortens_the_names_rather_than_dropping_one() {
-        let drawn = screen(40, 1, |frame, shell| {
-            render_tab_bar(frame, shell, Rect::new(0, 0, 40, 1), TabId::Secrets, &[]);
+        let drawn = screen(60, 1, |frame, shell| {
+            render_tab_bar(
+                frame,
+                shell,
+                Rect::new(0, 0, 60, 1),
+                0,
+                &tabs(),
+                Some(Kind::Events),
+            );
         });
-        assert!(drawn.contains("1 Sec"), "{drawn}");
-        assert!(drawn.contains("2 Reg"), "{drawn}");
+        assert!(drawn.contains("1 dev"), "{drawn}");
+        assert!(drawn.contains("5 Sec"), "{drawn}");
+        assert!(drawn.contains("6 Reg"), "{drawn}");
+        assert!(!drawn.contains("qa/dev"), "{drawn}");
+        assert!(drawn.contains("Events ▾"), "{drawn}");
     }
 
     #[test]
-    fn a_click_on_a_tab_lands_on_that_tab() {
+    fn a_click_on_a_tab_or_the_pill_lands_where_it_should() {
         let mut shell = Shell::default();
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
@@ -562,14 +706,38 @@ mod tests {
                     frame,
                     &mut shell,
                     Rect::new(0, 0, 80, 1),
-                    TabId::Secrets,
-                    &[],
+                    0,
+                    &tabs(),
+                    Some(Kind::Pods),
                 );
             })
             .unwrap();
-        assert_eq!(shell.hit(3, 0), Some(&Target::Tab(TabId::Secrets)));
-        assert_eq!(shell.hit(12, 0), Some(&Target::Tab(TabId::Registries)));
+        assert_eq!(shell.hit(3, 0), Some(&Target::Tab(0)));
+        assert_eq!(shell.hit(12, 0), Some(&Target::Tab(1)));
         assert_eq!(shell.hit(78, 0), Some(&Target::Help));
+        let pill = shell.find(&Target::KindPill).expect("a pill");
+        assert_eq!(shell.hit(pill.x + 1, 0), Some(&Target::KindPill));
+    }
+
+    #[test]
+    fn the_kind_menu_lists_every_kind_under_the_pill_and_each_takes_a_click() {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_kind_menu(frame, &mut shell, Rect::new(40, 0, 8, 1), Kind::Pods, 1);
+            })
+            .unwrap();
+        let drawn = screen_text(terminal.backend().buffer());
+        assert!(drawn.contains("\u{2713} Pods"), "{drawn}");
+        assert!(drawn.contains("  Events"), "{drawn}");
+        assert!(drawn.contains("Secrets"), "{drawn}");
+        let events = shell.find(&Target::KindOption(Kind::Events)).unwrap();
+        assert_eq!(
+            shell.hit(events.x + 2, events.y),
+            Some(&Target::KindOption(Kind::Events))
+        );
     }
 
     #[test]

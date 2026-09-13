@@ -3,7 +3,9 @@
 
 pub mod cursor;
 pub mod keys;
+pub mod list;
 pub mod registries;
+pub mod scope;
 pub mod screen;
 pub mod secrets;
 pub mod shell;
@@ -16,7 +18,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use screen::{AppAction, TabId, Target};
 use secrets::SecretsScreen;
-use shell::{Focus, Shell};
+use shell::{Focus, Menu, Shell};
 
 use crate::columns::{ColumnId, TableLayout};
 use crate::filter::{self, ENV_CHOICES, Env};
@@ -61,16 +63,18 @@ impl App {
             self.shell.help_open = false;
             return AppAction::None;
         }
-        if let Some(at) = self.shell.env_menu {
+        if let Some((Menu::Env, at)) = self.shell.menu {
             // The menu takes the keys that walk it; any other closes it.
             let count = ENV_CHOICES.len();
             match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.shell.env_menu = Some((at + 1) % count),
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.shell.menu = Some((Menu::Env, (at + 1) % count));
+                }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    self.shell.env_menu = Some((at + count - 1) % count);
+                    self.shell.menu = Some((Menu::Env, (at + count - 1) % count));
                 }
                 KeyCode::Enter => self.choose_env(ENV_CHOICES[at]),
-                _ => self.shell.env_menu = None,
+                _ => self.shell.menu = None,
             }
             return AppAction::None;
         }
@@ -102,7 +106,7 @@ impl App {
             }
             KeyCode::Char('r') => {
                 self.on_refresh();
-                AppAction::Send(Request::Refresh)
+                AppAction::Azure(Request::Refresh)
             }
             KeyCode::Char('/') => {
                 self.shell.focus = Focus::Search;
@@ -164,7 +168,10 @@ impl App {
     /// already at.
     fn open_env_menu(&mut self) {
         let current = self.current_env();
-        self.shell.env_menu = ENV_CHOICES.iter().position(|held| *held == current);
+        self.shell.menu = ENV_CHOICES
+            .iter()
+            .position(|held| *held == current)
+            .map(|at| (Menu::Env, at));
     }
 
     /// A choice from the menu goes into the search box as `env:prod`, where
@@ -173,7 +180,7 @@ impl App {
         let input = self.input();
         let text = filter::with_env(input.text(), env);
         input.set_text(text);
-        self.shell.env_menu = None;
+        self.shell.menu = None;
     }
 
     /// `Esc` out of the table: the filter goes, and the table comes back
@@ -208,7 +215,7 @@ impl App {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> AppAction {
         let target = self.shell.hit(event.column, event.row).cloned();
         match event.kind {
-            MouseEventKind::Down(_) if self.shell.env_menu.take().is_some() => {
+            MouseEventKind::Down(_) if self.shell.menu.take().is_some() => {
                 // The open menu takes the click: one of its lines chooses,
                 // anywhere else closes it and does nothing more.
                 if let Some(Target::EnvOption(env)) = target {
@@ -222,8 +229,10 @@ impl App {
                     self.open_env_menu();
                     AppAction::None
                 }
-                Some(Target::Tab(tab)) => {
-                    self.switch_to(tab);
+                Some(Target::Tab(index)) => {
+                    if let Some(tab) = TabId::ALL.get(index) {
+                        self.switch_to(*tab);
+                    }
                     AppAction::None
                 }
                 Some(Target::Help) => {
@@ -433,11 +442,22 @@ impl App {
             ])
             .areas(area);
 
-        let badges = [
-            (TabId::Secrets, self.secrets.badge(&self.store.azure)),
-            (TabId::Registries, self.registries.badge(&self.store.azure)),
-        ];
-        ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, self.tab, &badges);
+        let labels: Vec<ui::widgets::TabLabel> = TabId::ALL
+            .into_iter()
+            .map(|tab| ui::widgets::TabLabel {
+                label: tab.label().to_owned(),
+                short: tab.short_label().to_owned(),
+                badge: match tab {
+                    TabId::Secrets => self.secrets.badge(&self.store.azure),
+                    TabId::Registries => self.registries.badge(&self.store.azure),
+                },
+            })
+            .collect();
+        let active = TabId::ALL
+            .iter()
+            .position(|held| *held == self.tab)
+            .unwrap_or(0);
+        ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, active, &labels, None);
         self.render_body(frame, body);
         let hint = self.footer_hint();
         ui::widgets::render_status_bar(
@@ -449,7 +469,7 @@ impl App {
             self.tab,
             millis,
         );
-        if let Some(highlighted) = self.shell.env_menu
+        if let Some((Menu::Env, highlighted)) = self.shell.menu
             && let Some(anchor) = self.shell.find(&Target::Header(ColumnId::Env))
         {
             let current = self.current_env();
@@ -760,7 +780,7 @@ mod tests {
             .find(&Target::Header(ColumnId::Env))
             .expect("the table drew an Env header");
         app.handle_mouse(click(header.x, header.y));
-        assert_eq!(app.shell.env_menu, Some(0), "open, on All");
+        assert_eq!(app.shell.menu, Some((Menu::Env, 0)), "open, on All");
         assert_eq!(app.secrets.sort, ColumnId::Name, "and it did not sort");
         let drawn = draw(&mut app);
         assert!(drawn.contains("\u{2713} All"), "{drawn}");
@@ -777,7 +797,7 @@ mod tests {
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.secrets.input.text(), "db env:prod");
-        assert_eq!(app.shell.env_menu, None);
+        assert_eq!(app.shell.menu, None);
         app.secrets.refilter(&app.store.azure);
         assert!(
             app.secrets
@@ -794,12 +814,12 @@ mod tests {
         app.shell
             .region(Rect::new(2, 2, 6, 1), Target::Header(ColumnId::Env));
         app.handle_mouse(click(3, 2));
-        assert_eq!(app.shell.env_menu, Some(3));
+        assert_eq!(app.shell.menu, Some((Menu::Env, 3)));
         app.shell
             .region(Rect::new(2, 4, 6, 1), Target::EnvOption(None));
         app.shell.region(Rect::new(2, 9, 20, 1), Target::Row(1));
         app.handle_mouse(click(3, 9));
-        assert_eq!(app.shell.env_menu, None);
+        assert_eq!(app.shell.menu, None);
         assert_eq!(
             app.secrets.cursor.index, 0,
             "the row under it was not taken"
@@ -811,9 +831,9 @@ mod tests {
 
         // Any other key closes it and is not otherwise acted on.
         app.handle_mouse(click(3, 2));
-        assert!(app.shell.env_menu.is_some());
+        assert!(app.shell.menu.is_some());
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert_eq!(app.shell.env_menu, None);
+        assert_eq!(app.shell.menu, None);
     }
 
     #[test]

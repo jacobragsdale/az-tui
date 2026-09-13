@@ -235,7 +235,9 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
 fn act(app: &mut App, worker: &Worker, action: AppAction) -> bool {
     match action {
         AppAction::Quit => return true,
-        AppAction::Send(request) => worker.send(request),
+        AppAction::Azure(request) => worker.send(request),
+        // Wired to the kube worker once the scope tabs are in the app.
+        AppAction::Kube(_) | AppAction::Exec { .. } => {}
         AppAction::Copy { text, label } => match clipboard::copy(&text) {
             Ok(clipboard::Channel::Command) => app.shell.set_status(label),
             // The escape went out and nothing confirmed it; a terminal that

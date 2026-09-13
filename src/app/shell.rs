@@ -21,8 +21,19 @@ const SIDE_BY_SIDE_AT: u16 = 110;
 pub enum Focus {
     #[default]
     Table,
+    /// The details pane, or the text pane under it when that is open.
     Details,
     Search,
+    /// The filter inside the text pane.
+    PaneSearch,
+}
+
+/// Which drop-down is open: the Env header's on an Azure tab, the kind
+/// pill's on a scope tab. Only one table shows, so only one can be.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Menu {
+    Env,
+    Kind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,9 +57,9 @@ pub enum Panes {
 pub struct Shell {
     pub focus: Focus,
     pub help_open: bool,
-    /// The Env header's menu, and which line of it the keys are on, while it
-    /// is open. One per app rather than per screen: only one table shows.
-    pub env_menu: Option<usize>,
+    /// The open menu and which line of it the keys are on. One per app
+    /// rather than per screen: only one table shows.
+    pub menu: Option<(Menu, usize)>,
     /// What the status bar says instead of the footer hint, until it expires.
     notification: Option<(String, Instant, Level)>,
     /// Rebuilt every frame; a click resolves against the last region that
@@ -134,7 +145,7 @@ impl Shell {
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Table => Focus::Details,
-            Focus::Details | Focus::Search => Focus::Table,
+            Focus::Details | Focus::Search | Focus::PaneSearch => Focus::Table,
         };
     }
 }

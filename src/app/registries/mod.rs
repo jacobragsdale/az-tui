@@ -299,7 +299,7 @@ impl RegistriesScreen {
         self.tag_built_for = None;
         self.details_scroll.scroll_to(0);
         self.rested = None;
-        AppAction::Send(Request::Tags { registry, repo })
+        AppAction::Azure(Request::Tags { registry, repo })
     }
 
     /// `Backspace` or `h`: back to the repositories, cursor where it was.

@@ -1,10 +1,16 @@
 //! Every frame: the guard for a terminal too small to say anything in, and
 //! the panes on top of it.
 
+pub mod config;
 pub mod details;
+pub mod events;
+pub mod modal;
+pub mod pods;
 pub mod registries;
+pub mod scope;
 pub mod secrets;
 pub mod table;
+pub mod textpane;
 pub mod theme;
 pub mod widgets;
 
@@ -32,6 +38,19 @@ pub fn render_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// A test buffer as one string, a row per line.
+#[cfg(test)]
+pub(crate) fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,15 +63,7 @@ mod tests {
         terminal
             .draw(|frame| render_too_small(frame, frame.area()))
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let screen: String = (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let screen = screen_text(terminal.backend().buffer());
         assert!(screen.contains("too small"), "{screen}");
     }
 }

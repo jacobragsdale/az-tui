@@ -693,7 +693,7 @@ impl SecretsScreen {
             name: name.clone(),
             copy: false,
         });
-        AppAction::Send(crate::worker::Request::Value {
+        AppAction::Azure(crate::worker::Request::Value {
             vault,
             name,
             version: None,
@@ -722,7 +722,7 @@ impl SecretsScreen {
             copy: true,
         });
         shell.set_status(format!("reading {name}…"));
-        AppAction::Send(crate::worker::Request::Value {
+        AppAction::Azure(crate::worker::Request::Value {
             vault,
             name,
             version: None,

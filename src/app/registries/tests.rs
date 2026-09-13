@@ -100,7 +100,7 @@ fn enter_opens_a_repository_and_backspace_comes_back_with_both_cursors_intact() 
 
     let action = press(&mut screen, &store, KeyCode::Enter);
     assert!(
-        matches!(&action, AppAction::Send(Request::Tags { repo, .. }) if repo == "payments-api"),
+        matches!(&action, AppAction::Azure(Request::Tags { repo, .. }) if repo == "payments-api"),
         "{action:?}"
     );
     assert_eq!(screen.open_repository(), Some(("acrprod", "payments-api")));

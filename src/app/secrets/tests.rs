@@ -413,7 +413,7 @@ fn v_asks_once_shows_the_value_and_lets_it_go_at_sixty_seconds() {
 
     let action = press(&mut screen, &mut shell, &store, 'v');
     assert!(
-        matches!(&action, AppAction::Send(crate::worker::Request::Value { name, .. }) if name == "api-key"),
+        matches!(&action, AppAction::Azure(crate::worker::Request::Value { name, .. }) if name == "api-key"),
         "{action:?}"
     );
     assert!(screen.is_reading(&row));
@@ -502,7 +502,7 @@ fn y_without_a_reveal_asks_and_copies_on_arrival_and_with_one_copies_at_once() {
     screen.refilter(&store);
 
     let action = press(&mut screen, &mut shell, &store, 'y');
-    assert!(matches!(action, AppAction::Send(_)), "{action:?}");
+    assert!(matches!(action, AppAction::Azure(_)), "{action:?}");
     let action = screen.on_value(
         &mut shell,
         &store,
