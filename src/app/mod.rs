@@ -21,7 +21,7 @@ use shell::{Focus, Shell};
 use crate::columns::{ColumnId, TableLayout};
 use crate::filter::{self, ENV_CHOICES, Env};
 use crate::session::{Session, SessionColumn};
-use crate::store::{Applied, Store};
+use crate::store::{Store, azure::Applied};
 use crate::text_input::TextInput;
 use crate::worker::Request;
 use crate::{ui, worker};
@@ -637,6 +637,7 @@ mod tests {
         assert!(app.secrets.input.is_empty());
         let mut app = App::new(Store {
             azure: crate::app::registries::tests::stocked(),
+            ..Store::default()
         });
         app.tab = TabId::Registries;
         app.registries.refilter(&app.store.azure);
@@ -675,6 +676,7 @@ mod tests {
 
         let mut app = App::new(Store {
             azure: crate::app::registries::tests::stocked(),
+            ..Store::default()
         });
         app.tab = TabId::Registries;
         app.registries.refilter(&app.store.azure);
@@ -741,6 +743,7 @@ mod tests {
     fn the_env_header_opens_a_menu_whose_choice_lands_in_the_search_box() {
         let mut app = App::new(Store {
             azure: crate::app::secrets::tests::stocked(),
+            ..Store::default()
         });
         app.secrets.input.set_text("db");
         let click = |column, row| MouseEvent {

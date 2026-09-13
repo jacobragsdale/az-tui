@@ -16,6 +16,8 @@
 
 use ratatui::layout::{Alignment, Constraint};
 
+use crate::kube::Kind;
+
 /// The two columns the selection marker (`› `) is always given, whether or
 /// not the row under the cursor is on screen.
 pub const SELECTION_WIDTH: u16 = 2;
@@ -368,6 +370,17 @@ pub const K8S_SECRET_COLUMNS: &[ColumnConfig] = &[
     ColumnConfig::shown(ColumnId::Age),
 ];
 
+/// The table a namespace opens for one kind.
+#[must_use]
+pub const fn columns_for(kind: Kind) -> &'static [ColumnConfig] {
+    match kind {
+        Kind::Pods => POD_COLUMNS,
+        Kind::Events => EVENT_COLUMNS,
+        Kind::ConfigMaps => CONFIGMAP_COLUMNS,
+        Kind::Secrets => K8S_SECRET_COLUMNS,
+    }
+}
+
 /// One table's columns as they stand: what it opened with, plus whatever the
 /// session file or the user has done to them since.
 ///
@@ -623,7 +636,16 @@ mod tests {
                 ColumnId::Age
             ]
         );
-        assert_eq!(CONFIGMAP_COLUMNS.len(), 4);
+        assert_eq!(columns_for(Kind::ConfigMaps).len(), 4);
+        for kind in Kind::ALL {
+            assert!(
+                columns_for(kind)
+                    .iter()
+                    .any(|column| column.id == ColumnId::Name)
+                    || kind == Kind::Events,
+                "{kind:?} names its rows"
+            );
+        }
     }
 
     /// The smallest table the app draws at all, from `ui::MIN_WIDTH`, less
