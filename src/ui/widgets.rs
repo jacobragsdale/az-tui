@@ -10,13 +10,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::theme::theme;
 use crate::app::keys::{self, Section};
-use crate::app::screen::{TabId, Target};
+use crate::app::screen::Target;
 use crate::app::shell::{Focus, Level, Panes, Shell};
 use crate::filter::{ENV_CHOICES, Env};
 use crate::kube::Kind;
-use crate::store::{AzureStore, problem_line};
 use crate::text_input::{TextInput, field_window};
-use crate::timestamp::Timestamp;
 
 /// The frames of the spinner that turns while a refresh runs.
 const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
@@ -292,9 +290,8 @@ pub fn render_status_bar(
     shell: &mut Shell,
     area: Rect,
     hint: &str,
-    store: &AzureStore,
-    tab: TabId,
-    millis: u128,
+    right: &str,
+    right_style: Style,
 ) {
     let palette = theme();
     let (left, style) = match shell.notification() {
@@ -302,7 +299,6 @@ pub fn render_status_bar(
         Some((said, Level::Info)) => (said.to_owned(), Style::default().fg(palette.success)),
         None => (hint.to_owned(), Style::default().fg(palette.muted)),
     };
-    let (right, right_style) = store_state(store, tab, millis);
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
 
     // The right-hand end is the one that cannot be guessed from the keys, so
@@ -310,10 +306,10 @@ pub fn render_status_bar(
     // gap, so the two never read as one sentence.
     let (left, right) = if right_width + 3 >= area.width {
         // No room for both: what is happening beats what the keys do.
-        (String::new(), right)
+        (String::new(), right.to_owned())
     } else {
         let room = usize::from(area.width - right_width - 3);
-        (truncate(&left, room), right)
+        (truncate(&left, room), right.to_owned())
     };
 
     frame.render_widget(Paragraph::new(Span::styled(left, style)), area);
@@ -334,48 +330,6 @@ fn truncate(text: &str, room: usize) -> String {
         return String::new();
     }
     text.chars().take(room - 1).chain(['…']).collect()
-}
-
-/// The right-hand end of the status bar: what is happening, or what is
-/// wrong, or what this tab holds and when it was read.
-fn store_state(store: &AzureStore, tab: TabId, millis: u128) -> (String, Style) {
-    let palette = theme();
-    if store.refreshing {
-        let said = store.progress.clone().unwrap_or_else(|| "reading…".into());
-        return (
-            format!("{} {said}", spinner_frame(millis)),
-            Style::default().fg(palette.info),
-        );
-    }
-    if let Some(problem) = store.first_problem() {
-        return (
-            format!("! {}", problem_line(problem)),
-            Style::default().fg(palette.error),
-        );
-    }
-    let age = store.read_at.map_or_else(
-        || "never read".to_owned(),
-        |read_at| match read_at.relative_age(Timestamp::now()).as_str() {
-            "now" => "just now".to_owned(),
-            age => format!("{age} ago"),
-        },
-    );
-    let counts = match tab {
-        TabId::Secrets => format!(
-            "{} vaults · {} secrets",
-            store.inventory.vaults.len(),
-            store.secrets.len()
-        ),
-        TabId::Registries => format!(
-            "{} registries · {} repositories",
-            store.inventory.registries.len(),
-            store.repositories.len()
-        ),
-    };
-    (
-        format!("● {counts} · {age}"),
-        Style::default().fg(palette.muted),
-    )
 }
 
 /// A centred box for a modal, with the screen behind it washed out where the
@@ -621,9 +575,7 @@ pub fn render_scrollbar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::azure::Inventory;
     use crate::ui::screen_text;
-    use crate::worker::Event;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -798,20 +750,19 @@ mod tests {
 
     #[test]
     fn the_status_bar_says_the_hint_then_the_notification_then_the_error() {
-        let store = AzureStore::default();
+        let right = "● 3 vaults · 412 secrets · 12s ago";
         let drawn = screen(100, 1, |frame, shell| {
             render_status_bar(
                 frame,
                 shell,
                 Rect::new(0, 0, 100, 1),
                 "↑↓ move",
-                &store,
-                TabId::Secrets,
-                0,
+                right,
+                Style::default(),
             );
         });
         assert!(drawn.contains("↑↓ move"), "{drawn}");
-        assert!(drawn.contains("never read"), "{drawn}");
+        assert!(drawn.contains("412 secrets"), "{drawn}");
 
         let mut shell = Shell::default();
         shell.set_status("Copied value of db-password (kv-prod)");
@@ -824,9 +775,8 @@ mod tests {
                     &mut shell,
                     Rect::new(0, 0, 100, 1),
                     "↑↓ move",
-                    &store,
-                    TabId::Secrets,
-                    0,
+                    right,
+                    Style::default(),
                 );
             })
             .unwrap();
@@ -838,10 +788,6 @@ mod tests {
 
     #[test]
     fn the_two_halves_of_the_status_bar_never_run_into_each_other() {
-        let mut store = AzureStore::default();
-        store.apply(Event::Inventory(Err(
-            "not signed in — run `az login`".into()
-        )));
         for width in [40, 60, 80, 100, 120] {
             let drawn = screen(width, 1, |frame, shell| {
                 render_status_bar(
@@ -849,9 +795,8 @@ mod tests {
                     shell,
                     Rect::new(0, 0, width, 1),
                     "↑↓/jk move  / search  S sort  y copy value  v reveal  r refresh  ? help",
-                    &store,
-                    TabId::Secrets,
-                    0,
+                    "! not signed in — run `az login`",
+                    Style::default(),
                 );
             });
             assert!(
@@ -871,44 +816,6 @@ mod tests {
         assert_eq!(truncate("↑↓/jk move", 6), "↑↓/jk…");
         assert_eq!(truncate("↑↓/jk move", 1), "");
         assert_eq!(truncate("", 0), "");
-    }
-
-    #[test]
-    fn the_status_bar_shows_the_spinner_while_reading_and_the_problem_after() {
-        let mut store = AzureStore::default();
-        store.apply(Event::Inventory(Ok(Inventory::default())));
-        store.apply(Event::Progress("reading kv-prod (2/3)…".into()));
-        let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(
-                frame,
-                shell,
-                Rect::new(0, 0, 100, 1),
-                "",
-                &store,
-                TabId::Secrets,
-                0,
-            );
-        });
-        assert!(drawn.contains("reading kv-prod (2/3)"), "{drawn}");
-        assert!(drawn.contains(SPINNER[0]), "{drawn}");
-
-        store.apply(Event::Secrets {
-            vault: "kv-prod".into(),
-            result: Err("no permission to read secrets".into()),
-        });
-        store.apply(Event::Idle);
-        let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(
-                frame,
-                shell,
-                Rect::new(0, 0, 100, 1),
-                "",
-                &store,
-                TabId::Secrets,
-                0,
-            );
-        });
-        assert!(drawn.contains("! kv-prod: no permission"), "{drawn}");
     }
 
     #[test]
@@ -963,24 +870,6 @@ mod tests {
             drawn.contains("access policy"),
             "the second half of the line is the actionable half: {drawn}"
         );
-    }
-
-    #[test]
-    fn the_status_bar_counts_what_the_open_tab_holds() {
-        let store = AzureStore::default();
-        let drawn = screen(100, 1, |frame, shell| {
-            render_status_bar(
-                frame,
-                shell,
-                Rect::new(0, 0, 100, 1),
-                "",
-                &store,
-                TabId::Registries,
-                0,
-            );
-        });
-        assert!(drawn.contains("registries"), "{drawn}");
-        assert!(!drawn.contains("secrets"), "{drawn}");
     }
 
     #[test]

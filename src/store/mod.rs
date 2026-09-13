@@ -7,6 +7,7 @@ pub mod azure;
 
 pub use azure::{AzureStore, problem_line};
 
+use crate::app::screen::Tab;
 use crate::cache::Snapshot;
 use crate::kube::{ConfigMap, Event, K8sEvent, Kind, Pod, SecretMeta};
 use crate::timestamp::Timestamp;
@@ -157,6 +158,28 @@ impl Store {
     #[must_use]
     pub fn scope(&self, index: usize) -> Option<&ScopeData> {
         self.scopes.get(index)
+    }
+
+    /// Everything that is wrong, for the help: the Azure half's problems,
+    /// then each scope's last failed read per kind.
+    #[must_use]
+    pub fn problems(&self, tabs: &[Tab]) -> Vec<String> {
+        let mut problems: Vec<String> = self.azure.problems.iter().map(problem_line).collect();
+        for (tab, slot) in tabs.iter().zip(&self.scopes) {
+            let Tab::Scope(tab) = tab else {
+                continue;
+            };
+            for kind in Kind::ALL {
+                if let Some(message) = slot.listing(kind).error {
+                    problems.push(format!(
+                        "{} {}: {message}",
+                        tab.scope.describe(),
+                        kind.noun()
+                    ));
+                }
+            }
+        }
+        problems
     }
 
     /// Whether any AKS read is in flight, for the spinner and the poll rate.

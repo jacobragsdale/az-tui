@@ -58,50 +58,6 @@ pub fn tabs(scopes: Vec<config::Tab>) -> Vec<Tab> {
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum TabId {
-    Secrets,
-    Registries,
-}
-
-impl TabId {
-    pub const ALL: [Self; 2] = [Self::Secrets, Self::Registries];
-
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Secrets => "Secrets",
-            Self::Registries => "Registries",
-        }
-    }
-
-    /// What the tab bar falls back to when the terminal is narrow.
-    #[must_use]
-    pub const fn short_label(self) -> &'static str {
-        match self {
-            Self::Secrets => "Sec",
-            Self::Registries => "Reg",
-        }
-    }
-
-    #[must_use]
-    pub const fn number(self) -> char {
-        match self {
-            Self::Secrets => '1',
-            Self::Registries => '2',
-        }
-    }
-
-    #[must_use]
-    pub const fn from_number(key: char) -> Option<Self> {
-        match key {
-            '1' => Some(Self::Secrets),
-            '2' => Some(Self::Registries),
-            _ => None,
-        }
-    }
-}
-
 /// Something on screen a click can land on.
 ///
 /// The shell keeps a `Vec<(Rect, Target)>` rebuilt every frame and resolves a
@@ -251,15 +207,6 @@ mod tests {
         assert_eq!(tabs[5].short_label(), "Reg");
         for tab in &tabs {
             assert!(tab.short_label().len() <= tab.label().len());
-        }
-    }
-
-    #[test]
-    fn a_tab_is_named_by_its_number_and_knows_a_short_name() {
-        assert_eq!(TabId::from_number('1'), Some(TabId::Secrets));
-        assert_eq!(TabId::from_number('3'), None);
-        for tab in TabId::ALL {
-            assert_eq!(TabId::from_number(tab.number()), Some(tab));
         }
     }
 }

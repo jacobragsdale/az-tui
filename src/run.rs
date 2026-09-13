@@ -138,7 +138,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
         .then(|| Instant::now().checked_add(every))
         .flatten();
 
-    let mut app = App::new(store);
+    let mut app = App::new(crate::app::screen::tabs(config.tabs()), store);
     // Before the first frame, so nothing is drawn in a layout that is about
     // to change.
     let session_path = paths::session_file();
@@ -177,7 +177,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
         // Everything the worker has said since the last frame.
         while let Some(event) = worker.try_recv() {
             let idle = matches!(event, crate::worker::Event::Idle);
-            let action = app.apply(event, Instant::now());
+            let action = app.apply_azure(event, Instant::now());
             if act(&mut app, &worker, action) {
                 return Ok(());
             }
@@ -198,8 +198,10 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
 
         // What has run out, and what the cursor has settled on long enough
         // to be worth asking about.
-        if let Some(request) = app.tick(Instant::now()) {
-            worker.send(request);
+        for action in app.tick(Instant::now()) {
+            if act(&mut app, &worker, action) {
+                return Ok(());
+            }
         }
 
         // The layout, once it has stopped moving.
