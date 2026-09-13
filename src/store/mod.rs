@@ -140,17 +140,18 @@ impl Store {
 
     /// The store as the last run left it.
     #[must_use]
-    pub fn from_cache(snapshot: Snapshot) -> Self {
+    pub fn from_cache(snapshot: &Snapshot) -> Self {
         Self {
             azure: AzureStore::from_cache(snapshot),
             scopes: Vec::new(),
         }
     }
 
-    /// What the next save writes.
+    /// What the next save writes. Empty until something has been read, and
+    /// then not worth a file.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        self.azure.snapshot()
+        Snapshot::new(self.azure.snapshot())
     }
 
     #[must_use]

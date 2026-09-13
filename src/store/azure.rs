@@ -6,11 +6,12 @@
 //! as [`Applied::Value`] for the screen that asked, which is the only field
 //! in the crate that keeps one.
 
-use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::azure::{Inventory, Manifest, Repository, Secret, SecretRow, SecretVersion, Tag};
-use crate::cache::Snapshot;
+use crate::cache::{CachedTab, Snapshot};
+use crate::config::{REGISTRIES_TAB, SECRETS_TAB};
 use crate::timestamp::Timestamp;
 use crate::worker::Event;
 
@@ -66,29 +67,53 @@ pub struct AzureStore {
 }
 
 impl AzureStore {
-    /// The store as the last run left it.
+    /// The store as the last run left it: the two azure tabs put back
+    /// together, either of which may be missing, stamped with the later of
+    /// their reads.
     #[must_use]
-    pub fn from_cache(snapshot: Snapshot) -> Self {
-        Self {
-            inventory: snapshot.inventory,
-            secrets: snapshot.secrets,
-            repositories: snapshot.repositories,
-            read_at: Some(snapshot.read_at),
-            ..Self::default()
+    pub fn from_cache(snapshot: &Snapshot) -> Self {
+        let mut store = Self::default();
+        if let Some(CachedTab::Secrets {
+            read_at,
+            vaults,
+            secrets,
+        }) = snapshot.tabs.get(SECRETS_TAB)
+        {
+            store.inventory.vaults.clone_from(vaults);
+            store.secrets.clone_from(secrets);
+            store.read_at = Some(*read_at);
         }
+        if let Some(CachedTab::Registries {
+            read_at,
+            registries,
+            repositories,
+        }) = snapshot.tabs.get(REGISTRIES_TAB)
+        {
+            store.inventory.registries.clone_from(registries);
+            store.repositories.clone_from(repositories);
+            store.read_at = store.read_at.max(Some(*read_at));
+        }
+        store
     }
 
-    /// What the next save writes. Rows a failed read left standing are in it:
-    /// yesterday's names beat no names, and the status bar says how old they
-    /// are.
+    /// What the next save writes: nothing until something has been read —
+    /// a first run with no login would otherwise write an empty cache
+    /// stamped now, which the subcommands would then trust for five minutes
+    /// and answer "nothing" from. Rows a failed read left standing are in
+    /// it: yesterday's names beat no names, and the status bar says how old
+    /// they are.
     #[must_use]
-    pub fn snapshot(&self) -> Snapshot {
-        Snapshot::new(
-            self.read_at.unwrap_or_else(Timestamp::now),
-            self.inventory.clone(),
-            self.secrets.clone(),
-            self.repositories.clone(),
-        )
+    pub fn snapshot(&self) -> BTreeMap<String, CachedTab> {
+        self.read_at.map_or_else(BTreeMap::new, |read_at| {
+            CachedTab::azure(
+                read_at,
+                self.inventory.clone(),
+                self.secrets.clone(),
+                self.repositories.clone(),
+            )
+            .into_iter()
+            .collect()
+        })
     }
 
     /// The first problem, for the status bar. `?` lists them all.

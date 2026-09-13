@@ -17,8 +17,8 @@ use crate::azure::transport::{Client, said};
 use crate::azure::{
     Inventory, Registry, Repository, SecretRow, Vault, acr, allowed, graph, missing, vault,
 };
-use crate::cache;
-use crate::config::Azure;
+use crate::cache::{self, CachedTab};
+use crate::config::{Azure, REGISTRIES_TAB, SECRETS_TAB};
 use crate::filter::Query;
 use crate::parallel;
 use crate::timestamp::Timestamp;
@@ -79,27 +79,32 @@ pub struct Context<'a> {
 }
 
 impl Context<'_> {
-    /// The inventory, from the cache when it is young enough and from Azure
-    /// otherwise. A command that has to be current passes `refresh`.
+    /// The inventory, from the cache when both azure tabs are young enough
+    /// and from Azure otherwise. A command that has to be current passes
+    /// `refresh`.
     fn inventory(&self, refresh: bool) -> Result<Inventory> {
-        if !refresh && let Some(snapshot) = self.snapshot() {
-            return Ok(snapshot.inventory);
+        if !refresh
+            && let Some(CachedTab::Secrets { vaults, .. }) = self.cached(SECRETS_TAB)
+            && let Some(CachedTab::Registries { registries, .. }) = self.cached(REGISTRIES_TAB)
+        {
+            return Ok(Inventory { vaults, registries });
         }
         graph::inventory(self.client, self.azure)
     }
 
-    /// The cache, if there is one and it is younger than the refresh
-    /// interval. Older than that and a shell command should go and look.
-    fn snapshot(&self) -> Option<cache::Snapshot> {
-        let snapshot = cache::load(self.cache?)?;
+    /// One tab of the cache, if there is one and it is younger than the
+    /// refresh interval. Older than that and a shell command should go and
+    /// look.
+    fn cached(&self, tab: &str) -> Option<CachedTab> {
+        let entry = cache::load(self.cache?)?.tabs.remove(tab)?;
         let stale_after = self.azure.refresh.unwrap_or(300);
         // `refresh = 0` turns the timer off in the TUI; from a shell it means
         // the cache never goes off by itself.
         if stale_after == 0 {
-            return Some(snapshot);
+            return Some(entry);
         }
-        let age = snapshot.read_at.seconds_until(Timestamp::now());
-        (age >= 0 && age.unsigned_abs() < stale_after).then_some(snapshot)
+        let age = entry.read_at().seconds_until(Timestamp::now());
+        (age >= 0 && age.unsigned_abs() < stale_after).then_some(entry)
     }
 }
 
@@ -379,17 +384,14 @@ fn read_secrets(
     only: &[String],
     refresh: bool,
 ) -> Result<(Vec<SecretRow>, Vec<String>), Failure> {
-    if !refresh && let Some(snapshot) = context.snapshot() {
-        let vaults = narrow(
-            snapshot.inventory.vaults,
-            &context.azure.vaults,
-            only,
-            "vault",
-            vault_name,
-        )?;
+    if !refresh
+        && let Some(CachedTab::Secrets {
+            vaults, secrets, ..
+        }) = context.cached(SECRETS_TAB)
+    {
+        let vaults = narrow(vaults, &context.azure.vaults, only, "vault", vault_name)?;
         let all = only.is_empty() && context.azure.vaults.is_empty();
-        let rows = snapshot
-            .secrets
+        let rows = secrets
             .into_iter()
             .filter(|row| all || vaults.iter().any(|vault| vault.name == row.vault))
             .collect();
@@ -421,17 +423,22 @@ fn read_repositories(
     only: &[String],
     refresh: bool,
 ) -> Result<(Vec<Repository>, Vec<String>), Failure> {
-    if !refresh && let Some(snapshot) = context.snapshot() {
+    if !refresh
+        && let Some(CachedTab::Registries {
+            registries,
+            repositories,
+            ..
+        }) = context.cached(REGISTRIES_TAB)
+    {
         let registries = narrow(
-            snapshot.inventory.registries,
+            registries,
             &context.azure.registries,
             only,
             "registry",
             registry_name,
         )?;
         let all = only.is_empty() && context.azure.registries.is_empty();
-        let rows = snapshot
-            .repositories
+        let rows = repositories
             .into_iter()
             .filter(|row| all || registries.iter().any(|held| held.name == row.registry))
             .collect();
@@ -944,13 +951,27 @@ mod tests {
         );
     }
 
+    /// One Azure read as the cache holds it: the two fixed tabs, no scopes.
+    fn azure_cache(
+        read_at: Timestamp,
+        inventory: crate::azure::Inventory,
+        secrets: Vec<SecretRow>,
+        repositories: Vec<Repository>,
+    ) -> cache::Snapshot {
+        cache::Snapshot::new(
+            CachedTab::azure(read_at, inventory, secrets, repositories)
+                .into_iter()
+                .collect(),
+        )
+    }
+
     #[test]
     fn a_cache_young_enough_is_read_instead_of_azure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.json");
         cache::save(
             &path,
-            &cache::Snapshot::new(
+            &azure_cache(
                 Timestamp::now(),
                 crate::azure::Inventory {
                     vaults: vec![Vault {
@@ -1030,7 +1051,7 @@ mod tests {
         let long_ago = Timestamp::parse("2020-01-01T00:00:00Z").unwrap();
         cache::save(
             &path,
-            &cache::Snapshot::new(
+            &azure_cache(
                 long_ago,
                 crate::azure::Inventory::default(),
                 Vec::new(),
@@ -1055,6 +1076,38 @@ mod tests {
         assert!(
             !transport.sent().is_empty(),
             "a stale cache is not an answer"
+        );
+    }
+
+    #[test]
+    fn a_cache_with_only_the_other_tab_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        let mut fresh = azure_cache(
+            Timestamp::now(),
+            crate::azure::Inventory::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        fresh.tabs.remove(SECRETS_TAB);
+        cache::save(&path, &fresh).unwrap();
+
+        let azure = serial();
+        let (client, transport, _) = fake_client([
+            inventory_answer(),
+            listing("kv-dev", &["a"]),
+            listing("kv-prod", &[]),
+        ]);
+        let context = Context {
+            azure: &azure,
+            client: &client,
+            cache: Some(&path),
+        };
+        let mut out = Vec::new();
+        secrets(&mut out, &context, None, &[], false, false).unwrap();
+        assert!(
+            !transport.sent().is_empty(),
+            "a registries-only cache says nothing about secrets"
         );
     }
 }

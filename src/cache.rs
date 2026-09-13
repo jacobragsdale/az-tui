@@ -1,52 +1,113 @@
 //! The snapshot the next start paints from, before any network call.
 //!
 //! Names and metadata only. **No value ever reaches this file**, and it
-//! cannot: the newtype a value lives in derives no `Serialize`, and this
-//! module cannot so much as name that type — a word-boundary grep for it over
-//! this file comes back empty. `SecretRow` is a different word: it carries a
-//! secret's name, not its value.
+//! cannot: the newtypes a value lives in derive no `Serialize`, and this
+//! module cannot so much as name those types — a word-boundary grep for
+//! either over this file comes back empty. `SecretRow` is a different word:
+//! it carries a secret's name, not its value. A pod carries names, statuses,
+//! images and owners; a configmap's data, a cluster secret's keys and a log
+//! line are types this file does not name either.
+//!
+//! One entry per tab, under the same key the session uses
+//! ([`crate::config::Tab::key`], [`SECRETS_TAB`], [`REGISTRIES_TAB`]). A tab
+//! nothing has read is not in the file.
 //!
 //! Names alone are mildly sensitive — `stripe-prod-key` says a good deal — so
 //! the file is written `0600` on unix.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::azure::{Inventory, Repository, SecretRow};
+use crate::azure::{Inventory, Registry, Repository, SecretRow, Vault};
+use crate::config::{REGISTRIES_TAB, SECRETS_TAB};
+use crate::kube::Pod;
 use crate::timestamp::Timestamp;
 
 /// The schema this build writes. A file of any other version is ignored
 /// rather than migrated: it is a cache, and the next refresh rewrites it.
-const VERSION: u32 = 1;
+/// 2 keyed the file by tab and merged aks-tui's pod lists in; a version-1
+/// file from either program is ignored, and the refresh behind the first
+/// frame rewrites it.
+const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Snapshot {
     version: u32,
-    pub read_at: Timestamp,
-    #[serde(flatten)]
-    pub inventory: Inventory,
-    pub secrets: Vec<SecretRow>,
-    pub repositories: Vec<Repository>,
+    pub tabs: BTreeMap<String, CachedTab>,
+}
+
+/// One tab's last read.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CachedTab {
+    Scope {
+        read_at: Timestamp,
+        pods: Vec<Pod>,
+    },
+    Secrets {
+        read_at: Timestamp,
+        vaults: Vec<Vault>,
+        secrets: Vec<SecretRow>,
+    },
+    Registries {
+        read_at: Timestamp,
+        registries: Vec<Registry>,
+        repositories: Vec<Repository>,
+    },
 }
 
 impl Snapshot {
     #[must_use]
-    pub fn new(
+    pub fn new(tabs: BTreeMap<String, CachedTab>) -> Self {
+        Self {
+            version: VERSION,
+            tabs,
+        }
+    }
+}
+
+impl CachedTab {
+    #[must_use]
+    pub const fn read_at(&self) -> Timestamp {
+        match self {
+            Self::Scope { read_at, .. }
+            | Self::Secrets { read_at, .. }
+            | Self::Registries { read_at, .. } => *read_at,
+        }
+    }
+
+    /// The two fixed tabs from one Azure read, keyed for the map. The
+    /// inventory is split between them; `AzureStore::from_cache` puts it
+    /// back together.
+    #[must_use]
+    pub fn azure(
         read_at: Timestamp,
         inventory: Inventory,
         secrets: Vec<SecretRow>,
         repositories: Vec<Repository>,
-    ) -> Self {
-        Self {
-            version: VERSION,
-            read_at,
-            inventory,
-            secrets,
-            repositories,
-        }
+    ) -> [(String, Self); 2] {
+        [
+            (
+                SECRETS_TAB.to_owned(),
+                Self::Secrets {
+                    read_at,
+                    vaults: inventory.vaults,
+                    secrets,
+                },
+            ),
+            (
+                REGISTRIES_TAB.to_owned(),
+                Self::Registries {
+                    read_at,
+                    registries: inventory.registries,
+                    repositories,
+                },
+            ),
+        ]
     }
 }
 
@@ -112,7 +173,7 @@ mod tests {
     use crate::timestamp::ts;
 
     fn snapshot() -> Snapshot {
-        Snapshot::new(
+        let mut tabs: BTreeMap<String, CachedTab> = CachedTab::azure(
             ts("2026-09-11T20:00:00Z"),
             Inventory {
                 vaults: vec![Vault {
@@ -138,6 +199,21 @@ mod tests {
             }],
             Vec::new(),
         )
+        .into_iter()
+        .collect();
+        tabs.insert(
+            "qa/dev".into(),
+            CachedTab::Scope {
+                read_at: ts("2026-09-11T20:00:05Z"),
+                pods: vec![crate::kube::tests::pod(
+                    "qa",
+                    "dev",
+                    "orders-api-7d9f5b-abc12",
+                    "Running",
+                )],
+            },
+        );
+        Snapshot::new(tabs)
     }
 
     #[test]
@@ -147,13 +223,35 @@ mod tests {
         save(&path, &snapshot()).unwrap();
 
         let read = load(&path).unwrap();
-        assert_eq!(read.read_at, ts("2026-09-11T20:00:00Z"));
-        assert_eq!(read.inventory.vaults[0].name, "kv-prod");
-        assert_eq!(read.secrets[0].name, "db-password");
         assert_eq!(
-            read.secrets[0].tags,
-            [("env".to_owned(), "prod".to_owned())]
+            read.tabs.keys().collect::<Vec<_>>(),
+            ["qa/dev", "registries", "secrets"]
         );
+        match &read.tabs["secrets"] {
+            CachedTab::Secrets {
+                read_at,
+                vaults,
+                secrets,
+            } => {
+                assert_eq!(*read_at, ts("2026-09-11T20:00:00Z"));
+                assert_eq!(vaults[0].name, "kv-prod");
+                assert_eq!(secrets[0].name, "db-password");
+                assert_eq!(secrets[0].tags, [("env".to_owned(), "prod".to_owned())]);
+            }
+            other => panic!("expected the secrets tab, got {other:?}"),
+        }
+        assert!(matches!(
+            &read.tabs["registries"],
+            CachedTab::Registries { registries, repositories, .. }
+                if registries.is_empty() && repositories.is_empty()
+        ));
+        match &read.tabs["qa/dev"] {
+            CachedTab::Scope { read_at, pods } => {
+                assert_eq!(*read_at, ts("2026-09-11T20:00:05Z"));
+                assert_eq!(pods[0].key.name, "orders-api-7d9f5b-abc12");
+            }
+            other => panic!("expected a scope tab, got {other:?}"),
+        }
     }
 
     #[test]
@@ -167,7 +265,7 @@ mod tests {
 
         let mut written: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&snapshot()).unwrap()).unwrap();
-        written["version"] = serde_json::json!(2);
+        written["version"] = serde_json::json!(VERSION + 1);
         std::fs::write(&path, written.to_string()).unwrap();
         assert!(load(&path).is_none(), "a version this build does not know");
     }
@@ -190,9 +288,12 @@ mod tests {
         save(&path, &snapshot()).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("db-password"), "the name is the point");
-        // The only `"value"`-shaped key a vault answer carries. It cannot
-        // reach here — the type it would come in is not serialisable — and
-        // this is the check that says so from the outside.
+        assert!(written.contains("orders-api-7d9f5b-abc12"), "so is a pod's");
+        // The only `"value"`-shaped key a vault answer carries, and the key a
+        // configmap or a cluster secret keeps its contents under. Neither can
+        // reach here — the types they would come in are not serialisable —
+        // and this is the check that says so from the outside.
         assert!(!written.contains("\"value\""), "{written}");
+        assert!(!written.contains("\"data\""), "{written}");
     }
 }

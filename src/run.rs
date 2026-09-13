@@ -120,7 +120,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     // painted from it rather than after it.
     let cache_path = paths::cache_file(cli.cache.as_deref());
     let store = match (cli.no_cache, cache::load(&cache_path)) {
-        (false, Some(snapshot)) => Store::from_cache(snapshot),
+        (false, Some(snapshot)) => Store::from_cache(&snapshot),
         _ => Store::default(),
     };
 
@@ -181,14 +181,13 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             if act(&mut app, &worker, action) {
                 return Ok(());
             }
-            // A store that has never read anything is not worth a file: a
-            // first run with no login would otherwise write an empty cache
-            // stamped now, which the subcommands would then trust for five
-            // minutes and answer "nothing" from.
+            // A store that has never read anything is not worth a file, and
+            // its snapshot is empty.
             if idle
                 && !cli.no_cache
-                && app.store.azure.read_at.is_some()
-                && let Err(error) = cache::save(&cache_path, &app.store.snapshot())
+                && let snapshot = app.store.snapshot()
+                && !snapshot.tabs.is_empty()
+                && let Err(error) = cache::save(&cache_path, &snapshot)
             {
                 // A cache that will not save is a slower next start, not a
                 // reason to stop.
