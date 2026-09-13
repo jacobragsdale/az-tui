@@ -1,6 +1,7 @@
 //! What a tab is, and what the shell may ask one to do.
 
 use crate::columns::ColumnId;
+use crate::filter::Env;
 use crate::worker;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -59,6 +60,8 @@ pub enum Target {
     Row(usize),
     /// A column header.
     Header(ColumnId),
+    /// One line of the Env header's menu: an environment, or `None` for all.
+    EnvOption(Option<Env>),
     SearchField,
     ClearSearch,
     Details,

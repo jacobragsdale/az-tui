@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use super::details::{
     field, link_field, pane_width, quiet, refused, render_pane, section, subtitle, title, with_hint,
 };
+use super::secrets::env_cell;
 use super::table::{Cell, TableSpec, render_list_table, table_geometry};
 use super::theme::theme;
 use super::widgets::{
@@ -171,6 +172,7 @@ fn repository_cells(
     columns
         .iter()
         .map(|column| match column.id {
+            ColumnId::Env => env_cell(&row.registry, base, highlighter),
             ColumnId::Registry => {
                 Cell::styled(row.registry.clone(), base).matched(highlighter.indices(&row.registry))
             }

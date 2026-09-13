@@ -44,6 +44,9 @@ pub const MIN_FLEXIBLE_WIDTH: u16 = 24;
 /// secret does.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ColumnId {
+    // Both flat tables open with this: the environment read off the vault's
+    // or the registry's name.
+    Env,
     // The Secrets table.
     Vault,
     Name,
@@ -140,7 +143,8 @@ impl ColumnSpec {
 impl ColumnId {
     /// Every column there is, which is what a key out of the session file is
     /// resolved against.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
+        Self::Env,
         Self::Vault,
         Self::Name,
         Self::Enabled,
@@ -159,6 +163,9 @@ impl ColumnId {
     #[must_use]
     pub const fn spec(self) -> ColumnSpec {
         match self {
+            // The `▾` says the header opens a menu rather than sorting; six
+            // cells so a sort arrow still fits beside it.
+            Self::Env => ColumnSpec::pinned("env", "Env \u{25be}", 6),
             Self::Vault => ColumnSpec::pinned("vault", "Vault", 12),
             Self::Name => ColumnSpec::flexible("name", "Name", MIN_FLEXIBLE_WIDTH),
             Self::Enabled => ColumnSpec::fixed("enabled", "Enabled", 7),
@@ -228,7 +235,10 @@ impl ColumnConfig {
 
 /// The Secrets table, in the order it opens with.
 pub const SECRET_COLUMNS: &[ColumnConfig] = &[
-    ColumnConfig::shown(ColumnId::Vault),
+    ColumnConfig::shown(ColumnId::Env),
+    // The vault's name is in the details pane; the environment is what the
+    // column is for.
+    ColumnConfig::hidden(ColumnId::Vault),
     ColumnConfig::shown(ColumnId::Name),
     ColumnConfig::shown(ColumnId::Enabled),
     ColumnConfig::shown(ColumnId::Expires),
@@ -239,7 +249,8 @@ pub const SECRET_COLUMNS: &[ColumnConfig] = &[
 
 /// The Registries table at its first level, one row per repository.
 pub const REPOSITORY_COLUMNS: &[ColumnConfig] = &[
-    ColumnConfig::shown(ColumnId::Registry),
+    ColumnConfig::shown(ColumnId::Env),
+    ColumnConfig::hidden(ColumnId::Registry),
     ColumnConfig::shown(ColumnId::Repository),
     ColumnConfig::shown(ColumnId::Tags),
     // Manifests sits where it belongs rather than at the end, so turning it
@@ -376,7 +387,7 @@ mod tests {
             let columns = layout.visible_columns(available);
             let visible = ids(&columns);
 
-            assert_eq!(visible[0], ColumnId::Vault, "the pinned columns stay");
+            assert_eq!(visible[0], ColumnId::Env, "the pinned columns stay");
             assert_eq!(visible[1], ColumnId::Name);
             assert!(
                 flexible_width(&columns, available) >= MIN_FLEXIBLE_WIDTH,
@@ -397,7 +408,7 @@ mod tests {
         assert_eq!(
             ids(&layout.visible_columns(TableLayout::available_width(158))),
             vec![
-                ColumnId::Vault,
+                ColumnId::Env,
                 ColumnId::Name,
                 ColumnId::Enabled,
                 ColumnId::Expires,
@@ -415,17 +426,17 @@ mod tests {
         let secrets = TableLayout::new(SECRET_COLUMNS);
         let cramped = TableLayout::available_width(MIN_WIDTH_INNER);
         let columns = secrets.visible_columns(cramped);
-        assert_eq!(ids(&columns), vec![ColumnId::Vault, ColumnId::Name]);
+        assert_eq!(ids(&columns), vec![ColumnId::Env, ColumnId::Name]);
         assert!(flexible_width(&columns, cramped) > 0);
 
         assert_eq!(
             ids(&secrets.visible_columns(0)),
-            vec![ColumnId::Vault, ColumnId::Name],
+            vec![ColumnId::Env, ColumnId::Name],
             "a table with no room at all still says what its rows are"
         );
         assert_eq!(
             ids(&TableLayout::new(REPOSITORY_COLUMNS).visible_columns(0)),
-            vec![ColumnId::Registry, ColumnId::Repository],
+            vec![ColumnId::Env, ColumnId::Repository],
         );
         // The tags table pins only its name, so it is the one that can be cut
         // back to a single column.
@@ -445,7 +456,7 @@ mod tests {
         assert_eq!(
             ids(&repositories.visible_columns(200)),
             vec![
-                ColumnId::Registry,
+                ColumnId::Env,
                 ColumnId::Repository,
                 ColumnId::Tags,
                 ColumnId::Updated,
@@ -453,8 +464,8 @@ mod tests {
             "Manifests and Created are offered, not opened with"
         );
         assert_eq!(
-            ids(&repositories.visible_columns(45)),
-            vec![ColumnId::Registry, ColumnId::Repository, ColumnId::Tags],
+            ids(&repositories.visible_columns(41)),
+            vec![ColumnId::Env, ColumnId::Repository, ColumnId::Tags],
             "Updated goes before the count that is the point of the row"
         );
 
@@ -488,7 +499,7 @@ mod tests {
         assert_eq!(
             ids(&layout.visible_columns(200)),
             vec![
-                ColumnId::Registry,
+                ColumnId::Env,
                 ColumnId::Repository,
                 ColumnId::Tags,
                 ColumnId::Manifests,
@@ -528,7 +539,7 @@ mod tests {
     fn the_flexible_column_fills_and_the_rest_are_what_they_say() {
         let columns = TableLayout::new(SECRET_COLUMNS).visible_columns(120);
         let constraints: Vec<_> = columns.into_iter().map(TableLayout::constraint).collect();
-        assert_eq!(constraints[0], Constraint::Length(12));
+        assert_eq!(constraints[0], Constraint::Length(6));
         assert_eq!(
             constraints[1],
             Constraint::Fill(1),

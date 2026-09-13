@@ -19,6 +19,7 @@ use secrets::SecretsScreen;
 use shell::{Focus, Shell};
 
 use crate::columns::{ColumnId, TableLayout};
+use crate::filter::{self, ENV_CHOICES, Env};
 use crate::session::{Session, SessionColumn};
 use crate::store::{Applied, Store};
 use crate::text_input::TextInput;
@@ -58,6 +59,19 @@ impl App {
         if self.shell.help_open {
             // The help takes every key: the one thing it can do is close.
             self.shell.help_open = false;
+            return AppAction::None;
+        }
+        if let Some(at) = self.shell.env_menu {
+            // The menu takes the keys that walk it; any other closes it.
+            let count = ENV_CHOICES.len();
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.shell.env_menu = Some((at + 1) % count),
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.shell.env_menu = Some((at + count - 1) % count);
+                }
+                KeyCode::Enter => self.choose_env(ENV_CHOICES[at]),
+                _ => self.shell.env_menu = None,
+            }
             return AppAction::None;
         }
         if self.shell.focus == Focus::Search {
@@ -133,6 +147,35 @@ impl App {
         }
     }
 
+    /// What that box says.
+    fn query(&self) -> &str {
+        match self.tab {
+            TabId::Secrets => self.secrets.input.text(),
+            TabId::Registries => self.registries.input().text(),
+        }
+    }
+
+    /// The environment the query is filtered to, for the menu's tick.
+    fn current_env(&self) -> Option<Env> {
+        filter::env_of_query(self.query())
+    }
+
+    /// A click on the Env header: the menu opens on the line the query is
+    /// already at.
+    fn open_env_menu(&mut self) {
+        let current = self.current_env();
+        self.shell.env_menu = ENV_CHOICES.iter().position(|held| *held == current);
+    }
+
+    /// A choice from the menu goes into the search box as `env:prod`, where
+    /// it can be seen, typed, and taken off with `Esc` like any filter.
+    fn choose_env(&mut self, env: Option<Env>) {
+        let input = self.input();
+        let text = filter::with_env(input.text(), env);
+        input.set_text(text);
+        self.shell.env_menu = None;
+    }
+
     /// `Esc` out of the table: the filter goes, and the table comes back
     /// whole. Says whether there was one to take off.
     fn clear_query(&mut self) -> bool {
@@ -165,7 +208,20 @@ impl App {
     pub fn handle_mouse(&mut self, event: MouseEvent) -> AppAction {
         let target = self.shell.hit(event.column, event.row).cloned();
         match event.kind {
+            MouseEventKind::Down(_) if self.shell.env_menu.take().is_some() => {
+                // The open menu takes the click: one of its lines chooses,
+                // anywhere else closes it and does nothing more.
+                if let Some(Target::EnvOption(env)) = target {
+                    self.choose_env(env);
+                }
+                AppAction::None
+            }
             MouseEventKind::Down(_) => match target {
+                Some(Target::Header(ColumnId::Env)) => {
+                    self.shell.focus = Focus::Table;
+                    self.open_env_menu();
+                    AppAction::None
+                }
                 Some(Target::Tab(tab)) => {
                     self.switch_to(tab);
                     AppAction::None
@@ -392,6 +448,12 @@ impl App {
             self.tab,
             millis,
         );
+        if let Some(highlighted) = self.shell.env_menu
+            && let Some(anchor) = self.shell.find(&Target::Header(ColumnId::Env))
+        {
+            let current = self.current_env();
+            ui::widgets::render_env_menu(frame, &mut self.shell, anchor, current, highlighted);
+        }
         if self.shell.help_open {
             ui::widgets::render_help(frame, &mut self.shell, area, self.tab, &self.store);
         }
@@ -645,6 +707,97 @@ mod tests {
         );
         app.registries.refilter(&app.store);
         assert_ne!(first(&app).unwrap(), was, "the newest tag is first again");
+    }
+
+    /// Draws one frame and hands back what it said.
+    fn draw(app: &mut App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame, 0)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_env_header_opens_a_menu_whose_choice_lands_in_the_search_box() {
+        let mut app = App::new(crate::app::secrets::tests::stocked());
+        app.secrets.input.set_text("db");
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("Env \u{25be}"), "{drawn}");
+        assert!(!drawn.contains("All"), "closed until asked for: {drawn}");
+        let header = app
+            .shell
+            .find(&Target::Header(ColumnId::Env))
+            .expect("the table drew an Env header");
+        app.handle_mouse(click(header.x, header.y));
+        assert_eq!(app.shell.env_menu, Some(0), "open, on All");
+        assert_eq!(app.secrets.sort, ColumnId::Name, "and it did not sort");
+        let drawn = draw(&mut app);
+        assert!(drawn.contains("\u{2713} All"), "{drawn}");
+        assert!(drawn.contains("  prod"), "{drawn}");
+        let prod = app
+            .shell
+            .find(&Target::EnvOption(Some(Env::Prod)))
+            .expect("a line for prod");
+        assert!(prod.y > header.y, "under the header");
+
+        // Down to prod and Enter: the filter is in the box, the menu is gone.
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.secrets.input.text(), "db env:prod");
+        assert_eq!(app.shell.env_menu, None);
+        app.secrets.refilter(&app.store);
+        assert!(
+            app.secrets
+                .visible()
+                .iter()
+                .all(|at| app.store.secrets[*at].vault == "kv-prod"),
+            "{:?}",
+            app.secrets.visible()
+        );
+
+        // Opened again it starts on prod; a click on a line chooses it, and
+        // a click anywhere else only closes it.
+        app.shell.begin_frame();
+        app.shell
+            .region(Rect::new(2, 2, 6, 1), Target::Header(ColumnId::Env));
+        app.handle_mouse(click(3, 2));
+        assert_eq!(app.shell.env_menu, Some(3));
+        app.shell
+            .region(Rect::new(2, 4, 6, 1), Target::EnvOption(None));
+        app.shell.region(Rect::new(2, 9, 20, 1), Target::Row(1));
+        app.handle_mouse(click(3, 9));
+        assert_eq!(app.shell.env_menu, None);
+        assert_eq!(
+            app.secrets.cursor.index, 0,
+            "the row under it was not taken"
+        );
+        assert_eq!(app.secrets.input.text(), "db env:prod");
+        app.handle_mouse(click(3, 2));
+        app.handle_mouse(click(3, 4));
+        assert_eq!(app.secrets.input.text(), "db", "All takes the filter off");
+
+        // Any other key closes it and is not otherwise acted on.
+        app.handle_mouse(click(3, 2));
+        assert!(app.shell.env_menu.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.shell.env_menu, None);
     }
 
     #[test]

@@ -17,7 +17,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 1;
+/// Bumped when a stored layout would read wrong: 2 hid the vault and
+/// registry columns behind the environment, which a version-1 file would
+/// have shown again.
+const VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
@@ -143,7 +146,7 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert!(Session::load(&path).tabs.is_empty());
 
-        std::fs::write(&path, r#"{"version":2,"tab":"secrets"}"#).unwrap();
+        std::fs::write(&path, r#"{"version":99,"tab":"secrets"}"#).unwrap();
         assert!(
             Session::load(&path).tab.is_none(),
             "a version this build does not know"
@@ -159,7 +162,7 @@ mod tests {
         let path = dir.path().join("session.json");
         std::fs::write(
             &path,
-            r#"{"version":1,"tab":"secrets","tabs":{"secrets":{"columns":[{"key":"from_the_future","width":9}]}}}"#,
+            r#"{"version":2,"tab":"secrets","tabs":{"secrets":{"columns":[{"key":"from_the_future","width":9}]}}}"#,
         )
         .unwrap();
         let read = Session::load(&path);

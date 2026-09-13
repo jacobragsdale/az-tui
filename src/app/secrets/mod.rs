@@ -16,7 +16,7 @@ use super::shell::{Focus, Shell};
 use super::{flip, none_last};
 use crate::azure::{Secret, SecretRow};
 use crate::columns::{ColumnId, SECRET_COLUMNS, TableLayout};
-use crate::filter::{self, Query, When};
+use crate::filter::{self, Env, Query, When};
 use crate::store::Store;
 use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
@@ -36,7 +36,7 @@ pub const REST: Duration = Duration::from_millis(150);
 
 /// The `key:` filters this tab knows. Everything else typed is a word.
 pub const SCHEMA: &[&str] = &[
-    "vault", "name", "type", "enabled", "managed", "expires", "tag",
+    "env", "vault", "name", "type", "enabled", "managed", "expires", "tag",
 ];
 
 /// What a row looks like to the search: every cell a person might type part
@@ -66,6 +66,9 @@ pub fn haystack(row: &SecretRow) -> String {
 pub fn passes(row: &SecretRow, query: &Query, now: Timestamp) -> bool {
     for (key, value) in &query.fields {
         let holds = match key.as_str() {
+            // Half-typed `env:p` names nothing yet and passes everything,
+            // like a boolean that is not yet a yes or a no.
+            "env" => Env::of(value).is_none_or(|want| Env::of(&row.vault) == Some(want)),
             "vault" => filter::contains(&row.vault, value),
             "name" => filter::contains(&row.name, value),
             "type" => row
@@ -181,6 +184,7 @@ pub fn sort(
     indices.sort_by(|a, b| {
         let (left, right) = (&rows[*a], &rows[*b]);
         let ordering = match by {
+            ColumnId::Env => none_last(Env::of(&left.vault), Env::of(&right.vault), descending),
             ColumnId::Vault => flip(
                 order
                     .get(left.vault.as_str())
@@ -846,4 +850,4 @@ impl SecretsScreen {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

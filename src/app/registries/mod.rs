@@ -16,14 +16,14 @@ use super::shell::{Focus, Shell};
 use super::{flip, none_last};
 use crate::azure::{Repository, Tag, acr};
 use crate::columns::{ColumnId, REPOSITORY_COLUMNS, TAG_COLUMNS, TableLayout};
-use crate::filter::{self, Query, When};
+use crate::filter::{self, Env, Query, When};
 use crate::store::Store;
 use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
 use crate::worker::Request;
 
 /// The `key:` filters the repository table knows.
-pub const REPOSITORY_SCHEMA: &[&str] = &["registry", "repo", "name", "updated", "created"];
+pub const REPOSITORY_SCHEMA: &[&str] = &["env", "registry", "repo", "name", "updated", "created"];
 /// The `key:` filters the tag table knows.
 pub const TAG_SCHEMA: &[&str] = &["tag", "name", "digest", "updated", "created"];
 /// How many tags the repository pane lists before it says how many more there
@@ -702,6 +702,7 @@ pub fn haystack(row: &Repository) -> String {
 #[must_use]
 pub fn repository_passes(row: &Repository, query: &Query, now: Timestamp) -> bool {
     query.fields.iter().all(|(key, value)| match key.as_str() {
+        "env" => Env::of(value).is_none_or(|want| Env::of(&row.registry) == Some(want)),
         "registry" => filter::contains(&row.registry, value),
         "repo" | "name" => filter::contains(&row.name, value),
         "updated" => When::parse(value).is_none_or(|when| when.holds(row.updated, now)),
@@ -730,6 +731,11 @@ pub fn sort_repositories(
     indices.sort_by(|a, b| {
         let (left, right) = (&rows[*a], &rows[*b]);
         let ordering = match by {
+            ColumnId::Env => none_last(
+                Env::of(&left.registry),
+                Env::of(&right.registry),
+                descending,
+            ),
             ColumnId::Registry => flip(left.registry.cmp(&right.registry), descending),
             ColumnId::Repository => flip(left.name.cmp(&right.name), descending),
             ColumnId::Tags => none_last(left.tag_count, right.tag_count, descending),

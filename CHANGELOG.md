@@ -14,6 +14,10 @@ The first version. Two tabs, read only.
   repository's tags; `y` and `Y` copy references that pull.
 - Literal search as you type, with a `key:value` grammar per tab. Forty
   thousand rows re-filter in about two milliseconds.
+- The first column of both tables is the environment — dev, qa or prod, read
+  off the vault's or registry's name — and clicking its header opens a menu
+  that sets or clears the `env:` filter. The vault and registry columns are
+  still in the layout, hidden.
 - Opens from a JSON cache of names and metadata — never values — and refreshes
   in the background, `parallel` vaults or repositories at a time (eight by
   default). The session remembers the tab, the sort and the

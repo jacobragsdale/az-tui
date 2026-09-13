@@ -46,6 +46,9 @@ pub enum Panes {
 pub struct Shell {
     pub focus: Focus,
     pub help_open: bool,
+    /// The Env header's menu, and which line of it the keys are on, while it
+    /// is open. One per app rather than per screen: only one table shows.
+    pub env_menu: Option<usize>,
     /// What the status bar says instead of the footer hint, until it expires.
     notification: Option<(String, Instant, Level)>,
     /// Rebuilt every frame; a click resolves against the last region that
@@ -98,6 +101,15 @@ impl Shell {
             .rev()
             .find(|(area, _)| area.contains((column, row).into()))
             .map(|(_, target)| target)
+    }
+
+    /// Where something was drawn this frame, for a menu that opens under it.
+    #[must_use]
+    pub fn find(&self, target: &Target) -> Option<Rect> {
+        self.regions
+            .iter()
+            .find(|(_, held)| held == target)
+            .map(|(area, _)| *area)
     }
 
     /// How the panes sit at this width.

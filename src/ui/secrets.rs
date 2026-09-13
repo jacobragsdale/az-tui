@@ -17,6 +17,7 @@ use crate::app::secrets::{Expiry, SCHEMA, SecretsScreen};
 use crate::app::shell::{Focus, Shell};
 use crate::azure::SecretRow;
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
+use crate::filter::Env;
 use crate::search::Query;
 use crate::store::Store;
 use crate::timestamp::{Timestamp, age};
@@ -302,6 +303,12 @@ fn stamp_line(
     }
 }
 
+/// The environment read off `name`, or a dash where it names none.
+pub fn env_cell(name: &str, base: Style, highlighter: &mut Query) -> Cell {
+    let env = Env::of(name).map_or("\u{2014}", Env::label);
+    Cell::styled(env.to_owned(), base).matched(highlighter.indices(env))
+}
+
 /// One row's cells, in the order the visible columns are in.
 fn row_cells(
     row: &SecretRow,
@@ -322,6 +329,7 @@ fn row_cells(
     columns
         .iter()
         .map(|column| match column.id {
+            ColumnId::Env => env_cell(&row.vault, base, highlighter),
             ColumnId::Vault => {
                 Cell::styled(row.vault.clone(), base).matched(highlighter.indices(&row.vault))
             }
@@ -438,9 +446,14 @@ mod tests {
         let store = stocked();
         let mut screen = SecretsScreen::default();
         let (drawn, _) = draw(120, 14, &mut screen, &store);
-        assert!(drawn.contains("Vault"), "{drawn}");
+        assert!(drawn.contains("Env"), "{drawn}");
         assert!(drawn.contains("Name"), "{drawn}");
         assert!(drawn.contains("3 · Name ↑"), "{drawn}");
+        assert!(
+            drawn.contains(" prod "),
+            "the environment, not the vault: {drawn}"
+        );
+        assert!(!drawn.contains("kv-prod     "), "{drawn}");
         let lines: Vec<&str> = drawn.lines().collect();
         let db = lines
             .iter()
@@ -482,12 +495,14 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let muted = theme().muted;
+        // By name then the inventory's order, kv-prod's db-password is the
+        // last row that says db-password.
         let row = (0..buffer.area.height)
-            .find(|y| {
+            .rfind(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, *y)].symbol())
                     .collect::<String>()
-                    .contains("kv-prod")
+                    .contains("db-password")
             })
             .expect("a kv-prod row");
         let painted: Vec<_> = (3..12).map(|x| buffer[(x, row)].fg).collect();
@@ -516,7 +531,7 @@ mod tests {
                 _ => None,
             })
             .expect("a header region");
-        assert_eq!(header, ColumnId::Vault);
+        assert_eq!(header, ColumnId::Env);
     }
 
     #[test]
@@ -644,7 +659,7 @@ mod tests {
         let store = stocked();
         let mut screen = SecretsScreen::default();
         let (drawn, _) = draw(46, 12, &mut screen, &store);
-        assert!(drawn.contains("Vault"), "{drawn}");
+        assert!(drawn.contains("Env"), "{drawn}");
         assert!(drawn.contains("Name"), "{drawn}");
         assert!(drawn.contains("db-password"), "{drawn}");
     }

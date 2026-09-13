@@ -427,9 +427,9 @@ mod tests {
 
     fn secrets() -> Vec<Vec<Cell>> {
         vec![
-            row(&["kv-prod", "db-password", "\u{2713}", "12d", "2h"]),
-            row(&["kv-prod", "signing-key", "\u{2717}", "\u{2014}", "3d"]),
-            row(&["kv-dev", "db-password", "\u{2713}", "\u{2014}", "1y"]),
+            row(&["prod", "db-password", "\u{2713}", "12d", "2h"]),
+            row(&["prod", "signing-key", "\u{2717}", "\u{2014}", "3d"]),
+            row(&["dev", "db-password", "\u{2713}", "\u{2014}", "1y"]),
         ]
     }
 
@@ -485,14 +485,14 @@ mod tests {
         assert!(drawn.contains(" Secrets "), "{drawn}");
         assert!(drawn.contains("3/412 \u{b7} Name \u{2191}"), "{drawn}");
         assert!(drawn.contains("Name \u{2191}"), "the sorted header {drawn}");
-        assert!(drawn.contains("Vault"), "{drawn}");
+        assert!(drawn.contains("Env"), "{drawn}");
         assert!(drawn.contains("db-password"), "{drawn}");
         assert_eq!(
             hits.headers
                 .iter()
                 .map(|(column, _)| column.key())
                 .collect::<Vec<_>>(),
-            vec!["vault", "name", "enabled", "expires", "updated"],
+            vec!["env", "name", "enabled", "expires", "updated"],
         );
         assert_eq!(
             hits.rows
@@ -502,11 +502,11 @@ mod tests {
             vec![0, 1, 2],
         );
         // The header cell a click lands on is over the column it names.
-        let (_, vault) = hits.headers[0];
+        let (_, env) = hits.headers[0];
         assert_eq!(
-            buffer[(vault.x, hits.rows[0].1.y)].symbol(),
-            "k",
-            "the Vault header sits over the vault names"
+            buffer[(env.x, hits.rows[0].1.y)].symbol(),
+            "p",
+            "the Env header sits over the environments"
         );
         assert_eq!(
             cursor.scroll.viewport, 6,

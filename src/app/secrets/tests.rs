@@ -177,7 +177,11 @@ fn a_stamp_that_is_not_set_sorts_last_whichever_way_the_sort_points() {
 fn only_the_columns_on_screen_can_be_sorted_by() {
     let layout = TableLayout::new(SECRET_COLUMNS);
     let wide = sortable(&layout, 200);
-    assert!(wide.contains(&ColumnId::Vault));
+    assert!(wide.contains(&ColumnId::Env));
+    assert!(
+        !wide.contains(&ColumnId::Vault),
+        "the vault is hidden behind its environment"
+    );
     assert!(wide.contains(&ColumnId::Name));
     assert!(
         !wide.contains(&ColumnId::Type),
@@ -187,12 +191,12 @@ fn only_the_columns_on_screen_can_be_sorted_by() {
     let narrow = sortable(&layout, 30);
     assert!(narrow.len() < wide.len(), "{narrow:?}");
     assert!(
-        narrow.contains(&ColumnId::Name) && narrow.contains(&ColumnId::Vault),
+        narrow.contains(&ColumnId::Name) && narrow.contains(&ColumnId::Env),
         "the pinned columns survive any width: {narrow:?}"
     );
 }
 
-fn stocked() -> Store {
+pub(crate) fn stocked() -> Store {
     use crate::azure::{Inventory, Vault};
     let vault = |name: &str| Vault {
         id: format!("/vaults/{name}"),

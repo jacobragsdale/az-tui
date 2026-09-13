@@ -131,6 +131,86 @@ pub fn tag_matches(tags: &[(String, String)], filter: &str) -> bool {
     }
 }
 
+/// The environment a vault's or a registry's name says it is in: what the
+/// first column of both tables shows and what `env:` filters by.
+///
+// ponytail: read off the name — `kv-prod`, `acrdev` — because that is how
+// the names are cut and nothing else says. An `[env]` table in config.toml
+// mapping names to environments is the upgrade if somebody's names do not.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Env {
+    Dev,
+    Qa,
+    Prod,
+}
+
+impl Env {
+    /// Every environment, in the order the tables sort them.
+    pub const ALL: [Self; 3] = [Self::Dev, Self::Qa, Self::Prod];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Qa => "qa",
+            Self::Prod => "prod",
+        }
+    }
+
+    /// The environment `name` names last, ignoring case: `kv-devops-prod` is
+    /// prod, because the environment is the suffix by every convention this
+    /// has met. A name naming none is none.
+    #[must_use]
+    pub fn of(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .filter_map(|env| rfind_ignore_case(name, env.label()).map(|at| (at, env)))
+            .max_by_key(|(at, _)| *at)
+            .map(|(_, env)| env)
+    }
+}
+
+fn rfind_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .rposition(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// What the Env header's menu offers, in the order it lists them: everything,
+/// then each environment.
+pub const ENV_CHOICES: [Option<Env>; 4] = [None, Some(Env::Dev), Some(Env::Qa), Some(Env::Prod)];
+
+/// The `env:` filter in a query, if it names an environment.
+#[must_use]
+pub fn env_of_query(raw: &str) -> Option<Env> {
+    raw.split_whitespace()
+        .filter_map(|token| token.split_once(':'))
+        .rfind(|(key, _)| key.eq_ignore_ascii_case("env"))
+        .and_then(|(_, value)| Env::of(value))
+}
+
+/// The same query with its `env:` filter replaced — or taken off, for `None`.
+/// What the menu writes into the search box, so its choice is visible there
+/// and comes off with `Esc` like any other filter.
+#[must_use]
+pub fn with_env(raw: &str, env: Option<Env>) -> String {
+    let mut tokens: Vec<&str> = raw
+        .split_whitespace()
+        .filter(|token| {
+            !token
+                .split_once(':')
+                .is_some_and(|(key, _)| key.eq_ignore_ascii_case("env"))
+        })
+        .collect();
+    let token;
+    if let Some(env) = env {
+        token = format!("env:{}", env.label());
+        tokens.push(&token);
+    }
+    tokens.join(" ")
+}
+
 /// Whether a cell contains what was asked for, ignoring case. The shape
 /// every plain `key:` filter takes.
 #[must_use]
@@ -236,6 +316,36 @@ mod tests {
         assert!(tag_matches(&tags, "env=PROD"));
         assert!(!tag_matches(&tags, "env=qa"));
         assert!(!tag_matches(&tags, "team"));
+    }
+
+    #[test]
+    fn an_environment_is_read_off_the_end_of_a_name() {
+        assert_eq!(Env::of("kv-prod"), Some(Env::Prod));
+        assert_eq!(Env::of("ACRDEV"), Some(Env::Dev));
+        assert_eq!(Env::of("kv-qa-eastus"), Some(Env::Qa));
+        assert_eq!(
+            Env::of("kv-devops-prod"),
+            Some(Env::Prod),
+            "the last one named"
+        );
+        assert_eq!(Env::of("kv-shared"), None);
+    }
+
+    #[test]
+    fn the_menu_rewrites_the_env_token_and_leaves_the_rest_of_the_query_alone() {
+        assert_eq!(
+            with_env("db-pass env:dev enabled:no", Some(Env::Prod)),
+            "db-pass enabled:no env:prod"
+        );
+        assert_eq!(with_env("db-pass ENV:dev", None), "db-pass");
+        assert_eq!(with_env("", Some(Env::Qa)), "env:qa");
+        assert_eq!(env_of_query("db-pass env:dev env:prod"), Some(Env::Prod));
+        assert_eq!(
+            env_of_query("db-pass env:p"),
+            None,
+            "half-typed is nothing yet"
+        );
+        assert_eq!(env_of_query("vault:kv-prod"), None);
     }
 
     #[test]

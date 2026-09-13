@@ -11,6 +11,7 @@ use super::theme::theme;
 use crate::app::keys;
 use crate::app::screen::{TabId, Target};
 use crate::app::shell::{Focus, Level, Panes, Shell};
+use crate::filter::{ENV_CHOICES, Env};
 use crate::store::{Store, problem_line};
 use crate::text_input::{TextInput, field_window};
 use crate::timestamp::Timestamp;
@@ -21,8 +22,8 @@ const SPINNER: [char; 4] = ['◐', '◓', '◑', '◒'];
 /// What each table's search row says before anything is typed. The grammar
 /// differs per table, and a placeholder naming another table's keys is a
 /// worked example of something that will not match.
-pub const SECRETS_PLACEHOLDER: &str = "Type / to search, or vault:kv-prod enabled:no expires:<30d";
-pub const REPOSITORIES_PLACEHOLDER: &str = "Type / to search, or registry:acrprod updated:<30d";
+pub const SECRETS_PLACEHOLDER: &str = "Type / to search, or env:prod enabled:no expires:<30d";
+pub const REPOSITORIES_PLACEHOLDER: &str = "Type / to search, or env:prod updated:<30d";
 pub const TAGS_PLACEHOLDER: &str = "Type / to search, or tag:1.4 digest:ab12 updated:<30d";
 
 /// The `key:value` filters each table takes, for the help. The README is
@@ -31,12 +32,12 @@ const FILTERS: &[(TabId, &str, &str)] = &[
     (
         TabId::Secrets,
         "Filters",
-        "vault: name: type: enabled:yes|no managed:yes|no tag:key=value expires:<30d|>30d|none|expired",
+        "env:dev|qa|prod vault: name: type: enabled:yes|no managed:yes|no tag:key=value expires:<30d|>30d|none|expired",
     ),
     (
         TabId::Registries,
         "Filters",
-        "registry: repo: updated:<30d|>30d created:<30d|>30d",
+        "env:dev|qa|prod registry: repo: updated:<30d|>30d created:<30d|>30d",
     ),
     (
         TabId::Registries,
@@ -404,6 +405,61 @@ pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, tab: TabId,
     frame.render_widget(paragraph, inner);
 }
 
+/// The Env header's menu, under the header that was clicked: every
+/// environment and `All`, with a tick on the one the query has now and the
+/// keys' line lit. Drawn last so it sits over whichever pane is under it.
+pub fn render_env_menu(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    anchor: Rect,
+    current: Option<Env>,
+    highlighted: usize,
+) {
+    let palette = theme();
+    let lines = u16::try_from(ENV_CHOICES.len()).unwrap_or(u16::MAX);
+    // One cell left of the header, so the labels line up under it.
+    let area = Rect::new(
+        anchor.x.saturating_sub(1),
+        anchor.y.saturating_add(1),
+        8,
+        lines.saturating_add(2),
+    )
+    .intersection(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(palette.border_type)
+        .border_style(Style::default().fg(palette.border_focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    for (at, choice) in ENV_CHOICES.iter().enumerate() {
+        let y = inner
+            .y
+            .saturating_add(u16::try_from(at).unwrap_or(u16::MAX));
+        if y >= inner.bottom() {
+            break;
+        }
+        let line = Rect::new(inner.x, y, inner.width, 1);
+        let mark = if *choice == current {
+            "\u{2713} "
+        } else {
+            "  "
+        };
+        let label = choice.map_or("All", Env::label);
+        let mut style = Style::default().fg(palette.text);
+        if at == highlighted {
+            style = style
+                .bg(palette.selected_background)
+                .add_modifier(Modifier::BOLD);
+        }
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("{mark}{label}"), style)),
+            line,
+        );
+        shell.region(line, Target::EnvOption(*choice));
+    }
+}
+
 /// A one-character scrollbar down the right edge of a pane, drawn only when
 /// there is more content than viewport.
 pub fn render_scrollbar(
@@ -550,8 +606,8 @@ mod tests {
                 REPOSITORIES_PLACEHOLDER,
             );
         });
-        assert!(drawn.contains("registry:acrprod"), "{drawn}");
-        assert!(!drawn.contains("vault:"), "{drawn}");
+        assert!(drawn.contains("env:prod updated:"), "{drawn}");
+        assert!(!drawn.contains("enabled:"), "{drawn}");
     }
 
     #[test]
@@ -734,6 +790,36 @@ mod tests {
         });
         assert!(drawn.contains("registries"), "{drawn}");
         assert!(!drawn.contains("secrets"), "{drawn}");
+    }
+
+    #[test]
+    fn the_env_menu_lists_every_choice_under_the_header_and_each_takes_a_click() {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_env_menu(frame, &mut shell, Rect::new(3, 2, 6, 1), Some(Env::Qa), 3);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let drawn: String = (0..12)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drawn.contains("  All"), "{drawn}");
+        assert!(
+            drawn.contains("\u{2713} qa"),
+            "the one the query has: {drawn}"
+        );
+        assert!(drawn.contains("  prod"), "{drawn}");
+        assert_eq!(shell.hit(4, 4), Some(&Target::EnvOption(None)));
+        assert_eq!(shell.hit(4, 7), Some(&Target::EnvOption(Some(Env::Prod))));
+        assert_eq!(
+            buffer[(4, 7)].bg,
+            theme().selected_background,
+            "the keys' line is lit"
+        );
     }
 
     #[test]

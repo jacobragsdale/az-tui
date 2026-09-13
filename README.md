@@ -11,11 +11,11 @@ the same stack (Rust, ratatui, crossterm), the same layout, the same keys.
  1 Secrets ⚠ 3 2 Registries                                                                                           ?
 / db-pass                                                                                                             ×
 ╭ Secrets ───────────────────────────────────────────────────────╮╭ Details ───────────────────────────────────────────╮
-│  Vault        Name ↑                         Enabled Expires   ││db-password                                         │
+│  Env ▾  Name ↑                               Enabled Expires   ││db-password                                         │
 │────────────────────────────────────────────────────────────────││kv-prod · secret · enabled · 2 versions             │
-│› kv-prod     db-password                     ✓       —        ││                                                    │
-│  kv-qa       db-password                     ✓       —        ││Value         ••••••••                         v · y│
-│  kv-dev      db-password                     ✓       12d      ││Content type  text/plain                            │
+│› prod   db-password                           ✓       —        ││                                                    │
+│  qa     db-password                           ✓       —        ││Value         ••••••••                         v · y│
+│  dev    db-password                           ✓       12d      ││Content type  text/plain                            │
 │                                                                ││Expires       —                                     │
 │                                                                ││Created       2026-03-01 · 6mo                      │
 │                                                                ││Updated       2026-09-08 · 3d                       │
@@ -34,7 +34,7 @@ the same stack (Rust, ratatui, crossterm), the same layout, the same keys.
   from Azure in the background. Secret values are never cached, logged or
   written anywhere.
 - **Searches literally, as you type**, across every vault or registry at once:
-  `db-pass`, `vault:kv-prod enabled:no`, `expires:<30d`. Forty thousand rows
+  `db-pass`, `env:prod enabled:no`, `expires:<30d`. Forty thousand rows
   re-filter in about two milliseconds.
 - **`y` copies a secret's value without showing it**; `v` shows it for sixty
   seconds. On an image, `y` copies `acrprod.azurecr.io/payments-api:1.42.0`
@@ -144,12 +144,17 @@ A word of the form `key:value` is a filter when the tab knows the key, and an
 ordinary word otherwise (so `https://kv-prod` searches for itself). Filters
 and words are all ANDed.
 
-**Secrets:** `vault:` `name:` `type:` (content type) `enabled:yes|no`
+**Secrets:** `env:dev|qa|prod` `vault:` `name:` `type:` (content type) `enabled:yes|no`
 `managed:yes|no` `tag:key` `tag:key=value`
 `expires:<30d | >30d | none | expired`
 
-**Registries:** `registry:` `repo:`/`name:` `updated:<30d` `created:<30d`, and
+**Registries:** `env:dev|qa|prod` `registry:` `repo:`/`name:` `updated:<30d` `created:<30d`, and
 inside a repository `tag:`/`name:` `digest:` `updated:` `created:`
+
+The first column of both tables is the environment, read off the end of the
+vault's or registry's name: `kv-prod` and `acrprod` are prod. Clicking its
+header opens a menu — All, dev, qa, prod — whose choice writes or clears the
+`env:` filter in the search box, so `Esc` takes it off like any other.
 
 A bare number of days means `<`, so `expires:30d` reads the way you meant it.
 A filter whose value makes no sense is ignored rather than matching nothing,
