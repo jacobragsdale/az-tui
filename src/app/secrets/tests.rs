@@ -196,7 +196,7 @@ fn only_the_columns_on_screen_can_be_sorted_by() {
     );
 }
 
-pub(crate) fn stocked() -> Store {
+pub(crate) fn stocked() -> AzureStore {
     use crate::azure::{Inventory, Vault};
     let vault = |name: &str| Vault {
         id: format!("/vaults/{name}"),
@@ -205,7 +205,7 @@ pub(crate) fn stocked() -> Store {
         location: "eastus".into(),
         uri: format!("https://{name}.vault.azure.net/"),
     };
-    let mut store = Store::default();
+    let mut store = AzureStore::default();
     store.apply(crate::worker::Event::Inventory(Ok(Inventory {
         vaults: vec![vault("kv-dev"), vault("kv-prod")],
         registries: Vec::new(),
@@ -221,7 +221,7 @@ pub(crate) fn stocked() -> Store {
     store
 }
 
-fn shown(screen: &SecretsScreen, store: &Store) -> Vec<String> {
+fn shown(screen: &SecretsScreen, store: &AzureStore) -> Vec<String> {
     screen
         .visible()
         .iter()
@@ -332,7 +332,7 @@ fn s_walks_the_columns_and_a_header_click_cycles_one() {
 fn filters_forty_thousand_rows_between_keystrokes() {
     use crate::azure::{Inventory, Vault};
     let vaults: Vec<String> = (0..8).map(|n| format!("kv-{n}")).collect();
-    let mut store = Store::default();
+    let mut store = AzureStore::default();
     store.apply(crate::worker::Event::Inventory(Ok(Inventory {
         vaults: vaults
             .iter()
@@ -389,7 +389,12 @@ fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
 }
 
-fn press(screen: &mut SecretsScreen, shell: &mut Shell, store: &Store, code: char) -> AppAction {
+fn press(
+    screen: &mut SecretsScreen,
+    shell: &mut Shell,
+    store: &AzureStore,
+    code: char,
+) -> AppAction {
     screen.handle_key(shell, store, key(crossterm::event::KeyCode::Char(code)))
 }
 
@@ -728,7 +733,7 @@ fn the_wheel_after_a_shrinking_refresh_does_not_turn_the_window_inside_out() {
     use crate::azure::Inventory;
     use crate::worker::Event;
 
-    let mut store = Store::default();
+    let mut store = AzureStore::default();
     store.apply(Event::Inventory(Ok(Inventory {
         vaults: vec![crate::azure::Vault {
             id: "/vaults/kv-dev".into(),

@@ -17,7 +17,7 @@ use super::{flip, none_last};
 use crate::azure::{Repository, Tag, acr};
 use crate::columns::{ColumnId, REPOSITORY_COLUMNS, TAG_COLUMNS, TableLayout};
 use crate::filter::{self, Env, Query, When};
-use crate::store::Store;
+use crate::store::AzureStore;
 use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
 use crate::worker::Request;
@@ -152,7 +152,7 @@ impl RegistriesScreen {
     }
 
     #[must_use]
-    pub fn selected_repository<'a>(&self, store: &'a Store) -> Option<&'a Repository> {
+    pub fn selected_repository<'a>(&self, store: &'a AzureStore) -> Option<&'a Repository> {
         store
             .repositories
             .get(*self.visible.get(self.repositories.cursor.index)?)
@@ -170,13 +170,13 @@ impl RegistriesScreen {
 
     /// The open repository's tags, as the store holds them.
     #[must_use]
-    pub fn tags_of<'a>(&self, store: &'a Store) -> Option<&'a Result<Vec<Tag>, String>> {
+    pub fn tags_of<'a>(&self, store: &'a AzureStore) -> Option<&'a Result<Vec<Tag>, String>> {
         let (registry, repo) = self.open_repository()?;
         store.tags.get(&(registry.to_owned(), repo.to_owned()))
     }
 
     #[must_use]
-    pub fn selected_tag<'a>(&self, store: &'a Store) -> Option<&'a Tag> {
+    pub fn selected_tag<'a>(&self, store: &'a AzureStore) -> Option<&'a Tag> {
         let Ok(tags) = self.tags_of(store)? else {
             return None;
         };
@@ -195,12 +195,12 @@ impl RegistriesScreen {
     }
 
     /// Rebuilds whichever table is on screen. Cheap to call every frame.
-    pub fn refilter(&mut self, store: &Store) {
+    pub fn refilter(&mut self, store: &AzureStore) {
         self.refilter_repositories(store);
         self.refilter_tags(store);
     }
 
-    fn refilter_repositories(&mut self, store: &Store) {
+    fn refilter_repositories(&mut self, store: &AzureStore) {
         let order_key = (
             self.repositories.sort,
             self.repositories.descending,
@@ -245,7 +245,7 @@ impl RegistriesScreen {
         self.repositories.cursor.clamp(self.visible.len());
     }
 
-    fn refilter_tags(&mut self, store: &Store) {
+    fn refilter_tags(&mut self, store: &AzureStore) {
         let Some(Ok(tags)) = self.tags_of(store) else {
             self.tag_visible.clear();
             self.tag_built_for = None;
@@ -277,7 +277,7 @@ impl RegistriesScreen {
     }
 
     /// `Enter`: the table becomes that repository's tags.
-    fn open_tags(&mut self, store: &Store) -> AppAction {
+    fn open_tags(&mut self, store: &AzureStore) -> AppAction {
         let Some(repository) = self.selected_repository(store) else {
             return AppAction::None;
         };
@@ -311,7 +311,7 @@ impl RegistriesScreen {
 
     /// One turn of the clock: what the cursor has settled on long enough to
     /// be worth asking about.
-    pub fn tick(&mut self, store: &Store, now: Instant) -> Option<Request> {
+    pub fn tick(&mut self, store: &AzureStore, now: Instant) -> Option<Request> {
         let here = self.table().cursor.index;
         match self.rested {
             Some((at, since)) if at == here => {
@@ -371,7 +371,7 @@ impl RegistriesScreen {
 
     /// What the bottom border says.
     #[must_use]
-    pub fn status(&self, store: &Store) -> String {
+    pub fn status(&self, store: &AzureStore) -> String {
         let arrow = if self.table().descending {
             "↓"
         } else {
@@ -424,14 +424,14 @@ impl RegistriesScreen {
     }
 
     #[must_use]
-    pub fn cursor_identity(&self, store: &Store) -> Option<(String, String)> {
+    pub fn cursor_identity(&self, store: &AzureStore) -> Option<(String, String)> {
         self.selected_repository(store)
             .map(|row| (row.registry.clone(), row.name.clone()))
     }
 
     /// After a refresh: back onto the same repository, and out of a
     /// repository that has gone.
-    pub fn keep_cursor(&mut self, store: &Store, was: Option<(String, String)>) {
+    pub fn keep_cursor(&mut self, store: &AzureStore, was: Option<(String, String)>) {
         self.refilter(store);
         if let Level::Tags { registry, repo } = self.level.clone()
             && !store
@@ -505,7 +505,7 @@ impl RegistriesScreen {
     pub fn handle_key(
         &mut self,
         shell: &mut Shell,
-        store: &Store,
+        store: &AzureStore,
         key: crossterm::event::KeyEvent,
     ) -> AppAction {
         use crossterm::event::KeyCode;
@@ -554,7 +554,7 @@ impl RegistriesScreen {
     fn acting_key(
         &mut self,
         shell: &mut Shell,
-        store: &Store,
+        store: &AzureStore,
         key: crossterm::event::KeyEvent,
     ) -> AppAction {
         use crossterm::event::KeyCode;
@@ -575,7 +575,7 @@ impl RegistriesScreen {
     /// `y` and `Y`. At the repository level both copy the reference that
     /// pulls `latest`; at the tag level `y` is the tag and `Y` is the digest,
     /// which is the one that names a build rather than a moving label.
-    fn copy(&self, store: &Store, digest: bool) -> AppAction {
+    fn copy(&self, store: &AzureStore, digest: bool) -> AppAction {
         match &self.level {
             Level::Repositories => {
                 let Some(repository) = self.selected_repository(store) else {
@@ -613,7 +613,7 @@ impl RegistriesScreen {
         }
     }
 
-    fn open_in_portal(&self, shell: &mut Shell, store: &Store) -> AppAction {
+    fn open_in_portal(&self, shell: &mut Shell, store: &AzureStore) -> AppAction {
         let registry = match &self.level {
             Level::Repositories => self
                 .selected_repository(store)
@@ -633,7 +633,7 @@ impl RegistriesScreen {
     pub fn handle_click(
         &mut self,
         _shell: &mut Shell,
-        _store: &Store,
+        _store: &AzureStore,
         target: Target,
     ) -> AppAction {
         match target {
@@ -670,7 +670,7 @@ impl RegistriesScreen {
 
     /// Nothing about a registry is urgent, so no badge.
     #[must_use]
-    pub const fn badge(&self, _store: &Store) -> Option<String> {
+    pub const fn badge(&self, _store: &AzureStore) -> Option<String> {
         None
     }
 

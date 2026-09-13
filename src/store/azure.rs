@@ -2,7 +2,7 @@
 //! anything.
 //!
 //! The store holds rows and problems. It does not hold a value: an
-//! `Event::Value` passes straight through [`Store::apply`] and comes back out
+//! `Event::Value` passes straight through [`AzureStore::apply`] and comes back out
 //! as [`Applied::Value`] for the screen that asked, which is the only field
 //! in the crate that keeps one.
 
@@ -37,7 +37,7 @@ pub enum Applied {
 }
 
 #[derive(Default)]
-pub struct Store {
+pub struct AzureStore {
     pub inventory: Inventory,
     /// Every vault's secrets, concatenated in the inventory's order.
     pub secrets: Vec<SecretRow>,
@@ -65,7 +65,7 @@ pub struct Store {
     read_something: bool,
 }
 
-impl Store {
+impl AzureStore {
     /// The store as the last run left it.
     #[must_use]
     pub fn from_cache(snapshot: Snapshot) -> Self {
@@ -342,8 +342,8 @@ mod tests {
         }
     }
 
-    fn stocked() -> Store {
-        let mut store = Store::default();
+    fn stocked() -> AzureStore {
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory {
             vaults: vec![vault("kv-a"), vault("kv-b")],
             registries: vec![registry("acra")],
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn rows_landing_in_any_order_read_in_the_inventorys_order() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory {
             vaults: vec![vault("kv-a"), vault("kv-b"), vault("kv-c")],
             registries: Vec::new(),
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn the_spinner_turns_from_the_first_word_of_a_refresh() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Progress("reading the subscription…".into()));
         assert!(store.refreshing, "before the inventory has landed");
         store.apply(Event::Inventory(Err("not signed in".into())));
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn idle_stamps_the_read_and_progress_says_what_is_happening() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory::default())));
         assert!(store.refreshing);
         store.apply(Event::Progress("reading kv-a (1/2)…".into()));
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn a_refresh_that_read_nothing_does_not_claim_the_rows_are_new() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Err("not signed in".into())));
         store.apply(Event::Idle);
         assert!(

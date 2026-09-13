@@ -186,7 +186,7 @@ impl App {
     }
 
     fn screen_key(&mut self, key: KeyEvent) -> AppAction {
-        let store = &self.store;
+        let store = &self.store.azure;
         match self.tab {
             TabId::Secrets => self.secrets.handle_key(&mut self.shell, store, key),
             TabId::Registries => self.registries.handle_key(&mut self.shell, store, key),
@@ -244,7 +244,7 @@ impl App {
                 }
                 Some(target) => {
                     self.shell.focus = Focus::Table;
-                    let store = &self.store;
+                    let store = &self.store.azure;
                     match self.tab {
                         TabId::Secrets => self.secrets.handle_click(&mut self.shell, store, target),
                         TabId::Registries => {
@@ -280,16 +280,17 @@ impl App {
     /// screen that asked for it, which either shows it or copies it and
     /// keeps nothing either way.
     pub fn apply(&mut self, event: worker::Event, now: Instant) -> AppAction {
-        let secrets_was = self.secrets.cursor_identity(&self.store);
-        let registries_was = self.registries.cursor_identity(&self.store);
-        match self.store.apply(event) {
+        let secrets_was = self.secrets.cursor_identity(&self.store.azure);
+        let registries_was = self.registries.cursor_identity(&self.store.azure);
+        match self.store.azure.apply(event) {
             Applied::Secrets => {
                 self.secrets.invalidate();
-                self.secrets.keep_cursor(&self.store, secrets_was);
+                self.secrets.keep_cursor(&self.store.azure, secrets_was);
             }
             Applied::Repositories => {
                 self.registries.invalidate();
-                self.registries.keep_cursor(&self.store, registries_was);
+                self.registries
+                    .keep_cursor(&self.store.azure, registries_was);
             }
             Applied::Value {
                 vault,
@@ -298,7 +299,7 @@ impl App {
             } => {
                 return self.secrets.on_value(
                     &mut self.shell,
-                    &self.store,
+                    &self.store.azure,
                     &vault,
                     &name,
                     result,
@@ -318,12 +319,12 @@ impl App {
     pub fn tick(&mut self, now: Instant) -> Option<worker::Request> {
         match self.tab {
             TabId::Secrets => {
-                self.secrets.refilter(&self.store);
-                self.secrets.tick(&self.store, now)
+                self.secrets.refilter(&self.store.azure);
+                self.secrets.tick(&self.store.azure, now)
             }
             TabId::Registries => {
-                self.registries.refilter(&self.store);
-                self.registries.tick(&self.store, now)
+                self.registries.refilter(&self.store.azure);
+                self.registries.tick(&self.store.azure, now)
             }
         }
     }
@@ -333,7 +334,7 @@ impl App {
     /// landed somewhere, and whatever the caller wanted otherwise.
     #[must_use]
     pub fn poll_for(&self, settled: Duration) -> Duration {
-        if self.store.refreshing {
+        if self.store.azure.refreshing {
             return Duration::from_millis(100);
         }
         if self.secrets.is_ticking() {
@@ -433,8 +434,8 @@ impl App {
             .areas(area);
 
         let badges = [
-            (TabId::Secrets, self.secrets.badge(&self.store)),
-            (TabId::Registries, self.registries.badge(&self.store)),
+            (TabId::Secrets, self.secrets.badge(&self.store.azure)),
+            (TabId::Registries, self.registries.badge(&self.store.azure)),
         ];
         ui::widgets::render_tab_bar(frame, &mut self.shell, tabs, self.tab, &badges);
         self.render_body(frame, body);
@@ -444,7 +445,7 @@ impl App {
             &mut self.shell,
             status,
             &hint,
-            &self.store,
+            &self.store.azure,
             self.tab,
             millis,
         );
@@ -455,23 +456,29 @@ impl App {
             ui::widgets::render_env_menu(frame, &mut self.shell, anchor, current, highlighted);
         }
         if self.shell.help_open {
-            ui::widgets::render_help(frame, &mut self.shell, area, self.tab, &self.store);
+            ui::widgets::render_help(frame, &mut self.shell, area, self.tab, &self.store.azure);
         }
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
         match self.tab {
             TabId::Secrets => {
-                self.secrets.refilter(&self.store);
-                ui::secrets::render(frame, &mut self.shell, &mut self.secrets, &self.store, area);
+                self.secrets.refilter(&self.store.azure);
+                ui::secrets::render(
+                    frame,
+                    &mut self.shell,
+                    &mut self.secrets,
+                    &self.store.azure,
+                    area,
+                );
             }
             TabId::Registries => {
-                self.registries.refilter(&self.store);
+                self.registries.refilter(&self.store.azure);
                 ui::registries::render(
                     frame,
                     &mut self.shell,
                     &mut self.registries,
-                    &self.store,
+                    &self.store.azure,
                     area,
                 );
             }
@@ -628,9 +635,11 @@ mod tests {
         app.secrets.input.set_text("db");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.secrets.input.is_empty());
-        let mut app = App::new(crate::app::registries::tests::stocked());
+        let mut app = App::new(Store {
+            azure: crate::app::registries::tests::stocked(),
+        });
         app.tab = TabId::Registries;
-        app.registries.refilter(&app.store);
+        app.registries.refilter(&app.store.azure);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             app.registries.level,
@@ -664,14 +673,16 @@ mod tests {
         use crate::azure::Tag;
         use crate::timestamp::ts;
 
-        let mut app = App::new(crate::app::registries::tests::stocked());
+        let mut app = App::new(Store {
+            azure: crate::app::registries::tests::stocked(),
+        });
         app.tab = TabId::Registries;
-        app.registries.refilter(&app.store);
+        app.registries.refilter(&app.store.azure);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.registries.refilter(&app.store);
+        app.registries.refilter(&app.store.azure);
         let first = |app: &App| {
             app.registries
-                .selected_tag(&app.store)
+                .selected_tag(&app.store.azure)
                 .map(|tag| tag.name.clone())
         };
         let was = first(&app).expect("a tag under the cursor");
@@ -682,7 +693,7 @@ mod tests {
             .open_repository()
             .map(|(r, p)| (r.to_owned(), p.to_owned()))
             .unwrap();
-        let Ok(tags) = app.store.tags[&(registry.clone(), repo.clone())].clone() else {
+        let Ok(tags) = app.store.azure.tags[&(registry.clone(), repo.clone())].clone() else {
             panic!("tags");
         };
         let swapped: Vec<Tag> = tags
@@ -705,7 +716,7 @@ mod tests {
             },
             Instant::now(),
         );
-        app.registries.refilter(&app.store);
+        app.registries.refilter(&app.store.azure);
         assert_ne!(first(&app).unwrap(), was, "the newest tag is first again");
     }
 
@@ -728,7 +739,9 @@ mod tests {
 
     #[test]
     fn the_env_header_opens_a_menu_whose_choice_lands_in_the_search_box() {
-        let mut app = App::new(crate::app::secrets::tests::stocked());
+        let mut app = App::new(Store {
+            azure: crate::app::secrets::tests::stocked(),
+        });
         app.secrets.input.set_text("db");
         let click = |column, row| MouseEvent {
             kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -762,12 +775,12 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.secrets.input.text(), "db env:prod");
         assert_eq!(app.shell.env_menu, None);
-        app.secrets.refilter(&app.store);
+        app.secrets.refilter(&app.store.azure);
         assert!(
             app.secrets
                 .visible()
                 .iter()
-                .all(|at| app.store.secrets[*at].vault == "kv-prod"),
+                .all(|at| app.store.azure.secrets[*at].vault == "kv-prod"),
             "{:?}",
             app.secrets.visible()
         );

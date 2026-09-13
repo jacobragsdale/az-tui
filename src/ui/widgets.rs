@@ -12,7 +12,7 @@ use crate::app::keys;
 use crate::app::screen::{TabId, Target};
 use crate::app::shell::{Focus, Level, Panes, Shell};
 use crate::filter::{ENV_CHOICES, Env};
-use crate::store::{Store, problem_line};
+use crate::store::{AzureStore, problem_line};
 use crate::text_input::{TextInput, field_window};
 use crate::timestamp::Timestamp;
 
@@ -231,7 +231,7 @@ pub fn render_status_bar(
     shell: &mut Shell,
     area: Rect,
     hint: &str,
-    store: &Store,
+    store: &AzureStore,
     tab: TabId,
     millis: u128,
 ) {
@@ -277,7 +277,7 @@ fn truncate(text: &str, room: usize) -> String {
 
 /// The right-hand end of the status bar: what is happening, or what is
 /// wrong, or what this tab holds and when it was read.
-fn store_state(store: &Store, tab: TabId, millis: u128) -> (String, Style) {
+fn store_state(store: &AzureStore, tab: TabId, millis: u128) -> (String, Style) {
     let palette = theme();
     if store.refreshing {
         let said = store.progress.clone().unwrap_or_else(|| "reading…".into());
@@ -362,7 +362,13 @@ pub fn dim_behind(frame: &mut Frame, area: Rect) {
 
 /// The help: every key this tab has, the filters its search box takes, then
 /// whatever is wrong.
-pub fn render_help(frame: &mut Frame, shell: &mut Shell, area: Rect, tab: TabId, store: &Store) {
+pub fn render_help(
+    frame: &mut Frame,
+    shell: &mut Shell,
+    area: Rect,
+    tab: TabId,
+    store: &AzureStore,
+) {
     const WIDTH: u16 = 74;
     let palette = theme();
     let entry = |keys: &str, does: &str| {
@@ -612,7 +618,7 @@ mod tests {
 
     #[test]
     fn the_status_bar_says_the_hint_then_the_notification_then_the_error() {
-        let store = Store::default();
+        let store = AzureStore::default();
         let drawn = screen(100, 1, |frame, shell| {
             render_status_bar(
                 frame,
@@ -652,7 +658,7 @@ mod tests {
 
     #[test]
     fn the_two_halves_of_the_status_bar_never_run_into_each_other() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Err(
             "not signed in — run `az login`".into()
         )));
@@ -689,7 +695,7 @@ mod tests {
 
     #[test]
     fn the_status_bar_shows_the_spinner_while_reading_and_the_problem_after() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory::default())));
         store.apply(Event::Progress("reading kv-prod (2/3)…".into()));
         let drawn = screen(100, 1, |frame, shell| {
@@ -727,7 +733,7 @@ mod tests {
 
     #[test]
     fn the_help_lists_this_tabs_keys_and_the_problems_under_them() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory::default())));
         store.apply(Event::Secrets {
             vault: "kv-prod".into(),
@@ -753,7 +759,7 @@ mod tests {
 
     #[test]
     fn a_long_problem_wraps_in_the_help_so_the_fix_is_readable() {
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory::default())));
         store.apply(Event::Secrets {
             vault: "kv-prod".into(),
@@ -776,7 +782,7 @@ mod tests {
 
     #[test]
     fn the_status_bar_counts_what_the_open_tab_holds() {
-        let store = Store::default();
+        let store = AzureStore::default();
         let drawn = screen(100, 1, |frame, shell| {
             render_status_bar(
                 frame,

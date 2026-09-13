@@ -23,14 +23,14 @@ use crate::app::shell::{Focus, Shell};
 use crate::azure::acr::{human_size, short_digest};
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
 use crate::search::Query;
-use crate::store::Store;
+use crate::store::AzureStore;
 use crate::timestamp::{Timestamp, age};
 
 pub fn render(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut RegistriesScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     // Each level keeps its own box, so going down and back restores the
@@ -57,7 +57,7 @@ fn render_table(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut RegistriesScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     let geometry = table_geometry(area);
@@ -155,7 +155,7 @@ fn render_table(
 fn repository_cells(
     row: &crate::azure::Repository,
     columns: &[ColumnConfig],
-    store: &Store,
+    store: &AzureStore,
     highlighter: &mut Query,
     now: Timestamp,
 ) -> Vec<Cell> {
@@ -227,7 +227,7 @@ fn render_details(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut RegistriesScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     let focused = shell.focus == Focus::Details;
@@ -250,7 +250,7 @@ fn render_details(
 /// Why the pane has nothing to say. At the tag level that is nearly always
 /// "the tags have not landed", which is worth saying rather than leaving a
 /// pane that reads as broken.
-fn nothing_to_show(screen: &RegistriesScreen, store: &Store) -> String {
+fn nothing_to_show(screen: &RegistriesScreen, store: &AzureStore) -> String {
     match screen.level {
         Level::Repositories => "Nothing selected".to_owned(),
         Level::Tags { .. } => match screen.tags_of(store) {
@@ -264,7 +264,7 @@ fn nothing_to_show(screen: &RegistriesScreen, store: &Store) -> String {
 
 fn repository_lines(
     screen: &RegistriesScreen,
-    store: &Store,
+    store: &AzureStore,
     width: u16,
 ) -> Option<Vec<Line<'static>>> {
     let palette = theme();
@@ -333,7 +333,7 @@ fn repository_lines(
 
 fn tag_lines(
     screen: &RegistriesScreen,
-    store: &Store,
+    store: &AzureStore,
     registry: &str,
     repo: &str,
     width: u16,
@@ -426,7 +426,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn stocked() -> Store {
+    fn stocked() -> AzureStore {
         let registry = |name: &str| Registry {
             id: format!("/registries/{name}"),
             name: name.to_owned(),
@@ -434,7 +434,7 @@ mod tests {
             location: "eastus".into(),
             login_server: format!("{name}.azurecr.io"),
         };
-        let mut store = Store::default();
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory {
             vaults: Vec::new(),
             registries: vec![registry("acrprod")],
@@ -473,7 +473,7 @@ mod tests {
         store
     }
 
-    fn draw(width: u16, height: u16, screen: &mut RegistriesScreen, store: &Store) -> String {
+    fn draw(width: u16, height: u16, screen: &mut RegistriesScreen, store: &AzureStore) -> String {
         let mut shell = Shell::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
@@ -494,7 +494,7 @@ mod tests {
             .join("\n")
     }
 
-    fn open(screen: &mut RegistriesScreen, store: &Store) {
+    fn open(screen: &mut RegistriesScreen, store: &AzureStore) {
         let mut shell = Shell::default();
         screen.refilter(store);
         screen.handle_key(

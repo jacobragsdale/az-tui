@@ -19,7 +19,7 @@ use crate::azure::SecretRow;
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
 use crate::filter::Env;
 use crate::search::Query;
-use crate::store::Store;
+use crate::store::AzureStore;
 use crate::timestamp::{Timestamp, age};
 
 /// Draws the tab: one row for the search box, then the table and the details
@@ -28,7 +28,7 @@ pub fn render(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut SecretsScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     let input = screen.input.clone();
@@ -51,7 +51,7 @@ pub fn render_table(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut SecretsScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     let geometry = table_geometry(area);
@@ -117,7 +117,7 @@ pub fn render_details(
     frame: &mut Frame,
     shell: &mut Shell,
     screen: &mut SecretsScreen,
-    store: &Store,
+    store: &AzureStore,
     area: Rect,
 ) {
     let focused = shell.focus == Focus::Details;
@@ -138,7 +138,7 @@ pub fn render_details(
 /// Everything the pane says about one secret, top to bottom.
 fn detail_lines(
     screen: &SecretsScreen,
-    store: &Store,
+    store: &AzureStore,
     row: &SecretRow,
     width: u16,
     now: Timestamp,
@@ -313,7 +313,7 @@ pub fn env_cell(name: &str, base: Style, highlighter: &mut Query) -> Cell {
 fn row_cells(
     row: &SecretRow,
     columns: &[ColumnConfig],
-    store: &Store,
+    store: &AzureStore,
     highlighter: &mut Query,
     now: Timestamp,
 ) -> Vec<Cell> {
@@ -399,8 +399,8 @@ mod tests {
         }
     }
 
-    fn stocked() -> Store {
-        let mut store = Store::default();
+    fn stocked() -> AzureStore {
+        let mut store = AzureStore::default();
         store.apply(Event::Inventory(Ok(Inventory {
             vaults: vec![vault("kv-dev"), vault("kv-prod")],
             registries: Vec::new(),
@@ -419,7 +419,12 @@ mod tests {
         store
     }
 
-    fn draw(width: u16, height: u16, screen: &mut SecretsScreen, store: &Store) -> (String, Shell) {
+    fn draw(
+        width: u16,
+        height: u16,
+        screen: &mut SecretsScreen,
+        store: &AzureStore,
+    ) -> (String, Shell) {
         let mut shell = Shell::default();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal

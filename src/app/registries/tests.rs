@@ -34,8 +34,8 @@ fn tag(name: &str, digest: &str, updated: &str) -> Tag {
     }
 }
 
-pub(crate) fn stocked() -> Store {
-    let mut store = Store::default();
+pub(crate) fn stocked() -> AzureStore {
+    let mut store = AzureStore::default();
     store.apply(Event::Inventory(Ok(Inventory {
         vaults: Vec::new(),
         registries: vec![registry("acrdev"), registry("acrprod")],
@@ -70,7 +70,7 @@ pub(crate) fn stocked() -> Store {
     store
 }
 
-fn press(screen: &mut RegistriesScreen, store: &Store, code: KeyCode) -> AppAction {
+fn press(screen: &mut RegistriesScreen, store: &AzureStore, code: KeyCode) -> AppAction {
     let mut shell = Shell::default();
     screen.refilter(store);
     let action = screen.handle_key(&mut shell, store, KeyEvent::new(code, KeyModifiers::NONE));
@@ -78,7 +78,7 @@ fn press(screen: &mut RegistriesScreen, store: &Store, code: KeyCode) -> AppActi
     action
 }
 
-fn shown(screen: &RegistriesScreen, store: &Store) -> Vec<String> {
+fn shown(screen: &RegistriesScreen, store: &AzureStore) -> Vec<String> {
     screen
         .visible()
         .iter()

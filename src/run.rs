@@ -128,7 +128,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     // The worker starts knowing whatever the cache knew, so a key pressed on
     // the first frame reaches the right host without waiting for the refresh
     // behind it.
-    let worker = Worker::start(config.azure.clone(), client, store.inventory.clone());
+    let worker = Worker::start(config.azure.clone(), client, store.azure.inventory.clone());
     worker.send(Request::Refresh);
 
     let every = Duration::from_secs(config.azure.refresh.unwrap_or(DEFAULT_REFRESH));
@@ -187,7 +187,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             // minutes and answer "nothing" from.
             if idle
                 && !cli.no_cache
-                && app.store.read_at.is_some()
+                && app.store.azure.read_at.is_some()
                 && let Err(error) = cache::save(&cache_path, &app.store.snapshot())
             {
                 // A cache that will not save is a slower next start, not a

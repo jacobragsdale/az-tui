@@ -17,7 +17,7 @@ use super::{flip, none_last};
 use crate::azure::{Secret, SecretRow};
 use crate::columns::{ColumnId, SECRET_COLUMNS, TableLayout};
 use crate::filter::{self, Env, Query, When};
-use crate::store::Store;
+use crate::store::AzureStore;
 use crate::text_input::TextInput;
 use crate::timestamp::Timestamp;
 
@@ -161,7 +161,7 @@ pub fn sortable(layout: &TableLayout, available: u16) -> Vec<ColumnId> {
 /// prod rather than alphabetically. The configuration's order is an opinion;
 /// the alphabet is not.
 #[must_use]
-pub fn vault_order(store: &Store) -> HashMap<&str, usize> {
+pub fn vault_order(store: &AzureStore) -> HashMap<&str, usize> {
     store
         .inventory
         .vaults
@@ -362,14 +362,14 @@ impl SecretsScreen {
 
     /// The row under the cursor.
     #[must_use]
-    pub fn selected<'a>(&self, store: &'a Store) -> Option<&'a SecretRow> {
+    pub fn selected<'a>(&self, store: &'a AzureStore) -> Option<&'a SecretRow> {
         store.secrets.get(*self.visible.get(self.cursor.index)?)
     }
 
     /// Rebuilds the shown rows when the query, the sort or the rows have
     /// moved. Cheap to call every frame: it compares first, and a keystroke
     /// only ever re-runs the filter.
-    pub fn refilter(&mut self, store: &Store) {
+    pub fn refilter(&mut self, store: &AzureStore) {
         let order_key = (self.sort, self.descending, store.secrets.len());
         if self.ordered_for != Some(order_key) {
             self.ordered_for = Some(order_key);
@@ -404,7 +404,7 @@ impl SecretsScreen {
     /// Every row, in sort order, and the searchable text of each. Run when
     /// the rows or the sort change — once a refresh and once a keypress of
     /// `s`, not once a keystroke of the query.
-    fn reorder(&mut self, store: &Store) {
+    fn reorder(&mut self, store: &AzureStore) {
         if self.haystacks.len() != store.secrets.len() {
             self.haystacks = store.secrets.iter().map(haystack).collect();
         }
@@ -455,7 +455,7 @@ impl SecretsScreen {
 
     /// What the bottom border says: how many rows of how many, and the sort.
     #[must_use]
-    pub fn status(&self, store: &Store) -> String {
+    pub fn status(&self, store: &AzureStore) -> String {
         let arrow = if self.descending { "↓" } else { "↑" };
         if self.visible.len() == store.secrets.len() {
             format!("{} · {} {arrow}", store.secrets.len(), self.sort.label())
@@ -476,7 +476,7 @@ impl SecretsScreen {
     }
 
     /// After a refresh: back onto the same secret if it is still shown.
-    pub fn keep_cursor(&mut self, store: &Store, was: Option<(String, String)>) {
+    pub fn keep_cursor(&mut self, store: &AzureStore, was: Option<(String, String)>) {
         self.refilter(store);
         let Some((vault, name)) = was else {
             self.cursor.clamp(self.visible.len());
@@ -495,7 +495,7 @@ impl SecretsScreen {
     /// What the cursor is on, by identity rather than by position, for
     /// putting it back after the rows have moved.
     #[must_use]
-    pub fn cursor_identity(&self, store: &Store) -> Option<(String, String)> {
+    pub fn cursor_identity(&self, store: &AzureStore) -> Option<(String, String)> {
         self.selected(store)
             .map(|row| (row.vault.clone(), row.name.clone()))
     }
@@ -505,7 +505,7 @@ impl SecretsScreen {
     pub fn handle_key(
         &mut self,
         shell: &mut Shell,
-        store: &Store,
+        store: &AzureStore,
         key: crossterm::event::KeyEvent,
     ) -> AppAction {
         use crossterm::event::KeyCode;
@@ -556,7 +556,7 @@ impl SecretsScreen {
     fn acting_key(
         &mut self,
         shell: &mut Shell,
-        store: &Store,
+        store: &AzureStore,
         key: crossterm::event::KeyEvent,
     ) -> AppAction {
         use crossterm::event::KeyCode;
@@ -580,7 +580,7 @@ impl SecretsScreen {
     pub fn handle_click(
         &mut self,
         _shell: &mut Shell,
-        _store: &Store,
+        _store: &AzureStore,
         target: Target,
     ) -> AppAction {
         match target {
@@ -626,7 +626,7 @@ impl SecretsScreen {
     }
 
     /// The vault's secrets blade in the portal.
-    fn open_in_portal(&self, shell: &mut Shell, store: &Store) -> AppAction {
+    fn open_in_portal(&self, shell: &mut Shell, store: &AzureStore) -> AppAction {
         let Some(row) = self.selected(store) else {
             return AppAction::None;
         };
@@ -639,7 +639,7 @@ impl SecretsScreen {
 
     /// `⚠ N`, where N is the enabled secrets running out inside thirty days.
     #[must_use]
-    pub fn badge(&self, store: &Store) -> Option<String> {
+    pub fn badge(&self, store: &AzureStore) -> Option<String> {
         let count = expiring(&store.secrets, Timestamp::now());
         (count > 0).then(|| format!("⚠ {count}"))
     }
@@ -678,7 +678,7 @@ impl SecretsScreen {
     }
 
     /// `v` or `Enter`: show it, or hide it if it is already showing.
-    fn reveal(&mut self, store: &Store) -> AppAction {
+    fn reveal(&mut self, store: &AzureStore) -> AppAction {
         let Some(row) = self.selected(store) else {
             return AppAction::None;
         };
@@ -702,7 +702,7 @@ impl SecretsScreen {
 
     /// `y`: copy the value without showing it. A value already on screen is
     /// copied at once and nothing is asked for.
-    fn copy_value(&mut self, shell: &mut Shell, store: &Store) -> AppAction {
+    fn copy_value(&mut self, shell: &mut Shell, store: &AzureStore) -> AppAction {
         let Some(row) = self.selected(store) else {
             return AppAction::None;
         };
@@ -735,7 +735,7 @@ impl SecretsScreen {
     pub fn on_value(
         &mut self,
         shell: &mut Shell,
-        store: &Store,
+        store: &AzureStore,
         vault: &str,
         name: &str,
         result: Result<(Secret, String), String>,
@@ -788,7 +788,7 @@ impl SecretsScreen {
 
     /// One turn of the clock: drops a value that has run out, and asks for
     /// the versions of a row the cursor has settled on.
-    pub fn tick(&mut self, store: &Store, now: Instant) -> Option<crate::worker::Request> {
+    pub fn tick(&mut self, store: &AzureStore, now: Instant) -> Option<crate::worker::Request> {
         if self.revealed.as_ref().is_some_and(|held| held.expired(now)) {
             self.revealed = None;
         }
