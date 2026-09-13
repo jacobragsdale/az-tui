@@ -12,7 +12,7 @@ use crate::ui::theme::ThemeChoice;
 #[command(
     name = "az-tui",
     version,
-    about = "A read-only terminal browser for Azure Key Vault secrets and Container Registry images"
+    about = "A fast terminal browser for AKS namespaces, Azure Key Vault secrets and Container Registry images"
 )]
 pub struct Cli {
     /// Only read this subscription. Repeat for more; left out, every
@@ -28,7 +28,8 @@ pub struct Cli {
     #[arg(long = "registry", value_name = "NAME")]
     pub registries: Vec<String>,
 
-    /// Seconds between background refreshes; 0 leaves `r` as the only refresh.
+    /// Seconds between reads of the open AKS tab; 0 leaves `r` as the only
+    /// read. The vault and registry cadence is `[azure].refresh` in the file.
     #[arg(long, value_name = "SECS")]
     pub refresh: Option<u64>,
 
@@ -149,7 +150,7 @@ impl Cli {
             config.azure.registries = self.registries.clone();
         }
         if let Some(refresh) = self.refresh {
-            config.azure.refresh = Some(refresh);
+            config.refresh = Some(refresh);
         }
         config
     }
@@ -189,7 +190,12 @@ mod tests {
         let merged =
             Cli::parse_from(["az-tui", "--vault", "kv-flag", "--refresh", "0"]).merge(file);
         assert_eq!(merged.azure.vaults, ["kv-flag"]);
-        assert_eq!(merged.azure.refresh, Some(0));
+        assert_eq!(merged.refresh, Some(0), "the flag is the AKS cadence");
+        assert_eq!(
+            merged.azure.refresh,
+            Some(30),
+            "the vaults' is the file's alone"
+        );
     }
 
     #[test]

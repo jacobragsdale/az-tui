@@ -1,9 +1,32 @@
-# az-tui — every key is optional, and so is this whole file.
-# It lives at $XDG_CONFIG_HOME/az-tui/config.toml, or
-# ~/.config/az-tui/config.toml when that is unset (on macOS too).
+# az-tui — copy to ~/.config/az-tui/config.toml and edit. Every key is
+# optional, and so is the whole file. ($XDG_CONFIG_HOME/az-tui/config.toml
+# when that is set; the same path on macOS.)
 #
 # A flag beats an AZ_TUI_* variable, which beats this file.
 
+# ── AKS ──────────────────────────────────────────────────────────────────
+# Seconds between reads of the open AKS tab; the other tabs are read every
+# 30 s for their badges. 0 leaves `r` as the only read. This line must stay
+# above the first [[clusters]] block, or TOML gives it to that cluster.
+# refresh = 5
+
+# One tab per namespace, in this order, ahead of Secrets and Registries.
+# `context` is the kubeconfig context kubectl reaches the cluster by —
+# `az-tui setup` writes one per cluster and prints these blocks — and is the
+# cluster's name when left out. A cluster with no `namespaces` is one tab
+# over all of them. No [[clusters]] at all: no AKS tabs.
+
+[[clusters]]
+name = "qa"
+context = "aks-qa"
+namespaces = ["dev", "qa", "uat"]
+
+[[clusters]]
+name = "prod"
+context = "aks-prod"
+namespaces = ["prod"]
+
+# ── Key Vault and Container Registry ─────────────────────────────────────
 [azure]
 # Only read these subscriptions. Left out: every subscription `az` can see.
 # subscriptions = ["00000000-0000-0000-0000-000000000000"]
@@ -16,7 +39,9 @@
 # Only read these container registries, in this order. Left out: all of them.
 # registries = ["acrdev", "acrqa", "acrprod"]
 
-# Seconds between background refreshes. 0 leaves `r` as the only refresh.
+# Seconds between background refreshes of the vaults and registries; 0 leaves
+# `r` as the only refresh. No flag sets this one — `--refresh` is the AKS
+# cadence above.
 # refresh = 300
 
 # How many vaults, registries or repositories a refresh reads at once.
