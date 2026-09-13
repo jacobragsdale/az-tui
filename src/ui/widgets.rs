@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::theme::theme;
-use crate::app::keys;
+use crate::app::keys::{self, Section};
 use crate::app::screen::{TabId, Target};
 use crate::app::shell::{Focus, Level, Panes, Shell};
 use crate::filter::{ENV_CHOICES, Env};
@@ -41,20 +41,28 @@ pub const fn placeholder(kind: Kind) -> &'static str {
 
 /// The `key:value` filters each table takes, for the help. The README is
 /// otherwise the only place the grammar is written down.
-const FILTERS: &[(TabId, &str, &str)] = &[
+const FILTERS: &[(Section, &str, &str)] = &[
+    (Section::Aks, "Pods", "name: ns: status: owner: app: node:"),
     (
-        TabId::Secrets,
-        "Filters",
+        Section::Aks,
+        "Events",
+        "type: reason: object: kind: message: ns:",
+    ),
+    (Section::Aks, "ConfigMaps", "name: ns: key:"),
+    (Section::Aks, "Secrets", "name: ns: type: key:"),
+    (
+        Section::Secrets,
+        "Secrets",
         "env:dev|qa|prod vault: name: type: enabled:yes|no managed:yes|no tag:key=value expires:<30d|>30d|none|expired",
     ),
     (
-        TabId::Registries,
-        "Filters",
+        Section::Registries,
+        "Repos",
         "env:dev|qa|prod registry: repo: updated:<30d|>30d created:<30d|>30d",
     ),
     (
-        TabId::Registries,
-        "Inside one",
+        Section::Registries,
+        "Tags",
         "tag: digest: updated:<30d|>30d created:<30d|>30d",
     ),
 ];
@@ -413,16 +421,16 @@ pub fn dim_behind(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// The help: every key this tab has, the filters its search box takes, then
-/// whatever is wrong.
+/// The help: every key this section has, the filters its search boxes
+/// take, then whatever is wrong — one line per problem, already worded.
 pub fn render_help(
     frame: &mut Frame,
     shell: &mut Shell,
     area: Rect,
-    tab: TabId,
-    store: &AzureStore,
+    section: Section,
+    problems: &[String],
 ) {
-    const WIDTH: u16 = 74;
+    const WIDTH: u16 = 78;
     let palette = theme();
     let entry = |keys: &str, does: &str| {
         Line::from(vec![
@@ -430,27 +438,31 @@ pub fn render_help(
             Span::styled(does.to_owned(), Style::default().fg(palette.body)),
         ])
     };
-    let mut lines: Vec<Line> = keys::for_tab(tab)
-        .map(|key| entry(key.keys, key.does))
-        .collect();
-    lines.push(Line::from(""));
-    lines.extend(
-        FILTERS
-            .iter()
-            .filter(|(held, _, _)| *held == tab)
-            .map(|(_, label, grammar)| entry(label, grammar)),
-    );
-    if !store.problems.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Problems",
+    let heading = |said: &str| {
+        Line::from(Span::styled(
+            said.to_owned(),
             Style::default()
                 .fg(palette.header)
                 .add_modifier(Modifier::BOLD),
-        )));
-        for problem in &store.problems {
+        ))
+    };
+    let mut lines: Vec<Line> = keys::for_section(section)
+        .map(|key| entry(key.keys, key.does))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(heading("Filters"));
+    lines.extend(
+        FILTERS
+            .iter()
+            .filter(|(held, _, _)| *held == section)
+            .map(|(_, label, grammar)| entry(label, grammar)),
+    );
+    if !problems.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(heading("Problems"));
+        for problem in problems {
             lines.push(Line::from(Span::styled(
-                problem_line(problem),
+                problem.clone(),
                 Style::default().fg(palette.error),
             )));
         }
@@ -900,46 +912,51 @@ mod tests {
     }
 
     #[test]
-    fn the_help_lists_this_tabs_keys_and_the_problems_under_them() {
-        let mut store = AzureStore::default();
-        store.apply(Event::Inventory(Ok(Inventory::default())));
-        store.apply(Event::Secrets {
-            vault: "kv-prod".into(),
-            result: Err("blocked by the vault firewall".into()),
-        });
+    fn the_help_lists_this_sections_keys_and_the_problems_under_them() {
         let drawn = screen(100, 30, |frame, shell| {
             render_help(
                 frame,
                 shell,
                 Rect::new(0, 0, 100, 30),
-                TabId::Secrets,
-                &store,
+                Section::Secrets,
+                &["kv-prod: blocked by the vault firewall".to_owned()],
             );
         });
         assert!(drawn.contains("Keys"), "{drawn}");
         assert!(drawn.contains("copy the value"), "{drawn}");
         assert!(!drawn.contains("repository's tags"), "{drawn}");
+        assert!(!drawn.contains("bash"), "{drawn}");
         assert!(drawn.contains("Filters"), "{drawn}");
         assert!(drawn.contains("expires:<30d"), "{drawn}");
+        assert!(!drawn.contains("reason:"), "{drawn}");
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(drawn.contains("blocked by the vault firewall"), "{drawn}");
+
+        let drawn = screen(100, 45, |frame, shell| {
+            render_help(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 45),
+                Section::Aks,
+                &["qa/dev pods: Unable to connect to the server".to_owned()],
+            );
+        });
+        assert!(drawn.contains("refresh now"), "{drawn}");
+        assert!(drawn.contains("bash"), "{drawn}");
+        assert!(!drawn.contains("60 seconds"), "{drawn}");
+        assert!(drawn.contains("reason:"), "{drawn}");
+        assert!(drawn.contains("Unable to connect"), "{drawn}");
     }
 
     #[test]
     fn a_long_problem_wraps_in_the_help_so_the_fix_is_readable() {
-        let mut store = AzureStore::default();
-        store.apply(Event::Inventory(Ok(Inventory::default())));
-        store.apply(Event::Secrets {
-            vault: "kv-prod".into(),
-            result: Err("no permission to read secrets (needs the Key Vault Secrets User role or a `list` access policy)".into()),
-        });
         let drawn = screen(100, 40, |frame, shell| {
             render_help(
                 frame,
                 shell,
                 Rect::new(0, 0, 100, 40),
-                TabId::Secrets,
-                &store,
+                Section::Secrets,
+                &["kv-prod: no permission to read secrets (needs the Key Vault Secrets User role or a `list` access policy)".to_owned()],
             );
         });
         assert!(

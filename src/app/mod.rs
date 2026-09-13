@@ -23,7 +23,7 @@ use shell::{Focus, Menu, Shell};
 use crate::columns::{ColumnId, TableLayout};
 use crate::filter::{self, ENV_CHOICES, Env};
 use crate::session::{Session, SessionColumn};
-use crate::store::{Store, azure::Applied};
+use crate::store::{Store, azure::Applied, problem_line};
 use crate::text_input::TextInput;
 use crate::worker::Request;
 use crate::{ui, worker};
@@ -476,7 +476,13 @@ impl App {
             ui::widgets::render_env_menu(frame, &mut self.shell, anchor, current, highlighted);
         }
         if self.shell.help_open {
-            ui::widgets::render_help(frame, &mut self.shell, area, self.tab, &self.store.azure);
+            let section = match self.tab {
+                TabId::Secrets => keys::Section::Secrets,
+                TabId::Registries => keys::Section::Registries,
+            };
+            let problems: Vec<String> =
+                self.store.azure.problems.iter().map(problem_line).collect();
+            ui::widgets::render_help(frame, &mut self.shell, area, section, &problems);
         }
     }
 
