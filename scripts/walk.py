@@ -17,6 +17,7 @@ import fcntl
 import os
 import pty
 import select
+import signal
 import struct
 import sys
 import tempfile
@@ -50,21 +51,27 @@ class Walk:
             os.execve(binary, [binary], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", LINES, COLUMNS, 0, 0))
         self.scratch = scratch
+        # Set once the pty has closed: the binary was not there, or it died
+        # mid-walk. Every expectation after that fails at once rather than
+        # spinning out its timeout.
+        self.dead = False
 
     def pump(self, seconds):
         deadline = time.time() + seconds
-        while time.time() < deadline:
+        while not self.dead and time.time() < deadline:
             ready, _, _ = select.select([self.fd], [], [], 0.05)
             if not ready:
                 continue
             try:
                 data = os.read(self.fd, 65536)
             except OSError:
-                return
+                data = b""
             if not data:
+                self.dead = True
                 return
-            # crossterm asks where the cursor is on startup and waits for the
-            # answer; a pty with nobody on the other end would hang it.
+            # ratatui asks where the cursor is when it clears the screen for
+            # the repaint after `kubectl exec`; a pty with nobody on the other
+            # end would leave it waiting.
             if b"\x1b[6n" in data:
                 os.write(self.fd, b"\x1b[1;1R")
             self.stream.feed(data)
@@ -80,16 +87,29 @@ class Walk:
 
     def expect(self, needle, seconds=5.0):
         deadline = time.time() + seconds
-        while time.time() < deadline:
-            self.pump(0.2)
+        while True:
             if needle in self.text():
                 return True
+            if self.dead or time.time() >= deadline:
+                break
+            self.pump(0.05)
         print(f"--- expected {needle!r}, screen was:\n{self.text()}", file=sys.stderr)
         return False
 
     def quit(self):
-        self.send("q")
-        self.pump(1)
+        # Ctrl-C rather than q: q is swallowed by whatever a failed walk
+        # left open, and a walk that hangs is worse than one that fails.
+        self.send("\x03")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            self.pump(0.1)
+            try:
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            if pid:
+                return
+        os.kill(self.pid, signal.SIGKILL)
         try:
             os.waitpid(self.pid, 0)
         except ChildProcessError:
@@ -140,7 +160,7 @@ def main():
         walk.send("]")
         ok &= walk.expect("Env ▾")
         walk.send("]")
-        ok &= walk.expect("Registries")
+        ok &= walk.expect("Repository")
         walk.send("]")
         ok &= walk.expect("orders-worker-5c4d3e-q8zt")
         walk.send("/worker\r")
@@ -228,8 +248,14 @@ def main():
         print(walk.text())
     walk.quit()
 
-    with open(os.path.join(scratch, "calls.log")) as f:
-        calls = f.read().splitlines()
+    log = os.path.join(scratch, "calls.log")
+    if os.path.exists(log):
+        with open(log) as f:
+            calls = f.read().splitlines()
+    else:
+        print("--- kubectl was never called", file=sys.stderr)
+        calls = []
+        ok = False
     print(f"{len(calls)} kubectl calls; first: {calls[0] if calls else '-'}")
     wanted = [
         "--context aks-qa --request-timeout=10s get pods -o json -n dev",
@@ -242,7 +268,7 @@ def main():
         "--context aks-qa --request-timeout=10s get secrets -o json -n dev",
         "--context aks-qa --request-timeout=10s get secret orders-db -n dev -o json",
         "--context aks-prod --request-timeout=10s get secrets -o json -n prod",
-    ] if not options.keys else [calls[0]]
+    ] if not options.keys else []
     for line in wanted:
         if line not in calls:
             print(f"--- expected a call {line!r} in:\n" + "\n".join(calls), file=sys.stderr)

@@ -38,9 +38,10 @@ jobs:
           AZ_TUI_THEME: mono
       - run: cargo build --release
       # The whole program under a pty against the fake kubectl: what a person
-      # would see, asserted from the screen.
-      - run: pip install pyte && python3 scripts/walk.py
-        if: runner.os == 'Linux'
+      # would see, asserted from the screen. `uv run` reads the script's own
+      # dependency header, so pyte is declared in one place.
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run scripts/walk.py
       # The README tells people to install it this way, so the install path
       # is proven rather than assumed.
       - run: cargo install --path . --locked --root ${{ runner.temp }}/install
