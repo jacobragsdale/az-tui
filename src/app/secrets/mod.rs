@@ -426,7 +426,7 @@ impl SecretsScreen {
         self.haystacks.clear();
     }
 
-    /// `s`: the next column on screen. `S`: the same column the other way.
+    /// `S`: the next column on screen. `R`: the same column the other way.
     pub fn next_sort(&mut self) {
         let columns = sortable(&self.layout, self.available);
         if columns.is_empty() {
@@ -540,8 +540,8 @@ impl SecretsScreen {
             KeyCode::PageUp => self.cursor.page(-1, count),
             KeyCode::Home => self.cursor.focus(0),
             KeyCode::End => self.cursor.move_by(isize::MAX, count),
-            KeyCode::Char('s') => self.next_sort(),
-            KeyCode::Char('S') => self.descending = !self.descending,
+            KeyCode::Char('S') => self.next_sort(),
+            KeyCode::Char('R') => self.descending = !self.descending,
             _ => return self.acting_key(shell, store, key),
         }
         if self.cursor.index != before {
@@ -650,7 +650,7 @@ impl SecretsScreen {
             return "Esc/Enter keep the filter  Esc again clears it  Ctrl-U empties the box"
                 .to_owned();
         }
-        "↑↓/jk move  / search  v reveal  y copy value  Y copy name  s sort  r refresh  ? help"
+        "↑↓/jk move  / search  v reveal  y copy value  Y copy name  S sort  r refresh  ? help"
             .to_owned()
     }
 

@@ -836,7 +836,7 @@ mod tests {
                     frame,
                     shell,
                     Rect::new(0, 0, width, 1),
-                    "↑↓/jk move  / search  s sort  y copy value  v reveal  r refresh  ? help",
+                    "↑↓/jk move  / search  S sort  y copy value  v reveal  r refresh  ? help",
                     &store,
                     TabId::Secrets,
                     0,

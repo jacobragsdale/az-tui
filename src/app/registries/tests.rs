@@ -361,3 +361,30 @@ fn the_details_pane_pages_and_jumps_when_it_has_focus() {
     screen.handle_key(&mut shell, &store, key(KeyCode::Home));
     assert_eq!(screen.details_scroll.offset, 0);
 }
+
+#[test]
+fn capital_r_turns_the_sort_over_and_capital_s_walks_on() {
+    let store = stocked();
+    let mut screen = RegistriesScreen::default();
+    screen.note_width(200);
+    assert_eq!(
+        (screen.repositories.sort, screen.repositories.descending),
+        (ColumnId::Updated, true),
+        "repositories open newest first"
+    );
+    let before = shown(&screen, &store);
+
+    press(&mut screen, &store, KeyCode::Char('R'));
+    assert_eq!(
+        (screen.repositories.sort, screen.repositories.descending),
+        (ColumnId::Updated, false)
+    );
+    assert_ne!(shown(&screen, &store), before);
+
+    press(&mut screen, &store, KeyCode::Char('S'));
+    assert_ne!(screen.repositories.sort, ColumnId::Updated);
+    assert!(
+        !screen.repositories.descending,
+        "a new column starts ascending"
+    );
+}

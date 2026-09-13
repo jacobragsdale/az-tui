@@ -1319,6 +1319,11 @@ impl ScopeScreen {
                 self.list_mut().next_sort();
                 false
             }
+            KeyCode::Char('R') => {
+                let list = self.list_mut();
+                list.descending = !list.descending;
+                false
+            }
             _ => false,
         };
         if moved {
@@ -1960,5 +1965,34 @@ mod tests {
         assert!(screen.pane_zoom);
         screen.close_pane();
         assert!(!screen.pane_zoom && !screen.pane_open);
+    }
+
+    #[test]
+    fn capital_s_walks_the_columns_and_capital_r_turns_the_sort_over() {
+        let data = data();
+        let mut shell = Shell::default();
+        let mut screen = ScopeScreen::new(false);
+        screen.refilter(&data);
+        let press = |screen: &mut ScopeScreen, shell: &mut Shell, code| {
+            screen.handle_key(
+                shell,
+                &data,
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            )
+        };
+        let was = screen.list().sort;
+        press(
+            &mut screen,
+            &mut shell,
+            crossterm::event::KeyCode::Char('R'),
+        );
+        assert!(screen.list().descending);
+        assert_eq!(screen.list().sort, was, "R keeps the column");
+        press(
+            &mut screen,
+            &mut shell,
+            crossterm::event::KeyCode::Char('S'),
+        );
+        assert!(!screen.list().descending, "a new column starts ascending");
     }
 }

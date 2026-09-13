@@ -537,8 +537,8 @@ impl RegistriesScreen {
             KeyCode::PageUp => self.table_mut().cursor.page(-1, count),
             KeyCode::Home => self.table_mut().cursor.focus(0),
             KeyCode::End => self.table_mut().cursor.move_by(isize::MAX, count),
-            KeyCode::Char('s') => self.next_sort(),
-            KeyCode::Char('S') => {
+            KeyCode::Char('S') => self.next_sort(),
+            KeyCode::Char('R') => {
                 let table = self.table_mut();
                 table.descending = !table.descending;
             }
@@ -682,11 +682,11 @@ impl RegistriesScreen {
         }
         match self.level {
             Level::Repositories => {
-                "↑↓/jk move  Enter tags  / search  y copy pull  s sort  r refresh  ? help"
+                "↑↓/jk move  Enter tags  / search  y copy pull  S sort  r refresh  ? help"
                     .to_owned()
             }
             Level::Tags { .. } => {
-                "↑↓/jk move  h back  y copy pull  Y copy digest  s sort  ? help".to_owned()
+                "↑↓/jk move  h back  y copy pull  Y copy digest  S sort  ? help".to_owned()
             }
         }
     }

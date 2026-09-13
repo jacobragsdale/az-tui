@@ -766,3 +766,32 @@ fn the_wheel_after_a_shrinking_refresh_does_not_turn_the_window_inside_out() {
     screen.handle_wheel(&mut Shell::default(), None, 3);
     assert!(screen.cursor.index < screen.visible().len());
 }
+
+#[test]
+fn capital_s_walks_the_columns_and_capital_r_turns_the_sort_over() {
+    let store = stocked();
+    let mut shell = Shell::default();
+    let mut screen = SecretsScreen::default();
+    screen.note_width(120);
+    screen.refilter(&store);
+    let before: Vec<usize> = screen.visible().to_vec();
+
+    assert_eq!(press(&mut screen, &mut shell, &store, 's'), AppAction::None);
+    assert_eq!(
+        (screen.sort, screen.descending),
+        (ColumnId::Name, false),
+        "lowercase s is nobody's key here"
+    );
+
+    press(&mut screen, &mut shell, &store, 'S');
+    assert_eq!((screen.sort, screen.descending), (ColumnId::Enabled, false));
+
+    press(&mut screen, &mut shell, &store, 'R');
+    assert!(screen.descending);
+    screen.refilter(&store);
+    assert_ne!(
+        screen.visible().first(),
+        before.first(),
+        "the rows turned over"
+    );
+}
