@@ -53,6 +53,28 @@ pub(crate) fn mint(client: &Client, login_server: &str, scope: &str) -> Result<S
 /// The first of the two posts: a CLI token in, a refresh token out. Once per
 /// registry per run, however many scopes are asked for after it.
 fn exchange(client: &Client, login_server: &str) -> Result<String> {
+    let exchanged = match post_exchange(client, login_server) {
+        // A 401 here is most often the CLI token gone stale in the cache,
+        // which only a data-plane 401 would otherwise drop — and a registry
+        // that never answered has had none. One fresh token, one retry.
+        Err(error) if is_401(&error) => {
+            client.forget(&Audience::ContainerRegistry);
+            post_exchange(client, login_server)
+        }
+        first => first,
+    };
+    let exchanged = exchanged.map_err(|error| explain(login_server, error))?;
+    text(&exchanged["refresh_token"])
+        .with_context(|| format!("{login_server} answered the exchange without a token"))
+}
+
+/// A 401 on the post, as opposed to no login at all, which no re-mint fixes.
+fn is_401(error: &anyhow::Error) -> bool {
+    super::transport::is_signed_out(error) && !super::transport::is_no_login(error)
+}
+
+/// The exchange post itself, with whatever CLI token the cache holds.
+fn post_exchange(client: &Client, login_server: &str) -> Result<Value> {
     let cli = client.token(&Audience::ContainerRegistry)?;
     let mut fields = vec![
         ("grant_type".to_owned(), "access_token".to_owned()),
@@ -64,13 +86,10 @@ fn exchange(client: &Client, login_server: &str) -> Result<String> {
     if let Some(tenant) = client.tenant() {
         fields.push(("tenant".to_owned(), tenant));
     }
-    let exchanged = client.call_unsigned(Request::post_form(
+    client.call_unsigned(Request::post_form(
         format!("https://{login_server}/oauth2/exchange"),
         fields,
-    ));
-    let exchanged = exchanged.map_err(|error| explain(login_server, error))?;
-    text(&exchanged["refresh_token"])
-        .with_context(|| format!("{login_server} answered the exchange without a token"))
+    ))
 }
 
 /// A refusal on the exchange itself is not a spent token: it is a login with
@@ -519,16 +538,46 @@ mod tests {
 
     #[test]
     fn a_refusal_on_the_exchange_itself_names_the_role_that_is_missing() {
-        let (client, _, _) = fake_client([Answer::status(
-            401,
-            r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
-        )]);
+        let refused = || {
+            Answer::status(
+                401,
+                r#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#,
+            )
+        };
+        let (client, transport, _) = fake_client([refused(), refused()]);
         let error = format!("{:#}", repositories(&client, &registry()).unwrap_err());
         assert!(
             error.contains("acrprod.azurecr.io: no permission"),
             "{error}"
         );
         assert!(error.contains("AcrPull"), "{error}");
+        assert_eq!(
+            transport.sent().len(),
+            2,
+            "one fresh CLI token, then no more"
+        );
+    }
+
+    #[test]
+    fn a_stale_cli_token_on_the_exchange_is_minted_again_once() {
+        // The registry was unreachable at every refresh for an hour, so no
+        // data-plane 401 ever dropped the CLI token: the exchange is the
+        // first call to see it has expired.
+        let (client, transport, _) = fake_client([
+            Answer::status(401, r#"{"errors":[{"message":"expired"}]}"#),
+            exchanged(),
+            issued("fresh"),
+            Answer::json(json!({ "repositories": ["api"] })),
+        ]);
+        let names = repositories(&client, &registry()).unwrap();
+        assert_eq!(names, ["api"]);
+        let sent = transport.sent();
+        assert_eq!(sent.len(), 4);
+        let tokens: Vec<_> = sent[..2]
+            .iter()
+            .map(|request| field(&form(request), "access_token").unwrap().to_owned())
+            .collect();
+        assert_ne!(tokens[0], tokens[1], "the retry carried a fresh CLI token");
     }
 
     #[test]

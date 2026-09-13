@@ -31,6 +31,29 @@ use crate::kube::run_capped;
 /// tenant is the one that comes close.
 const CALL_CAP: Duration = Duration::from_secs(60);
 
+/// Creates the file with `text`, or leaves one already there alone: `false`
+/// when it exists. Created rather than checked for and then written, so two
+/// runs at once cannot both see nothing and both write.
+fn write_new(path: &Path, text: &str) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to make {}", parent.display()))?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(text.as_bytes())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to write {}", path.display())),
+    }
+}
+
 /// Namespaces every AKS cluster has that nobody wants a tab for.
 const SYSTEM_NAMESPACES: &[&str] = &[
     "default",
@@ -380,28 +403,21 @@ pub fn setup(out: &mut impl Write, write: bool, config_path: &Path) -> Result<bo
     let text = blocks.join("\n");
     writeln!(out)?;
     if write {
-        if config_path.exists() {
+        // The AKS cadence is a top-level key: below the first [[clusters]]
+        // TOML would hand it to that cluster, so it goes first.
+        let file = format!(
+            "# Seconds between reads of the open AKS tab; keep it above the first [[clusters]].\n# refresh = 5\n\n{text}\n[theme]\n# preset = \"terminal\"\n"
+        );
+        if !write_new(config_path, &file)? {
+            // Nothing failed: the file that is there is the one that stays.
             writeln!(
                 out,
                 "{} exists; not touched. The blocks it would have had:\n",
                 config_path.display()
             )?;
             write!(out, "{text}")?;
-            return Ok(false);
+            return Ok(true);
         }
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to make {}", parent.display()))?;
-        }
-        // The AKS cadence is a top-level key: below the first [[clusters]]
-        // TOML would hand it to that cluster, so it goes first.
-        std::fs::write(
-            config_path,
-            format!(
-                "# Seconds between reads of the open AKS tab; keep it above the first [[clusters]].\n# refresh = 5\n\n{text}\n[theme]\n# preset = \"terminal\"\n"
-            ),
-        )
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
         writeln!(
             out,
             "wrote {} — trim the namespaces to the ones you want tabs for",
@@ -602,5 +618,14 @@ mod tests {
         if let Err(error) = outcome {
             assert!(format!("{error:#}").contains("az"), "{error:#}");
         }
+    }
+
+    #[test]
+    fn a_config_already_there_is_left_alone_and_is_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        assert!(write_new(&path, "first\n").unwrap());
+        assert!(!write_new(&path, "second\n").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
     }
 }

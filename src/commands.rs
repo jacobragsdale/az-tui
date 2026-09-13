@@ -194,6 +194,7 @@ pub fn secret_get(
     // Which vaults actually hold it. A name in more than one and no --vault
     // is ambiguous, and guessing would be the worst possible answer.
     let mut holding = Vec::new();
+    let mut failed = Vec::new();
     let listed = parallel::map(&vaults, context.azure.threads(), |vault| {
         vault::secrets(context.client, vault)
     });
@@ -204,11 +205,13 @@ pub fn secret_get(
                     holding.push((vault.clone(), row));
                 }
             }
-            // A vault that would not answer cannot be ruled in or out, and
-            // saying so is better than a silent "not found".
-            Err(error) if vaults.len() == 1 => return Err(error.into()),
-            Err(_) => {}
+            Err(error) => failed.push(format!("{error:#}")),
         }
+    }
+    // A vault that would not answer cannot be ruled in or out: with nothing
+    // found, the failures are the answer rather than a silent "not found".
+    if holding.is_empty() {
+        partial(failed)?;
     }
     let [(held, row)] = holding.as_slice() else {
         return Err(if holding.is_empty() {
@@ -320,6 +323,7 @@ pub fn tags(
     }
 
     let mut holding = Vec::new();
+    let mut failed = Vec::new();
     let catalogs = parallel::map(&registries, context.azure.threads(), |registry| {
         acr::repositories(context.client, registry)
     });
@@ -327,9 +331,11 @@ pub fn tags(
         match catalog {
             Ok(names) if names.iter().any(|held| held == repo) => holding.push(registry.clone()),
             Ok(_) => {}
-            Err(error) if registries.len() == 1 => return Err(error.into()),
-            Err(_) => {}
+            Err(error) => failed.push(format!("{error:#}")),
         }
+    }
+    if holding.is_empty() {
+        partial(failed)?;
     }
     let [held] = holding.as_slice() else {
         return Err(if holding.is_empty() {
@@ -798,6 +804,34 @@ mod tests {
             "{}",
             failure.message
         );
+    }
+
+    #[test]
+    fn secret_get_with_no_vault_answering_reports_the_refusals_not_a_missing_name() {
+        let azure = serial();
+        let (client, _, _) = fake_client([
+            inventory_answer(),
+            Answer::status(403, r#"{"error":{"message":"kv-dev says no"}}"#),
+            Answer::status(403, r#"{"error":{"message":"kv-prod says no"}}"#),
+        ]);
+        let mut out = Vec::new();
+        let failure = secret_get(
+            &mut out,
+            &context(&client, &azure),
+            "db-password",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, FAILED);
+        assert!(
+            !failure.message.contains("no secret called"),
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("kv-dev"), "{}", failure.message);
+        assert!(failure.message.contains("kv-prod"), "{}", failure.message);
     }
 
     #[test]
