@@ -4,17 +4,17 @@
 //! the question on top of the table, and the one secret value on screen.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::cursor::ScrollState;
 use super::list::{ListState, Row};
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
+use crate::azure::Secret;
 use crate::columns::ColumnId;
 use crate::config::Tab;
 use crate::kube::{
-    ConfigMap, K8sEvent, Kind, LogFollow, ObjectRef, Pod, Replicas, Request, Secret, SecretMeta,
-    TextKind,
+    ConfigMap, K8sEvent, Kind, LogFollow, ObjectRef, Pod, Replicas, Request, SecretMeta, TextKind,
 };
 use crate::store::ScopeData;
 use crate::text_input::TextInput;
@@ -22,11 +22,6 @@ use crate::text_input::TextInput;
 /// How many log lines the pane keeps. Past this the oldest go, and the first
 /// line says how many.
 pub const LOG_LINE_CAP: usize = 20_000;
-
-/// How long a revealed secret stays on screen. Long enough to read one off
-/// and type it somewhere, short enough that a walked-away-from terminal is
-/// not showing a production password.
-pub const REVEAL_FOR: Duration = Duration::from_secs(60);
 
 /// What a confirmation is about to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +62,8 @@ pub enum Modal {
     },
     Scale {
         object: ObjectRef,
+        /// Where it is: `qa/dev`.
+        scope: String,
         input: TextInput,
         current: Option<Replicas>,
     },
@@ -105,14 +102,12 @@ impl Revealed {
     /// Whole seconds until it goes.
     #[must_use]
     pub fn clears_in(&self, now: Instant) -> u64 {
-        REVEAL_FOR
-            .saturating_sub(now.saturating_duration_since(self.at))
-            .as_secs()
+        super::secrets::clears_in(self.at, now)
     }
 
     #[must_use]
     pub fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) >= REVEAL_FOR
+        super::secrets::expired(self.at, now)
     }
 }
 
@@ -157,6 +152,13 @@ pub struct ScopeScreen {
     /// What the Value pane paints, rebuilt each frame from the key under the
     /// details cursor.
     pane_value: Vec<String>,
+    /// Bumped whenever the lines the pane holds change.
+    pane_generation: u64,
+    /// The lines the filter lets through, as indices, and what they were
+    /// worked out for: a log runs to twenty thousand lines, so they are
+    /// worked out again only when [`ScopeScreen::shown_key`] changes.
+    pub shown_for: Option<(String, u64, PaneText, Option<ObjectRef>)>,
+    pub shown: Vec<usize>,
     /// Whether the log pane is pinned to the tail.
     log_follow: bool,
     /// Whether the stream has ended: the pod went, or `kubectl` refused.
@@ -223,6 +225,9 @@ impl ScopeScreen {
             pane_zoom: false,
             pane_filter: TextInput::default(),
             pane_value: Vec::new(),
+            pane_generation: 0,
+            shown_for: None,
+            shown: Vec::new(),
             log_follow: true,
             log_finished: false,
             log_target: None,
@@ -288,9 +293,11 @@ impl ScopeScreen {
         self.refusal = None;
     }
 
-    /// Rebuilds the shown rows of the kind showing.
+    /// Rebuilds the shown rows of the kind showing, under a key cursor that
+    /// stays on a key of whatever row the cursor lands on.
     pub fn refilter(&mut self, data: &ScopeData) {
         self.refilter_kind(self.kind, data);
+        self.clamp_key_cursor(data);
     }
 
     pub fn refilter_kind(&mut self, kind: Kind, data: &ScopeData) {
@@ -315,9 +322,13 @@ impl ScopeScreen {
             Kind::Secrets => list.keep_cursor(&data.secrets.rows, was),
         }
         if kind == self.kind {
-            let keys = self.keys(data).len();
-            self.key_cursor = self.key_cursor.min(keys.saturating_sub(1));
+            self.clamp_key_cursor(data);
         }
+    }
+
+    fn clamp_key_cursor(&mut self, data: &ScopeData) {
+        let keys = self.keys(data).len();
+        self.key_cursor = self.key_cursor.min(keys.saturating_sub(1));
     }
 
     /// What one kind's cursor is on, by identity, before its rows move.
@@ -393,7 +404,9 @@ impl ScopeScreen {
                         .iter()
                         .map(|(key, value)| {
                             let lines = value.lines().count();
-                            let said = if lines > 1 {
+                            let said = if ConfigMap::is_binary(value) {
+                                value.clone()
+                            } else if lines > 1 {
                                 format!("{lines} lines")
                             } else {
                                 format!("{} bytes", value.len())
@@ -430,11 +443,19 @@ impl ScopeScreen {
         self.list().status(data.listing(self.kind).count)
     }
 
-    /// `✗ N` while N pods are in trouble.
+    /// `✗ N` while N pods are in trouble, with a `!` in front while the pod
+    /// read is failing.
     #[must_use]
     pub fn badge(data: &ScopeData) -> Option<String> {
+        let mut said = Vec::new();
+        if data.pods.error.is_some() {
+            said.push("!".to_owned());
+        }
         let count = data.unhealthy();
-        (count > 0).then(|| format!("\u{2717} {count}"))
+        if count > 0 {
+            said.push(format!("\u{2717} {count}"));
+        }
+        (!said.is_empty()).then(|| said.join(" "))
     }
 
     // ── Jumps between kinds ────────────────────────────────────────────
@@ -513,6 +534,19 @@ impl ScopeScreen {
         self.log_finished = false;
         self.log_follow = true;
         self.pane_scroll = ScrollState::default();
+        self.pane_generation += 1;
+    }
+
+    /// What the filter's matches depend on: the filter, the lines held,
+    /// which pane, and the object under the cursor.
+    #[must_use]
+    pub fn shown_key(&self, data: &ScopeData) -> (String, u64, PaneText, Option<ObjectRef>) {
+        (
+            self.pane_filter.text().to_owned(),
+            self.pane_generation,
+            self.pane,
+            self.selected_object(data),
+        )
     }
 
     /// What the pane is on now, which is what the lines held belong to.
@@ -528,6 +562,7 @@ impl ScopeScreen {
             return;
         }
         self.log_lines.extend(lines);
+        self.pane_generation += 1;
         if self.log_lines.len() > LOG_LINE_CAP {
             // One more than the overflow, because the line saying what went
             // takes a place of its own — and when there already is one, it
@@ -593,6 +628,7 @@ impl ScopeScreen {
             self.pending = None;
         }
         self.texts.insert((kind, object), text);
+        self.pane_generation += 1;
     }
 
     /// `Enter` or `l` on a pod: the log pane, open with the pod's log; again,
@@ -707,6 +743,7 @@ impl ScopeScreen {
     /// screen goes; the lists re-read on their own.
     pub fn on_refresh(&mut self) {
         self.texts.clear();
+        self.pane_generation += 1;
         self.pending = None;
         self.owners.clear();
         self.owner_pending = None;
@@ -770,6 +807,10 @@ impl ScopeScreen {
                     .and_then(|held| held.data.iter().find(|(k, _)| *k == key))
                     .map(|(_, value)| value.clone())
                     .unwrap_or_default();
+                if ConfigMap::is_binary(&value) {
+                    shell.set_error(format!("{key} is binary; not copied"));
+                    return AppAction::None;
+                }
                 AppAction::Copy {
                     text: value,
                     label: format!("Copied {key} of {}", object.name),
@@ -908,6 +949,7 @@ impl ScopeScreen {
         };
         if lines != self.pane_value {
             self.pane_value = lines;
+            self.pane_generation += 1;
             self.pane_scroll.scroll_to(0);
         }
     }
@@ -962,7 +1004,11 @@ impl ScopeScreen {
             (Kind::Events, _, _) => format!("{prefix} describe {}", object.slash()),
             (Kind::ConfigMaps, _, _) => format!("{prefix} get {} -o yaml", object.slash()),
             (Kind::Secrets, _, _) => {
-                let key = self.selected_key(data).unwrap_or_default();
+                // A dot in a key would read as a step down the path.
+                let key = self
+                    .selected_key(data)
+                    .unwrap_or_default()
+                    .replace('.', "\\.");
                 format!(
                     "{prefix} get secret {} -o jsonpath='{{.data.{key}}}' | base64 -d",
                     object.name
@@ -1007,6 +1053,7 @@ impl ScopeScreen {
             object: held,
             input,
             current,
+            ..
         }) = &mut self.modal
             && *held == object
             && let Ok(replicas) = &replicas
@@ -1023,7 +1070,7 @@ impl ScopeScreen {
     /// `x`: asks, rather than deleting. A pod nothing put there is refused
     /// outright — deleting it would take it away for good rather than
     /// restart it.
-    pub fn restart_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
+    pub fn restart_prompt(&mut self, shell: &mut Shell, tab: &Tab, data: &ScopeData) {
         let Some(pod) = self.selected_pod(data) else {
             shell.set_error("No pod is selected");
             return;
@@ -1038,7 +1085,7 @@ impl ScopeScreen {
         self.modal = Some(Modal::Confirm {
             title: "Restart pod".to_owned(),
             body: vec![
-                format!("Restart {}?", pod.key.name),
+                format!("Restart {} in {}?", pod.key.name, tab.scope.describe()),
                 String::new(),
                 format!("Deletes the pod; {kind} {owner} replaces it."),
             ],
@@ -1048,7 +1095,7 @@ impl ScopeScreen {
 
     /// `X`: a rollout restart of the owner, which replaces every pod of it
     /// one at a time. Refused for an owner that has no rollout.
-    pub fn rollout_prompt(&mut self, shell: &mut Shell, data: &ScopeData) {
+    pub fn rollout_prompt(&mut self, shell: &mut Shell, tab: &Tab, data: &ScopeData) {
         let Some(pod) = self.selected_pod(data) else {
             shell.set_error("No pod is selected");
             return;
@@ -1063,7 +1110,11 @@ impl ScopeScreen {
         self.modal = Some(Modal::Confirm {
             title: "Rollout restart".to_owned(),
             body: vec![
-                format!("Restart the rollout of {}?", object.slash()),
+                format!(
+                    "Restart the rollout of {} in {}?",
+                    object.slash(),
+                    tab.scope.describe()
+                ),
                 String::new(),
                 "Every pod of it is replaced, one at a time.".to_owned(),
             ],
@@ -1076,6 +1127,7 @@ impl ScopeScreen {
     pub fn scale_prompt(
         &mut self,
         shell: &mut Shell,
+        tab: &Tab,
         scope: usize,
         data: &ScopeData,
     ) -> Option<Request> {
@@ -1099,6 +1151,7 @@ impl ScopeScreen {
         input.move_end();
         self.modal = Some(Modal::Scale {
             object: object.clone(),
+            scope: tab.scope.describe(),
             input,
             current,
         });
@@ -1175,6 +1228,7 @@ impl ScopeScreen {
             }),
             Modal::Scale {
                 object,
+                scope: place,
                 input,
                 current,
             } => match input.text().trim().parse::<u32>() {
@@ -1190,6 +1244,7 @@ impl ScopeScreen {
                     shell.set_error("Replicas must be a whole number");
                     self.modal = Some(Modal::Scale {
                         object,
+                        scope: place,
                         input,
                         current,
                     });
@@ -1349,10 +1404,12 @@ impl ScopeScreen {
     }
 
     /// Moving the cursor takes a value off the screen with it, clears what
-    /// the last key refused with, and puts the details back at their top.
+    /// the last key refused with, puts the details back at their top, and
+    /// leaves the next pod's log on its running container.
     fn cursor_moved(&mut self) {
         self.details_scroll.scroll_to(0);
         self.key_cursor = 0;
+        self.previous = false;
         self.revealed = None;
         self.refusal = None;
     }
@@ -1462,6 +1519,7 @@ impl ScopeScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::secrets::REVEAL_FOR;
     use crate::kube::tests::{crashing, key, pod};
 
     fn data() -> ScopeData {
@@ -1759,6 +1817,95 @@ mod tests {
     }
 
     #[test]
+    fn a_dotted_secret_key_is_escaped_in_the_jsonpath_and_a_search_keeps_a_key_selected() {
+        let mut data = data();
+        data.secrets.rows.push(
+            SecretMeta::from_json(&serde_json::json!({
+                "metadata": {"name": "tls", "namespace": "dev"},
+                "type": "kubernetes.io/tls",
+                "data": {"tls.crt": "LS0t"}
+            }))
+            .unwrap(),
+        );
+        let mut screen = ScopeScreen::new(false);
+        screen.set_kind(Kind::Secrets);
+        screen.list_mut().input.set_text("db");
+        screen.refilter(&data);
+        screen.key_cursor = 1;
+        screen.list_mut().input.set_text("tls");
+        screen.refilter(&data);
+        assert_eq!(
+            screen.selected_key(&data).as_deref(),
+            Some("tls.crt"),
+            "one key, and the cursor on it"
+        );
+        assert!(
+            screen
+                .kubectl_line(&tab(), &data)
+                .unwrap()
+                .ends_with("jsonpath='{.data.tls\\.crt}' | base64 -d")
+        );
+    }
+
+    #[test]
+    fn a_binary_configmap_key_says_its_size_and_is_not_copied() {
+        let mut data = ScopeData::default();
+        data.configmaps.rows = vec![
+            ConfigMap::from_json(&serde_json::json!({
+                "metadata": {"name": "orders-config", "namespace": "dev"},
+                "binaryData": {"blob": "AAECAw=="}
+            }))
+            .unwrap(),
+        ];
+        let mut screen = ScopeScreen::new(false);
+        let mut shell = Shell::default();
+        screen.set_kind(Kind::ConfigMaps);
+        screen.refilter(&data);
+        assert_eq!(
+            screen.keys(&data),
+            [("blob".to_owned(), "<binary, 4 bytes>".to_owned())]
+        );
+        assert_eq!(screen.copy_value(&mut shell, 0, &data), AppAction::None);
+        assert_eq!(
+            shell.notification().map(|(said, _)| said),
+            Some("blob is binary; not copied")
+        );
+    }
+
+    #[test]
+    fn the_badge_says_when_the_pod_read_is_failing() {
+        let mut data = ScopeData::default();
+        assert_eq!(ScopeScreen::badge(&data), None);
+        data.pods.error = Some("Unable to connect to the server".to_owned());
+        assert_eq!(ScopeScreen::badge(&data).as_deref(), Some("!"));
+        data.pods.rows = vec![crashing("qa", "dev", "orders-api-7d9f5b-abc12")];
+        assert_eq!(ScopeScreen::badge(&data).as_deref(), Some("! \u{2717} 1"));
+    }
+
+    #[test]
+    fn a_rollout_restart_and_a_scale_say_which_namespace_they_act_in() {
+        let data = data();
+        let mut screen = ScopeScreen::new(false);
+        let mut shell = Shell::default();
+        screen.refilter(&data);
+        screen.list_mut().cursor.focus(1);
+        screen.rollout_prompt(&mut shell, &tab(), &data);
+        let Some(Modal::Confirm { body, .. }) = &screen.modal else {
+            panic!("a confirmation");
+        };
+        assert_eq!(
+            body[0],
+            "Restart the rollout of deployment/orders-api in qa/dev?"
+        );
+        screen.dismiss();
+        screen.scale_prompt(&mut shell, &tab(), 0, &data);
+        let Some(Modal::Scale { scope, .. }) = &screen.modal else {
+            panic!("the scale modal");
+        };
+        assert_eq!(scope, "qa/dev");
+    }
+
+    #[test]
     fn the_log_pane_follows_the_pod_under_the_cursor_once_it_is_open_and_nothing_before() {
         let data = data();
         let mut screen = ScopeScreen::new(false);
@@ -1871,6 +2018,18 @@ mod tests {
                 .kubectl_line(&tab(), &data)
                 .unwrap()
                 .ends_with("logs -f orders-api-7d9f5b-abc12 -p")
+        );
+        screen.handle_key(
+            &mut shell,
+            &data,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            !screen.log_target(0, &data).unwrap().previous,
+            "P was for the pod it was pressed on"
         );
     }
 

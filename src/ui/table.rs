@@ -18,10 +18,13 @@ use ratatui::widgets::{
 };
 
 use crate::app::cursor::ListCursor;
+use crate::app::screen::Target;
+use crate::app::shell::Shell;
 use crate::columns::{
     COLUMN_SPACING, ColumnConfig, ColumnId, SCROLLBAR_WIDTH, SELECTION_WIDTH, TableLayout,
 };
 use crate::ui::theme::theme;
+use crate::ui::widgets::render_scrollbar;
 
 /// Where a list table's parts land inside its area. A screen works this out
 /// before it draws, because how many rows fit is what its viewport is, and
@@ -115,7 +118,7 @@ impl Cell {
 }
 
 /// One list, drawn as a table. Both tabs go through here, so a row is
-/// selected, hovered and sorted the same way whatever it holds.
+/// selected and sorted the same way whatever it holds.
 pub struct TableSpec<'a> {
     /// What the pane is, on the top border: `Secrets`, `Registries`, a
     /// repository's name. It stays the same while the list underneath it
@@ -141,8 +144,6 @@ pub struct TableSpec<'a> {
     /// records what it turned out to have room for on the way past, so the
     /// keys that move the cursor know what a page is.
     pub cursor: &'a mut ListCursor,
-    /// The row the pointer is over, if it is over one.
-    pub hovered: Option<usize>,
 }
 
 /// Where the table put the things a click can land on. The screen that drew
@@ -315,37 +316,32 @@ pub fn render_list_table(frame: &mut Frame, area: Rect, spec: &mut TableSpec<'_>
             })
         })
         .collect();
-
-    if let Some(hovered) = spec.hovered
-        && let Some((_, rect)) = hits.rows.iter().find(|(index, _)| *index == hovered)
-    {
-        tint(frame, *rect);
-    }
     hits
 }
 
-/// The wash under the row the pointer is over.
-///
-/// A row's cells carry colours of their own — a warning on an expiry, a muted
-/// foreground on a stale vault — and reversing the row would flatten them into
-/// one block, so it is tinted instead. Painted after the table, so a row that
-/// is hovered *and* selected shows the hover over the selection. A palette
-/// with no tint to give has to reverse the row after all.
-fn tint(frame: &mut Frame, rect: Rect) {
-    let wash = theme().hover_background;
-    let rect = rect.intersection(frame.area());
-    let buffer = frame.buffer_mut();
-    for y in rect.y..rect.y.saturating_add(rect.height) {
-        for x in rect.x..rect.x.saturating_add(rect.width) {
-            let cell = &mut buffer[(x, y)];
-            let style = if wash == Color::Reset {
-                cell.style().add_modifier(Modifier::REVERSED)
-            } else {
-                cell.style().bg(wash)
-            };
-            cell.set_style(style);
-        }
+/// A screen's table: drawn, its rows and headers made places a click can
+/// land, and the scrollbar down its right edge.
+pub fn render_table_in(frame: &mut Frame, shell: &mut Shell, area: Rect, spec: &mut TableSpec<'_>) {
+    let hits = render_list_table(frame, area, spec);
+    for (index, rect) in hits.rows {
+        shell.region(rect, Target::Row(index));
     }
+    for (column, rect) in hits.headers {
+        shell.region(rect, Target::Header(column));
+    }
+    let geometry = table_geometry(area);
+    render_scrollbar(
+        frame,
+        Rect::new(
+            geometry.inner.right().saturating_sub(1),
+            geometry.body.y,
+            1,
+            geometry.body.height,
+        ),
+        spec.cursor.scroll.offset,
+        geometry.visible_rows,
+        spec.total,
+    );
 }
 
 /// The frame every pane wears: the theme's corners, the accent while it has
@@ -457,7 +453,6 @@ mod tests {
                     rows,
                     total: 412,
                     cursor,
-                    hovered: None,
                 };
                 build(&mut spec);
                 hits = render_list_table(frame, frame.area(), &mut spec);
@@ -506,15 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn the_row_under_the_cursor_is_marked_and_the_one_under_the_pointer_is_washed() {
+    fn the_row_under_the_cursor_is_marked() {
         let mut cursor = ListCursor::default();
         // What the frame before this one left the cursor knowing, which is
         // what puts row 1 on screen rather than scrolling until it is.
         table_geometry(Rect::new(0, 0, 90, 10)).window(&mut cursor, 412);
         cursor.focus(1);
-        let (buffer, hits) = draw(90, 10, &secrets(), &mut cursor, |spec| {
-            spec.hovered = Some(2)
-        });
+        let (buffer, hits) = draw(90, 10, &secrets(), &mut cursor, |_| {});
 
         let (_, selected) = hits.rows[1];
         assert_eq!(
@@ -531,26 +524,6 @@ mod tests {
             buffer[(selected.x + 4, selected.y)].bg,
             theme().selected_background,
         );
-
-        let (_, hovered) = hits.rows[2];
-        let washed = &buffer[(hovered.x + 4, hovered.y)];
-        let neighbour = &buffer[(hits.rows[0].1.x + 4, hits.rows[0].1.y)];
-        if theme().hover_background == Color::Reset {
-            // A palette with no tint to give reverses the row instead, so
-            // that is the signal to look for and to look for the absence of.
-            assert!(washed.modifier.contains(Modifier::REVERSED));
-            assert!(
-                !neighbour.modifier.contains(Modifier::REVERSED),
-                "and its neighbours are left alone"
-            );
-        } else {
-            assert_eq!(washed.bg, theme().hover_background);
-            assert_ne!(
-                neighbour.bg,
-                theme().hover_background,
-                "and its neighbours are left alone"
-            );
-        }
     }
 
     #[test]
@@ -637,7 +610,6 @@ mod tests {
                     rows: &rows,
                     total: 1,
                     cursor: &mut cursor,
-                    hovered: None,
                 };
                 render_list_table(frame, frame.area(), &mut spec);
             })

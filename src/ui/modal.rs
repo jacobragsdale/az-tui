@@ -34,12 +34,13 @@ pub fn render_modal(frame: &mut Frame, shell: &mut Shell, modal: &Modal, area: R
         ),
         Modal::Scale {
             object,
+            scope,
             input,
             current,
         } => (
             "Scale",
             vec![
-                Line::from(format!("{} {}", object.kind, object.name)),
+                Line::from(format!("{} {} in {scope}", object.kind, object.name)),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("Replicas  ", Style::default().fg(palette.muted)),
@@ -133,6 +134,7 @@ mod tests {
                 namespace: "dev".into(),
                 name: "orders".into(),
             },
+            scope: "qa/dev".into(),
             input,
             current: None,
         };
@@ -146,5 +148,6 @@ mod tests {
             .unwrap();
         let drawn = screen_text(terminal.backend().buffer());
         assert!(drawn.contains("[ 13\u{258f}2]"), "{drawn}");
+        assert!(drawn.contains("deployment orders in qa/dev"), "{drawn}");
     }
 }

@@ -108,6 +108,23 @@ impl ListCursor {
         self.scroll.scroll_to(0);
     }
 
+    /// The wheel over a list of `count` rows: the viewport moves and the
+    /// cursor follows it rather than being left behind, so what a key acts
+    /// on is always something on screen. Says whether the cursor moved.
+    pub fn wheel(&mut self, delta: i32, count: usize) -> bool {
+        let before = self.index;
+        // The scroll state is from the last draw, which a refresh may have
+        // shortened the list under since; measured again here so the window
+        // below cannot come out inside out.
+        self.scroll.set_viewport(self.scroll.viewport, count);
+        self.scroll.scroll_by(delta);
+        let last = (self.scroll.offset + self.scroll.viewport.saturating_sub(1))
+            .min(count.saturating_sub(1));
+        let first = self.scroll.offset.min(last);
+        self.index = self.index.clamp(first, last);
+        self.index != before
+    }
+
     /// Re-clamps the cursor after the list under it has changed length.
     pub const fn clamp(&mut self, count: usize) {
         if count == 0 {
@@ -162,6 +179,21 @@ mod tests {
 
         list.clamp(0);
         assert_eq!((list.index, list.scroll.offset), (0, 0), "and none of it");
+    }
+
+    #[test]
+    fn the_wheel_drags_the_cursor_along_with_the_viewport() {
+        let mut list = cursor(5);
+        assert!(
+            list.wheel(3, 20),
+            "row 0 scrolled off, so the cursor follows"
+        );
+        assert_eq!((list.index, list.scroll.offset), (3, 3));
+        list.focus(5);
+        assert!(!list.wheel(-1, 20), "row 5 is still on screen");
+        assert_eq!((list.index, list.scroll.offset), (5, 2));
+        assert!(list.wheel(1, 4), "a list shortened since the last draw");
+        assert_eq!((list.index, list.scroll.offset), (3, 0));
     }
 
     #[test]

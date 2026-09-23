@@ -59,6 +59,21 @@ pub fn config_file_with(
     config_dir_with(env).join("config.toml")
 }
 
+/// Whether the config file was named — by `--config` or `AZ_TUI_CONFIG` —
+/// rather than looked for in the config directory. A named file that is not
+/// there is a mistake; the default one not being there is a first run.
+#[must_use]
+pub fn config_named(flag: Option<&std::path::Path>) -> bool {
+    config_named_with(flag, from_env)
+}
+
+pub fn config_named_with(
+    flag: Option<&std::path::Path>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> bool {
+    flag.is_some() || env("AZ_TUI_CONFIG").is_some_and(|value| !value.is_empty())
+}
+
 /// The cache file: `--cache` first, then `AZ_TUI_CACHE`, then the data
 /// directory's `cache.json`.
 #[must_use]
@@ -167,5 +182,21 @@ mod tests {
             PathBuf::from("/home/j/.config/az-tui/config.toml")
         );
         assert!(session_file_with(bare).ends_with("az-tui/session.json"));
+    }
+
+    #[test]
+    fn a_config_is_named_by_the_flag_or_the_variable_and_not_by_the_directory() {
+        let flag = Some(std::path::Path::new("/flag.toml"));
+        let bare = env_of(&[("HOME", "/home/j")]);
+        assert!(config_named_with(flag, bare));
+        assert!(config_named_with(
+            None,
+            env_of(&[("AZ_TUI_CONFIG", "/etc/az.toml")])
+        ));
+        assert!(!config_named_with(None, bare));
+        assert!(
+            !config_named_with(None, env_of(&[("AZ_TUI_CONFIG", "")])),
+            "an empty variable names nothing, as config_file reads it"
+        );
     }
 }

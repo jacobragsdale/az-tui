@@ -259,24 +259,6 @@ impl Rgb {
             (value & 0xff) as u8,
         ))
     }
-
-    /// The colour `t` of the way from this one to `other`, for the tints a
-    /// palette does not name — a hover a shade lighter than the ground.
-    #[must_use]
-    pub fn mix(self, other: Self, t: f32) -> Self {
-        let channel = |from: u8, to: u8| {
-            let mixed = f32::from(from) + (f32::from(to) - f32::from(from)) * t;
-            // Clamped to a byte before the cast, so nothing is truncated.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let byte = mixed.round().clamp(0.0, 255.0) as u8;
-            byte
-        };
-        Self(
-            channel(self.0, other.0),
-            channel(self.1, other.1),
-            channel(self.2, other.2),
-        )
-    }
 }
 
 impl From<Rgb> for Color {
@@ -308,10 +290,14 @@ fn one_or_many<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>
 }
 
 /// Reads the file, or the default configuration when there is none. A file
-/// that will not parse is an error naming the path and the line.
-pub fn load(path: &Path) -> Result<Config> {
+/// that will not parse is an error naming the path and the line, and so is
+/// one that is not there when it was `named` rather than looked for.
+pub fn load(path: &Path, named: bool) -> Result<Config> {
     match std::fs::read_to_string(path) {
         Ok(source) => parse(&source).with_context(|| format!("reading {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && named => {
+            anyhow::bail!("no config file at {}", path.display())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
@@ -436,8 +422,14 @@ namespaces = "prod"
 
     #[test]
     fn a_missing_file_is_the_default_configuration() {
-        let config = load(Path::new("/nonexistent/az-tui/config.toml")).unwrap();
+        let config = load(Path::new("/nonexistent/az-tui/config.toml"), false).unwrap();
         assert_eq!(config, Config::default());
+        let error = load(Path::new("/nonexistent/az-tui/config.toml"), true).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "no config file at /nonexistent/az-tui/config.toml",
+            "a file that was named and is not there is a mistake"
+        );
     }
 
     #[test]
@@ -445,17 +437,8 @@ namespaces = "prod"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[theme]\npreset = [1]\n").unwrap();
-        let message = format!("{:#}", load(&path).unwrap_err());
+        let message = format!("{:#}", load(&path, false).unwrap_err());
         assert!(message.contains("config.toml"), "{message}");
-    }
-
-    #[test]
-    fn mixing_moves_each_channel_part_of_the_way() {
-        let black = Rgb(0, 0, 0);
-        let white = Rgb(255, 255, 255);
-        assert_eq!(black.mix(white, 0.5), Rgb(128, 128, 128));
-        assert_eq!(black.mix(white, 0.0), black);
-        assert_eq!(black.mix(white, 1.0), white);
     }
 
     #[test]

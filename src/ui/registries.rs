@@ -10,15 +10,12 @@ use super::details::{
     field, link_field, pane_width, quiet, refused, render_pane, section, subtitle, title, with_hint,
 };
 use super::secrets::env_cell;
-use super::table::{Cell, TableSpec, render_list_table, table_geometry};
+use super::table::{Cell, TableSpec, render_table_in, table_geometry};
 use super::theme::theme;
-use super::widgets::{
-    Pane, REPOSITORIES_PLACEHOLDER, TAGS_PLACEHOLDER, render_panes, render_scrollbar,
-};
+use super::widgets::{Pane, REPOSITORIES_PLACEHOLDER, TAGS_PLACEHOLDER, render_panes};
 use crate::app::registries::{
     Level, REPOSITORY_SCHEMA, RegistriesScreen, TAG_SCHEMA, TAGS_IN_PANE,
 };
-use crate::app::screen::Target;
 use crate::app::shell::{Focus, Shell};
 use crate::azure::acr::{human_size, short_digest};
 use crate::columns::{ColumnConfig, ColumnId, TableLayout};
@@ -110,7 +107,6 @@ fn render_table(
         }
     };
 
-    let first = screen.table().cursor.scroll.offset;
     let focused = shell.focus == Focus::Table;
     let cursor = &mut screen.table_mut().cursor;
     let mut spec = TableSpec {
@@ -122,27 +118,8 @@ fn render_table(
         rows: &rows,
         total,
         cursor,
-        hovered: None,
     };
-    let hits = render_list_table(frame, area, &mut spec);
-    for (index, rect) in hits.rows {
-        shell.region(rect, Target::Row(index));
-    }
-    for (column, rect) in hits.headers {
-        shell.region(rect, Target::Header(column));
-    }
-    render_scrollbar(
-        frame,
-        Rect::new(
-            geometry.inner.right().saturating_sub(1),
-            geometry.body.y,
-            1,
-            geometry.body.height,
-        ),
-        first,
-        geometry.visible_rows,
-        total,
-    );
+    render_table_in(frame, shell, area, &mut spec);
 }
 
 fn repository_cells(

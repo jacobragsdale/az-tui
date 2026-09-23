@@ -7,10 +7,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::details::{quiet, refused, render_pane};
-use super::table::{Cell, TableSpec, render_list_table, table_geometry};
+use super::table::{Cell, TableSpec, render_table_in, table_geometry};
 use super::textpane::render_text_pane;
 use super::theme::theme;
-use super::widgets::{Pane, placeholder, render_panes, render_scrollbar};
+use super::widgets::{Pane, placeholder, render_panes};
 use super::{config, events, pods};
 use crate::app::list::Row;
 use crate::app::scope::ScopeScreen;
@@ -77,7 +77,6 @@ fn render_table(
     // End know how far to move.
     let total = list.visible().len();
     let window = geometry.window(&mut list.cursor, total);
-    let first = window.start;
     let shown: Vec<Vec<Cell>> = list.visible()[window]
         .iter()
         .map(|at| match kind {
@@ -101,28 +100,8 @@ fn render_table(
         rows: &shown,
         total,
         cursor: &mut list.cursor,
-        hovered: None,
     };
-    let hits = render_list_table(frame, area, &mut spec);
-
-    for (index, rect) in hits.rows {
-        shell.region(rect, Target::Row(index));
-    }
-    for (column, rect) in hits.headers {
-        shell.region(rect, Target::Header(column));
-    }
-    render_scrollbar(
-        frame,
-        Rect::new(
-            geometry.inner.right().saturating_sub(1),
-            geometry.body.y,
-            1,
-            geometry.body.height,
-        ),
-        first,
-        geometry.visible_rows,
-        total,
-    );
+    render_table_in(frame, shell, area, &mut spec);
 }
 
 /// The details pane for the row under the cursor, with the text pane under

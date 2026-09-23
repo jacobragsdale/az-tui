@@ -173,6 +173,19 @@ fn a_stamp_that_is_not_set_sorts_last_whichever_way_the_sort_points() {
     );
 }
 
+/// Every column `S` stops on in `available` cells, in the order it walks
+/// them.
+fn sortable(layout: &TableLayout, available: u16) -> Vec<ColumnId> {
+    let first = layout.next_sort(ColumnId::Vault, available).unwrap();
+    let mut walked = vec![first];
+    while let Some(next) = layout.next_sort(*walked.last().unwrap(), available)
+        && next != first
+    {
+        walked.push(next);
+    }
+    walked
+}
+
 #[test]
 fn only_the_columns_on_screen_can_be_sorted_by() {
     let layout = TableLayout::new(SECRET_COLUMNS);

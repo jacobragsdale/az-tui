@@ -11,7 +11,7 @@
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::azure::Secret;
 use crate::config::Scope;
 use crate::timestamp::Timestamp;
 
@@ -181,13 +182,6 @@ impl Pod {
     #[must_use]
     pub fn owner_name(&self) -> &str {
         self.owner.as_ref().map_or("", |(_, name)| name.as_str())
-    }
-
-    /// Whether deleting it restarts anything: a pod with a controller is put
-    /// back by that controller, a bare pod is simply gone.
-    #[must_use]
-    pub const fn restartable(&self) -> bool {
-        self.owner.is_some()
     }
 
     /// Whether the STATUS word is one somebody has to look at.
@@ -633,6 +627,12 @@ impl ConfigMap {
         })
     }
 
+    /// Whether a value is the size a binary key says in place of its bytes.
+    #[must_use]
+    pub fn is_binary(value: &str) -> bool {
+        value.starts_with("<binary, ") && value.ends_with(" bytes>")
+    }
+
     #[must_use]
     pub fn object(&self) -> ObjectRef {
         ObjectRef {
@@ -691,44 +691,6 @@ impl SecretMeta {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
         }
-    }
-}
-
-/// A secret's value, decoded. **The one type in the crate that holds one.**
-///
-/// `Debug` and `Display` print `[redacted]`, it derives no `Serialize`, and
-/// [`Secret::expose`] is the one way to read it — meant to be conspicuous at
-/// the call site.
-pub struct Secret(String);
-
-impl Secret {
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// The value. The callers are the line that draws it and the key that
-    /// copies it; a grep for this method over `src/` is the audit.
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn line_count(&self) -> usize {
-        self.0.lines().count().max(1)
-    }
-}
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("[redacted]")
-    }
-}
-
-impl std::fmt::Display for Secret {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("[redacted]")
     }
 }
 
@@ -860,19 +822,48 @@ impl Kubectl {
 
 /// Runs one command to completion, or kills it at `cap`. Both pipes are
 /// drained on threads of their own, so a child that fills one never blocks.
-pub(crate) fn run_capped(mut command: Command, cap: Duration) -> Result<String> {
+pub(crate) fn run_capped(command: Command, cap: Duration) -> Result<String> {
+    let (status, out, err) = run_until(
+        command,
+        cap,
+        "a kubelogin waiting for a device-code login looks like this; run \
+         `kubelogin convert-kubeconfig -l azurecli`",
+    )?;
+    if status.success() {
+        Ok(out)
+    } else {
+        bail!("{}", kubectl_error(&err))
+    }
+}
+
+/// Runs one command to completion, or kills it at `cap`, and hands back how
+/// it exited and both pipes whole. `stalled` ends the sentence said at the
+/// cap: what a hang of this program usually means.
+///
+/// A program that could not be started carries an `io::Error` in its chain,
+/// so a caller can tell "not there" from "ran and failed".
+pub(crate) fn run_until(
+    mut command: Command,
+    cap: Duration,
+    stalled: &str,
+) -> Result<(ExitStatus, String, String)> {
     let program = command.get_program().to_string_lossy().into_owned();
+    // Its own process group, so the cap takes a credential plugin the child
+    // spawned down with it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("{program} is not installed or not on PATH")
+            let said = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{program} is not installed or not on PATH")
             } else {
-                anyhow!("{program} could not be run: {error}")
-            }
+                format!("{program} could not be run: {error}")
+            };
+            anyhow::Error::new(std::io::Error::new(error.kind(), said))
         })?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
@@ -885,29 +876,29 @@ pub(crate) fn run_capped(mut command: Command, cap: Duration) -> Result<String> 
             break status;
         }
         if Instant::now() >= deadline {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             let _ = child.kill();
             let _ = child.wait();
-            // The drains are not joined: a credential plugin the child spawned
-            // inherits the pipes and holds them open for as long as it polls,
-            // which is the very wait the cap is for. Each thread ends on its
-            // own when the pipe finally closes.
-            // ponytail: one parked thread per timed-out call; a process group
-            // killed as one if that ever shows in a profile.
-            bail!(
-                "{program} did not answer in {}s — a kubelogin waiting for a device-code login \
-                 looks like this; run `kubelogin convert-kubeconfig -l azurecli`",
-                cap.as_secs()
-            );
+            // The drains are not joined: a grandchild that left the group
+            // still holds the pipes open for as long as it runs, which is the
+            // very wait the cap is for. Each thread ends on its own when the
+            // pipe finally closes.
+            // ponytail: the group kill misses a grandchild that started its
+            // own session, and Windows has no group here at all; one parked
+            // thread per such call, a job object if that ever shows.
+            bail!("{program} did not answer in {}s — {stalled}", cap.as_secs());
         }
         thread::sleep(Duration::from_millis(20));
     };
     let out = stdout.join().unwrap_or_default();
     let err = stderr.join().unwrap_or_default();
-    if status.success() {
-        Ok(out)
-    } else {
-        bail!("{}", kubectl_error(&err))
-    }
+    Ok((status, out, err))
 }
 
 /// Reads one pipe to its end on a thread of its own.
@@ -2052,7 +2043,6 @@ pub(crate) mod tests {
         );
         assert_eq!(pod.label("app"), Some("orders-api"));
         assert_eq!(pod.app(), Some("orders-api"));
-        assert!(pod.restartable());
         assert_eq!(pod.glyph(), "\u{25cf}");
         assert!(Pod::from_json("qa", &json!({"metadata": {}})).is_none());
         // And it survives the cache.
@@ -2195,7 +2185,6 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(bare.owner, None);
-        assert!(!bare.restartable());
         assert_eq!(bare.owner_label(), "\u{2014}");
     }
 
@@ -2252,6 +2241,67 @@ pub(crate) mod tests {
 
         let error = run_capped(Command::new("az-tui-no-such-program"), CALL_CAP).unwrap_err();
         assert!(format!("{error:#}").contains("not installed"), "{error:#}");
+    }
+
+    #[test]
+    fn a_capped_run_says_what_its_own_program_stalls_on_and_a_missing_one_is_an_io_error() {
+        let mut hangs = Command::new("sleep");
+        hangs.arg("30");
+        let error = run_until(hangs, Duration::from_millis(200), "run it by hand").unwrap_err();
+        let said = format!("{error:#}");
+        assert!(
+            said.ends_with("did not answer in 0s — run it by hand"),
+            "{said}"
+        );
+        assert!(!said.contains("kubelogin"), "{said}");
+
+        let mut fails = Command::new("sh");
+        fails.args([
+            "-c",
+            "printf out; echo 'ERROR: AADSTS50076: mfa' >&2; exit 1",
+        ]);
+        let (status, out, err) = run_until(fails, Duration::from_secs(5), "").unwrap();
+        assert!(!status.success());
+        assert_eq!(out, "out");
+        assert_eq!(
+            err, "ERROR: AADSTS50076: mfa\n",
+            "stderr whole, not read as kubectl's"
+        );
+
+        let error = run_until(Command::new("az-tui-no-such-program"), CALL_CAP, "").unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause.is::<std::io::Error>()),
+            "{error:#}"
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            "az-tui-no-such-program is not installed or not on PATH"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_takes_the_whole_process_group_down() {
+        // A duration nothing else runs, so pgrep finds only these two.
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 7243 & sleep 7243"]);
+        run_capped(command, Duration::from_millis(200)).unwrap_err();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let survivors = Command::new("pgrep")
+                .args(["-f", "^sleep 7243$"])
+                .output()
+                .unwrap();
+            if !survivors.status.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "still running: {}",
+                String::from_utf8_lossy(&survivors.stdout)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// One scope read and what it answers.
@@ -2768,9 +2818,6 @@ pub(crate) mod tests {
         );
         assert_eq!(base64_decode("YWRt\naW4=").unwrap(), b"admin");
         assert!(base64_decode("not*base64").is_err());
-        let value = Secret::new("hunter2");
-        assert_eq!(format!("{value:?} {value}"), "[redacted] [redacted]");
-        assert_eq!(value.expose(), "hunter2");
     }
 
     #[test]

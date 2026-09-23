@@ -152,9 +152,10 @@ pub struct Inventory {
 pub struct Secret(String);
 
 impl Secret {
-    /// Wraps a value read out of a vault. Called from exactly one place —
-    /// [`vault::value`](crate::azure::vault::value) — so that every secret in
-    /// the crate has one provenance.
+    /// Wraps a value read out of a vault or a cluster. Called from exactly
+    /// two places — [`vault::value`](crate::azure::vault::value) and the
+    /// `kubectl` secret read in [`crate::kube`] — so that every secret in the
+    /// crate has one of two provenances.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())

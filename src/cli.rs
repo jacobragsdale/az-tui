@@ -33,15 +33,16 @@ pub struct Cli {
     #[arg(long, value_name = "SECS")]
     pub refresh: Option<u64>,
 
-    /// terminal · terminal-light · mono · custom
-    #[arg(long, value_name = "NAME", global = true)]
+    /// terminal · terminal-light · mono · custom [env: AZ_TUI_THEME]
+    #[arg(long, value_name = "NAME", global = true, value_parser = theme_name)]
     pub theme: Option<String>,
 
-    /// Read this file instead of ~/.config/az-tui/config.toml.
+    /// Read this file instead of $XDG_CONFIG_HOME/az-tui/config.toml
+    /// (~/.config/az-tui/config.toml when that is unset) [env: AZ_TUI_CONFIG]
     #[arg(long, value_name = "PATH", global = true)]
     pub config: Option<PathBuf>,
 
-    /// Keep the cache here instead of in the data directory.
+    /// Keep the cache here instead of in the data directory [env: AZ_TUI_CACHE]
     #[arg(long, value_name = "PATH", global = true)]
     pub cache: Option<PathBuf>,
 
@@ -59,8 +60,9 @@ pub enum Command {
     /// kubectl, kubelogin and every AKS scope in config.toml.
     Doctor,
 
-    /// Fetch credentials for every AKS cluster the login can see and print a
-    /// [[clusters]] block for each.
+    /// Fetch credentials for every AKS cluster in the current az
+    /// subscription, or in each --subscription / [azure].subscriptions when
+    /// given, and print a [[clusters]] block for each.
     Setup {
         /// Write the blocks to config.toml when there is no file yet.
         #[arg(long)]
@@ -172,6 +174,16 @@ impl Cli {
     }
 }
 
+/// A `--theme` name, checked while the arguments are read so a typo exits 2
+/// and names the themes there are. `AZ_TUI_THEME` is checked later, by
+/// `chosen_theme`.
+fn theme_name(raw: &str) -> anyhow::Result<String> {
+    if !raw.trim().is_empty() {
+        ThemeChoice::parse(raw)?;
+    }
+    Ok(raw.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +235,19 @@ mod tests {
         assert!(cli.no_cache);
         assert_eq!(cli.config.as_deref(), Some(std::path::Path::new("x.toml")));
         assert!(matches!(cli.command, Some(Command::Secrets { .. })));
+    }
+
+    #[test]
+    fn a_bad_theme_is_an_argument_error_that_names_the_themes() {
+        let error = Cli::try_parse_from(["az-tui", "--theme", "dracula"]).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        let said = error.to_string();
+        assert!(
+            said.contains("terminal, terminal-light, mono, custom"),
+            "{said}"
+        );
+
+        let cli = Cli::parse_from(["az-tui", "secrets", "--theme", "light"]);
+        assert_eq!(cli.theme.as_deref(), Some("light"), "an alias still reads");
     }
 }

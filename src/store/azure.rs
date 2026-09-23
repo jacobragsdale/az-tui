@@ -25,6 +25,10 @@ pub enum Applied {
     Secrets,
     /// The rows of the Registries table moved.
     Repositories,
+    /// One repository's counts and stamps arrived. Its row stayed where it
+    /// was and its registry and name did not change, so only where it sorts
+    /// and whether it passes a filter may have.
+    Filled,
     /// The inventory arrived: both tables may have lost rows.
     Inventory,
     /// Something the details pane shows arrived.
@@ -120,10 +124,19 @@ impl AzureStore {
         })
     }
 
-    /// The first problem, for the status bar. `?` lists them all.
+    /// The first problem the Registries tab (`registries`) or the Secrets
+    /// tab should show in its status bar: one about the whole read, or one
+    /// about a registry or a vault of its own. `?` lists them all.
     #[must_use]
-    pub fn first_problem(&self) -> Option<&(String, String)> {
-        self.problems.first()
+    pub fn first_problem(&self, registries: bool) -> Option<&(String, String)> {
+        self.problems.iter().find(|(who, _)| {
+            who.is_empty()
+                || if registries {
+                    self.registry(who).is_some()
+                } else {
+                    self.vault(who).is_some()
+                }
+        })
     }
 
     /// The vault a row names, as the inventory describes it.
@@ -206,8 +219,25 @@ impl AzureStore {
                 }
             },
             Event::Repositories { registry, result } => match result {
-                Ok(rows) => {
+                Ok(mut rows) => {
                     self.stale.remove(&registry);
+                    // The catalog lists names only. What an earlier fill
+                    // said stands until this refresh's fill says otherwise,
+                    // rather than the columns going blank in between.
+                    let filled: HashMap<&str, &Repository> = self
+                        .repositories
+                        .iter()
+                        .filter(|held| held.registry == registry)
+                        .map(|held| (held.name.as_str(), held))
+                        .collect();
+                    for row in &mut rows {
+                        if let Some(held) = filled.get(row.name.as_str()) {
+                            row.tag_count = row.tag_count.or(held.tag_count);
+                            row.manifest_count = row.manifest_count.or(held.manifest_count);
+                            row.created = row.created.or(held.created);
+                            row.updated = row.updated.or(held.updated);
+                        }
+                    }
                     let order = &self.inventory.registries;
                     replace(
                         &mut self.repositories,
@@ -233,7 +263,7 @@ impl AzureStore {
                     .find(|held| held.registry == registry && held.name == repository.name)
                 {
                     *held = repository;
-                    return Applied::Repositories;
+                    return Applied::Filled;
                 }
                 Applied::Nothing
             }
@@ -460,7 +490,11 @@ mod tests {
         assert_eq!(store.secrets.len(), 3, "yesterday's names beat no names");
         assert!(store.stale.contains("kv-a"));
         assert!(!store.stale.contains("kv-b"));
-        assert_eq!(store.first_problem().unwrap().0, "kv-a");
+        assert_eq!(store.first_problem(false).unwrap().0, "kv-a");
+        assert!(
+            store.first_problem(true).is_none(),
+            "a vault's problem is not the Registries tab's"
+        );
 
         // It answers on the next refresh and stops being stale.
         store.apply(Event::Secrets {
@@ -599,6 +633,18 @@ mod tests {
             },
         });
         assert_eq!(store.repositories[0].tag_count, Some(48));
+
+        // The next refresh lists the name again, unfilled; what the fill
+        // said stands until the new fill lands.
+        store.apply(Event::Repositories {
+            registry: "acra".into(),
+            result: Ok(vec![Repository::unfilled("acra", "api")]),
+        });
+        assert_eq!(store.repositories[0].tag_count, Some(48));
+        assert_eq!(
+            store.repositories[0].updated,
+            Some(ts("2026-09-11T18:00:00Z"))
+        );
 
         // A fill for a repository that is no longer listed is dropped.
         let applied = store.apply(Event::Repository {

@@ -1,6 +1,7 @@
 //! Opening a URL in whatever browser the desktop has.
 
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -15,22 +16,45 @@ pub fn open_in_browser(url: &str) -> Result<()> {
         bail!("only HTTPS links are opened");
     }
     let mut last = None;
-    for mut command in browser_commands(url, is_wsl()) {
-        let program = command.get_program().to_string_lossy().into_owned();
-        let result = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .with_context(|| format!("failed to start {program}"));
-        match result {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => last = Some(anyhow::anyhow!("{program} exited with {status}")),
+    for command in browser_commands(url, is_wsl()) {
+        match launch(command, LAUNCH_WAIT) {
+            Ok(()) => return Ok(()),
             Err(error) => last = Some(error),
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no browser launcher available")))
         .context("could not open a browser")
+}
+
+/// How long a launcher gets to say it failed. `xdg-open` can run the
+/// browser in the foreground and only return when it closes, and this is the
+/// UI thread.
+const LAUNCH_WAIT: Duration = Duration::from_secs(2);
+
+/// Starts one launcher and waits up to `wait` for it. An early failure is an
+/// error, so the next launcher is tried; one still running at the deadline
+/// has opened something, and is reaped on a thread of its own.
+fn launch(mut command: Command, wait: Duration) -> Result<()> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))?;
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        match child
+            .try_wait()
+            .with_context(|| format!("{program} could not be waited for"))?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => bail!("{program} exited with {status}"),
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 /// The launchers to try, in order.
@@ -133,6 +157,21 @@ mod tests {
             .map(|command| command.get_program().to_string_lossy().into_owned())
             .collect();
         assert_eq!(programs.len(), 1, "nothing Windows-shaped off WSL");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_that_fails_early_is_an_error_and_one_still_running_has_opened() {
+        let error = launch(command("sh", &["-c", "exit 3"]), Duration::from_secs(5)).unwrap_err();
+        assert!(format!("{error:#}").contains("exited with"), "{error:#}");
+
+        let started = Instant::now();
+        launch(command("sleep", &["5"]), Duration::from_millis(200)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "not waited for: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

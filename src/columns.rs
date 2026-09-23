@@ -444,6 +444,19 @@ impl TableLayout {
         columns
     }
 
+    /// The column `S` walks to after `current`: the next one on screen in
+    /// `available` cells, or the first when `current` is not on screen.
+    /// Only what is on screen, because sorting by a hidden column would move
+    /// the rows for a reason nobody could see. None when nothing is.
+    #[must_use]
+    pub fn next_sort(&self, current: ColumnId, available: u16) -> Option<ColumnId> {
+        let columns = self.visible_columns(available);
+        let at = columns.iter().position(|column| column.id == current);
+        columns
+            .get(at.map_or(0, |at| (at + 1) % columns.len()))
+            .map(|column| column.id)
+    }
+
     #[must_use]
     pub const fn constraint(column: ColumnConfig) -> Constraint {
         if column.id.spec().flexible || column.width == 0 {

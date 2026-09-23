@@ -111,6 +111,26 @@ impl When {
             Self::Beyond(limit) => days > limit,
         }
     }
+
+    /// Whether one stamp answers this filter as an age, measured back from
+    /// `now`: `<30d` is at most thirty days ago, `>30d` is longer ago than
+    /// that. What `updated:` and `created:` mean, where `holds` would read a
+    /// past stamp as inside every window.
+    #[must_use]
+    pub fn holds_age(self, stamp: Option<Timestamp>, now: Timestamp) -> bool {
+        let Some(stamp) = stamp else {
+            return self == Self::Never;
+        };
+        // Positive when the stamp is behind now.
+        let seconds = stamp.seconds_until(now);
+        let days = seconds / 86_400;
+        match self {
+            Self::Never => false,
+            Self::Past => seconds > 0,
+            Self::Within(limit) => days <= limit,
+            Self::Beyond(limit) => days > limit,
+        }
+    }
 }
 
 /// A `tag:key` or `tag:key=value` test against a row's sorted tags.
@@ -118,16 +138,9 @@ impl When {
 pub fn tag_matches(tags: &[(String, String)], filter: &str) -> bool {
     match filter.split_once('=') {
         Some((key, value)) => tags.iter().any(|(held_key, held_value)| {
-            held_key.eq_ignore_ascii_case(key)
-                && held_value
-                    .to_ascii_lowercase()
-                    .contains(&value.to_ascii_lowercase())
+            held_key.eq_ignore_ascii_case(key) && contains(held_value, value)
         }),
-        None => tags.iter().any(|(held_key, _)| {
-            held_key
-                .to_ascii_lowercase()
-                .contains(&filter.to_ascii_lowercase())
-        }),
+        None => tags.iter().any(|(held_key, _)| contains(held_key, filter)),
     }
 }
 
@@ -302,6 +315,20 @@ mod tests {
             !When::Within(30).holds(None, now),
             "a secret with no expiry is not expiring"
         );
+    }
+
+    #[test]
+    fn an_age_answers_about_a_stamp_behind_now() {
+        let now = ts("2026-09-11T20:00:00Z");
+        let three_days_ago = Some(ts("2026-09-08T20:00:00Z"));
+        let ninety_days_ago = Some(ts("2026-06-13T20:00:00Z"));
+
+        assert!(When::Within(30).holds_age(three_days_ago, now));
+        assert!(!When::Within(30).holds_age(ninety_days_ago, now));
+        assert!(When::Beyond(30).holds_age(ninety_days_ago, now));
+        assert!(!When::Beyond(30).holds_age(three_days_ago, now));
+        assert!(When::Never.holds_age(None, now));
+        assert!(!When::Within(30).holds_age(None, now));
     }
 
     #[test]

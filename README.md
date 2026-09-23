@@ -181,10 +181,12 @@ with no trailing newline of its own, so `$(az-tui secret get NAME)` is the
 value byte for byte, and a value that ends in a newline keeps it. A name that
 is in more than one vault is an error listing them rather than a guess.
 
-`setup` fetches credentials for every AKS cluster the login can see, converts
-the kubeconfig, and prints a `[[clusters]]` block per cluster to trim;
-`--write` puts them in `config.toml` when there is no file yet, and never
-overwrites one: with a file already there it prints the blocks and exits 0.
+`setup` fetches credentials for every AKS cluster in the current `az`
+subscription — or in each `--subscription` or `[azure].subscriptions` entry
+when there are any — converts the kubeconfig, and prints a `[[clusters]]`
+block per cluster to trim; a cluster whose credentials fail is said and left
+out. `--write` puts the blocks in `config.toml` when there is no file yet, and
+never overwrites one: with a file already there it prints them and exits 0.
 
 Exit codes: **0** it worked, **1** a read failed (the rows that did answer
 are still printed first), **2** the arguments were wrong.

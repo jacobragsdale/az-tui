@@ -11,12 +11,12 @@
 //! The endpoints are the `/acr/v1/` ones, which carry attributes. The `/v2/`
 //! ones are the OCI distribution API and carry names only.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::auth::Audience;
 use super::graph::{string, text};
-use super::transport::{Client, Request, percent_encode};
+use super::transport::{Client, Request, host_under, percent_encode};
 use super::{Manifest, Registry, Repository, Tag};
 use crate::timestamp::Timestamp;
 
@@ -35,7 +35,14 @@ const PAGE: usize = 100;
 ///
 /// Called from the client's own token cache and nowhere else, so a registry
 /// read looks like every other read from above.
+///
+/// The login server comes from Resource Graph and the exchange hands it a
+/// CLI token, so it has to be a registry's own host under `.azurecr.io`
+/// before anything is sent.
 pub(crate) fn mint(client: &Client, login_server: &str, scope: &str) -> Result<String> {
+    if !host_under(login_server, ".azurecr.io") {
+        bail!("{login_server:?} is not a registry login server; no token is sent there");
+    }
     let refresh = client.registry_refresh_token(login_server, || exchange(client, login_server))?;
     let issued = client.call_unsigned(Request::post_form(
         format!("https://{login_server}/oauth2/token"),
@@ -417,6 +424,16 @@ mod tests {
             "the catalog is signed with the registry's own token, not ARM's"
         );
         assert_eq!(transport.bearers()[4].as_deref(), Some("repo-token"));
+    }
+
+    #[test]
+    fn no_token_is_exchanged_with_a_host_that_is_not_a_registry() {
+        let mut elsewhere = registry();
+        elsewhere.login_server = "evil.example".into();
+        let (client, transport, _) = fake_client([exchanged(), issued("catalog-token")]);
+        let error = format!("{:#}", repositories(&client, &elsewhere).unwrap_err());
+        assert!(error.contains("not a registry login server"), "{error}");
+        assert!(transport.sent().is_empty(), "nothing went out");
     }
 
     #[test]

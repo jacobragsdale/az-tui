@@ -116,7 +116,9 @@ pub fn render_panes(
             draw(frame, shell, Pane::Table, table);
             draw(frame, shell, Pane::Details, details);
         }
-        Panes::One if shell.focus == Focus::Details => draw(frame, shell, Pane::Details, body),
+        Panes::One if matches!(shell.focus, Focus::Details | Focus::PaneSearch) => {
+            draw(frame, shell, Pane::Details, body);
+        }
         Panes::One => draw(frame, shell, Pane::Table, body),
     }
 }
@@ -375,8 +377,9 @@ pub fn dim_behind(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// The help: every key this section has, the filters its search boxes
-/// take, then whatever is wrong — one line per problem, already worded.
+/// The help: whatever is wrong first — one line per problem, already worded,
+/// where a short terminal does not cut it off — then every key this section
+/// has and the filters its search boxes take.
 pub fn render_help(
     frame: &mut Frame,
     shell: &mut Shell,
@@ -400,9 +403,18 @@ pub fn render_help(
                 .add_modifier(Modifier::BOLD),
         ))
     };
-    let mut lines: Vec<Line> = keys::for_section(section)
-        .map(|key| entry(key.keys, key.does))
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    if !problems.is_empty() {
+        lines.push(heading("Problems"));
+        for problem in problems {
+            lines.push(Line::from(Span::styled(
+                problem.clone(),
+                Style::default().fg(palette.error),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.extend(keys::for_section(section).map(|key| entry(key.keys, key.does)));
     lines.push(Line::from(""));
     lines.push(heading("Filters"));
     lines.extend(
@@ -411,16 +423,6 @@ pub fn render_help(
             .filter(|(held, _, _)| *held == section)
             .map(|(_, label, grammar)| entry(label, grammar)),
     );
-    if !problems.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(heading("Problems"));
-        for problem in problems {
-            lines.push(Line::from(Span::styled(
-                problem.clone(),
-                Style::default().fg(palette.error),
-            )));
-        }
-    }
     // Wrapped, and sized to what the wrapping makes of it: a refusal names
     // the role that would fix it in its second half, which a cut line lost.
     // Counted at the width the frame will actually get: a terminal under
@@ -822,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn the_help_lists_this_sections_keys_and_the_problems_under_them() {
+    fn the_help_lists_this_sections_keys_and_the_problems_above_them() {
         let drawn = screen(100, 30, |frame, shell| {
             render_help(
                 frame,
@@ -871,6 +873,45 @@ mod tests {
         });
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(drawn.contains("vault firewall"), "{drawn}");
+    }
+
+    #[test]
+    fn the_problems_come_first_so_a_short_terminal_still_shows_them() {
+        let drawn = screen(100, 24, |frame, shell| {
+            render_help(
+                frame,
+                shell,
+                Rect::new(0, 0, 100, 24),
+                Section::Aks,
+                &["qa/dev pods: Unable to connect to the server".to_owned()],
+            );
+        });
+        assert!(drawn.contains("Unable to connect"), "{drawn}");
+    }
+
+    #[test]
+    fn one_pane_keeps_the_details_while_the_pane_filter_is_typed() {
+        let mut shell = Shell::default();
+        shell.focus = Focus::PaneSearch;
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_panes(
+                    frame,
+                    &mut shell,
+                    frame.area(),
+                    &TextInput::default(),
+                    "",
+                    |frame, _, pane, area| {
+                        frame.render_widget(Paragraph::new(format!("{pane:?}")), area);
+                    },
+                );
+            })
+            .unwrap();
+        let drawn = screen_text(terminal.backend().buffer());
+        assert!(drawn.contains("Details"), "{drawn}");
+        assert!(!drawn.contains("Table"), "{drawn}");
     }
 
     #[test]

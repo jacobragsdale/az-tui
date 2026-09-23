@@ -9,10 +9,9 @@ use super::details::{
     LABEL, chip, coloured_field, field, link_field, pane_width, quiet, refused, render_pane,
     section, title, with_hint,
 };
-use super::table::{Cell, TableSpec, render_list_table, table_geometry};
+use super::table::{Cell, TableSpec, render_table_in, table_geometry};
 use super::theme::theme;
-use super::widgets::{Pane, SECRETS_PLACEHOLDER, render_panes, render_scrollbar};
-use crate::app::screen::Target;
+use super::widgets::{Pane, SECRETS_PLACEHOLDER, render_panes};
 use crate::app::secrets::{Expiry, SCHEMA, SecretsScreen};
 use crate::app::shell::{Focus, Shell};
 use crate::azure::SecretRow;
@@ -67,13 +66,11 @@ pub fn render_table(
     // cursor thinking the list was one row tall.
     let total = screen.visible().len();
     let window = geometry.window(&mut screen.cursor, total);
-    let first = window.start;
     let shown: Vec<Vec<Cell>> = screen.visible()[window]
         .iter()
         .map(|at| row_cells(&store.secrets[*at], &columns, store, &highlighter, now))
         .collect();
 
-    let hovered = None;
     let mut spec = TableSpec {
         title: " Secrets ".to_owned(),
         status: screen.status(store),
@@ -83,28 +80,8 @@ pub fn render_table(
         rows: &shown,
         total,
         cursor: &mut screen.cursor,
-        hovered,
     };
-    let hits = render_list_table(frame, area, &mut spec);
-
-    for (index, rect) in hits.rows {
-        shell.region(rect, Target::Row(index));
-    }
-    for (column, rect) in hits.headers {
-        shell.region(rect, Target::Header(column));
-    }
-    render_scrollbar(
-        frame,
-        Rect::new(
-            geometry.inner.right().saturating_sub(1),
-            geometry.body.y,
-            1,
-            geometry.body.height,
-        ),
-        first,
-        geometry.visible_rows,
-        total,
-    );
+    render_table_in(frame, shell, area, &mut spec);
 }
 
 /// Eight dots, always. A mask that was as long as the value would be telling
@@ -367,6 +344,7 @@ fn row_cells(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::screen::Target;
     use crate::app::shell::Shell;
     use crate::azure::{Inventory, Vault};
     use crate::worker::Event;

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::cursor::ListCursor;
+use super::list::cmp_ignore_ascii_case;
 use super::screen::{AppAction, Target};
 use super::shell::{Focus, Shell};
 use super::{flip, none_last};
@@ -28,6 +29,20 @@ pub const EXPIRING_SOON: i64 = 30;
 /// and type it somewhere, short enough that a walked-away-from terminal is
 /// not showing a production password.
 pub const REVEAL_FOR: Duration = Duration::from_secs(60);
+
+/// Whole seconds until a value revealed at `at` goes.
+#[must_use]
+pub fn clears_in(at: Instant, now: Instant) -> u64 {
+    REVEAL_FOR
+        .saturating_sub(now.saturating_duration_since(at))
+        .as_secs()
+}
+
+/// Whether a value revealed at `at` has had its time.
+#[must_use]
+pub fn expired(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) >= REVEAL_FOR
+}
 
 /// How long the cursor has to sit on a row before its versions are asked
 /// for. Holding `j` down across four hundred rows must not be four hundred
@@ -145,18 +160,6 @@ pub fn expiring(rows: &[SecretRow], now: Timestamp) -> usize {
         .count()
 }
 
-/// The columns this table can be sorted by, in the order `s` walks them.
-/// Only what is on screen: sorting by a hidden column would move the rows for
-/// a reason nobody could see.
-#[must_use]
-pub fn sortable(layout: &TableLayout, available: u16) -> Vec<ColumnId> {
-    layout
-        .visible_columns(available)
-        .into_iter()
-        .map(|column| column.id)
-        .collect()
-}
-
 /// Where each vault sits in the inventory, so `db-password` reads dev, qa,
 /// prod rather than alphabetically. The configuration's order is an opinion;
 /// the alphabet is not.
@@ -208,14 +211,6 @@ pub fn sort(
     });
 }
 
-/// Two names, compared without regard to ASCII case and without allocating:
-/// this runs a million times in a sort of forty thousand rows.
-fn cmp_ignore_ascii_case(left: &str, right: &str) -> std::cmp::Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
-
 /// A value, on screen, and when it got there.
 ///
 /// **This is the one field in the crate that holds a [`Secret`].** It is
@@ -253,14 +248,12 @@ impl Revealed {
     /// Whole seconds until it goes.
     #[must_use]
     pub fn clears_in(&self, now: Instant) -> u64 {
-        REVEAL_FOR
-            .saturating_sub(now.saturating_duration_since(self.at))
-            .as_secs()
+        clears_in(self.at, now)
     }
 
     #[must_use]
     pub fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) >= REVEAL_FOR
+        expired(self.at, now)
     }
 }
 
@@ -429,13 +422,10 @@ impl SecretsScreen {
 
     /// `S`: the next column on screen. `R`: the same column the other way.
     pub fn next_sort(&mut self) {
-        let columns = sortable(&self.layout, self.available);
-        if columns.is_empty() {
-            return;
+        if let Some(next) = self.layout.next_sort(self.sort, self.available) {
+            self.sort = next;
+            self.descending = false;
         }
-        let at = columns.iter().position(|held| *held == self.sort);
-        self.sort = columns[at.map_or(0, |at| (at + 1) % columns.len())];
-        self.descending = false;
     }
 
     /// A header click: the same column cycles ascending, descending, then
@@ -562,7 +552,7 @@ impl SecretsScreen {
     ) -> AppAction {
         use crossterm::event::KeyCode;
         match key.code {
-            KeyCode::Char('v') | KeyCode::Enter => self.reveal(store),
+            KeyCode::Char('v' | 'l') | KeyCode::Enter => self.reveal(store),
             KeyCode::Char('y') => self.copy_value(shell, store),
             KeyCode::Char('Y') => {
                 self.selected(store)
@@ -605,22 +595,7 @@ impl SecretsScreen {
             self.details_scroll.scroll_by(delta);
             return;
         }
-        let before = self.cursor.index;
-        // The scroll state is from the last draw of the table, which a
-        // refresh may have shortened the list under since; measured again
-        // here so the window below cannot come out inside out.
-        let count = self.visible.len();
-        self.cursor
-            .scroll
-            .set_viewport(self.cursor.scroll.viewport, count);
-        self.cursor.scroll.scroll_by(delta);
-        // The cursor follows the viewport rather than being left behind it,
-        // so what `v` acts on is always something on screen.
-        let last = (self.cursor.scroll.offset + self.cursor.scroll.viewport.saturating_sub(1))
-            .min(count.saturating_sub(1));
-        let first = self.cursor.scroll.offset.min(last);
-        self.cursor.index = self.cursor.index.clamp(first, last);
-        if self.cursor.index != before {
+        if self.cursor.wheel(delta, self.visible.len()) {
             self.cursor_moved();
             self.details_scroll.scroll_to(0);
         }

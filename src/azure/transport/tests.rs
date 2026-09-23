@@ -273,3 +273,38 @@ fn a_plain_refusal_carries_the_status_and_the_message() {
     assert!(message.contains("caller is not authorized"), "{message}");
     assert!(!is_signed_out(&error), "a 403 is a permission, not a login");
 }
+
+#[test]
+fn a_signed_out_login_keeps_the_fixed_words_and_the_reason_behind_them() {
+    let error = anyhow::Error::new(NoLogin(
+        "could not get a token for vault: `az account get-access-token` failed: ERROR: AADSTS50076: MFA is required — run `az login`\nmore stack".to_owned(),
+    ))
+    .context("kv-prod");
+    let shown = said(&error);
+    assert!(shown.starts_with(SIGNED_OUT), "{shown}");
+    assert!(shown.contains("AADSTS50076: MFA is required)"), "{shown}");
+    assert!(!shown.contains("more stack"), "one line of it: {shown}");
+    assert_eq!(
+        shown.matches("az login").count(),
+        1,
+        "the fix is said once: {shown}"
+    );
+    assert_eq!(said(&anyhow::anyhow!("plain")), "plain");
+}
+
+#[test]
+fn only_a_plain_name_under_the_suffix_is_that_host() {
+    assert!(host_under("kv-prod.vault.azure.net", ".vault.azure.net"));
+    assert!(host_under("KV.Vault.Azure.Net", ".vault.azure.net"));
+    for host in [
+        "evil.example",
+        ".vault.azure.net",
+        "vault.azure.net",
+        "evil.example\\.vault.azure.net",
+        "x.vault.azure.net@evil.example",
+        "kv.vault.azure.net:8443",
+        "evil.vault.azure.net.example",
+    ] {
+        assert!(!host_under(host, ".vault.azure.net"), "{host}");
+    }
+}

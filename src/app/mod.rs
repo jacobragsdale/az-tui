@@ -294,12 +294,11 @@ impl App {
             KeyCode::Char('e') => self.set_kind(Kind::Events),
             KeyCode::Char('m') => self.set_kind(Kind::ConfigMaps),
             KeyCode::Char('s') => self.set_kind(Kind::Secrets),
-            KeyCode::Enter => match kind {
+            KeyCode::Enter | KeyCode::Char('l') => match kind {
                 Kind::Pods => self.button(Button::Logs),
                 Kind::Events => self.button(Button::Pod),
                 Kind::ConfigMaps | Kind::Secrets => self.button(Button::Value),
             },
-            KeyCode::Char('l') if kind == Kind::Pods => self.button(Button::Logs),
             KeyCode::Char('d') => self.button(Button::Describe),
             KeyCode::Char('v') => match kind {
                 Kind::Pods | Kind::Events => self.button(Button::Yaml),
@@ -308,13 +307,13 @@ impl App {
             KeyCode::Char('b') if kind == Kind::Pods => self.button(Button::Bash),
             KeyCode::Char('x') if kind == Kind::Pods => self.button(Button::Restart),
             KeyCode::Char('X') if kind == Kind::Pods => {
-                if let Some((_, screen, data, shell)) = self.scope_parts() {
-                    screen.rollout_prompt(shell, data);
+                if let Some((tab_ref, screen, data, shell)) = self.scope_parts() {
+                    screen.rollout_prompt(shell, tab_ref, data);
                 }
                 AppAction::None
             }
             KeyCode::Char('=') if kind == Kind::Pods => self.button(Button::Scale),
-            KeyCode::Char('b' | 'x' | 'X' | '=' | 'l') => {
+            KeyCode::Char('b' | 'x' | 'X' | '=') => {
                 self.shell.set_status("That is a pod's key: p for the pods");
                 AppAction::None
             }
@@ -473,11 +472,11 @@ impl App {
                 AppAction::None
             }),
             Button::Restart => {
-                screen.restart_prompt(shell, data);
+                screen.restart_prompt(shell, tab_ref, data);
                 AppAction::None
             }
             Button::Scale => screen
-                .scale_prompt(shell, tab, data)
+                .scale_prompt(shell, tab_ref, tab, data)
                 .map_or(AppAction::None, AppAction::Kube),
             Button::Pod => {
                 screen.jump_to_object(shell, data);
@@ -594,6 +593,11 @@ impl App {
             }
             Some(_) => {
                 self.on_azure_refresh();
+                // Versions are read again when the cursor next rests on the
+                // row, and a failed tag read is tried again; tags that were
+                // read stand.
+                self.store.azure.versions.clear();
+                self.store.azure.tags.retain(|_, held| held.is_ok());
                 AppAction::Azure(worker::Request::Refresh)
             }
             None => AppAction::None,
@@ -791,6 +795,11 @@ impl App {
                 if let Some(screen) = self.screens.iter_mut().find_map(Screen::registries_mut) {
                     screen.invalidate();
                     screen.keep_cursor(&self.store.azure, registries_was);
+                }
+            }
+            azure::Applied::Filled => {
+                if let Some(screen) = self.screens.iter_mut().find_map(Screen::registries_mut) {
+                    screen.on_fill();
                 }
             }
             azure::Applied::Inventory => {
@@ -1221,7 +1230,7 @@ impl App {
                         Style::default().fg(palette.info),
                     );
                 }
-                if let Some(problem) = store.first_problem() {
+                if let Some(problem) = store.first_problem(matches!(tab, Tab::Registries)) {
                     return (
                         format!("! {}", crate::store::problem_line(problem)),
                         Style::default().fg(palette.error),
@@ -1277,7 +1286,7 @@ impl App {
                 badge: match screen {
                     Screen::Scope(_) => self.store.scope(index).and_then(ScopeScreen::badge),
                     Screen::Secrets(screen) => screen.badge(&self.store.azure),
-                    Screen::Registries(screen) => screen.badge(&self.store.azure),
+                    Screen::Registries(_) => None,
                 },
             })
             .collect();
@@ -1439,8 +1448,9 @@ fn apply_columns(layout: &mut TableLayout, held: &[SessionColumn]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::azure::Secret;
     use crate::kube::tests::{crashing, pod};
-    use crate::kube::{ConfigMap, Event, K8sEvent, ObjectRef, Request, Secret, SecretMeta};
+    use crate::kube::{ConfigMap, Event, K8sEvent, ObjectRef, Request, SecretMeta};
     use crate::store::AzureStore;
     use screen::tabs;
 
@@ -2032,11 +2042,21 @@ pub(crate) mod tests {
 
     #[test]
     fn the_status_bar_shows_the_spinner_while_reading_and_the_problem_after() {
-        use crate::azure::Inventory;
+        use crate::azure::{Inventory, Vault};
 
         let mut app = azure_only();
+        let vault = Vault {
+            id: "/vaults/kv-prod".into(),
+            name: "kv-prod".into(),
+            resource_group: "rg".into(),
+            location: "eastus".into(),
+            uri: "https://kv-prod.vault.azure.net/".into(),
+        };
         app.apply_azure(
-            worker::Event::Inventory(Ok(Inventory::default())),
+            worker::Event::Inventory(Ok(Inventory {
+                vaults: vec![vault],
+                registries: Vec::new(),
+            })),
             Instant::now(),
         );
         app.apply_azure(
@@ -2064,6 +2084,95 @@ pub(crate) mod tests {
         let drawn = draw(&mut app);
         assert!(drawn.contains("Problems"), "{drawn}");
         assert!(drawn.contains("kv-prod: no permission"), "{drawn}");
+    }
+
+    #[test]
+    fn a_vaults_problem_stays_on_the_secrets_tab() {
+        let mut app = azure_only_with(crate::app::secrets::tests::stocked());
+        app.apply_azure(
+            worker::Event::Secrets {
+                vault: "kv-prod".into(),
+                result: Err("no permission".into()),
+            },
+            Instant::now(),
+        );
+        app.apply_azure(worker::Event::Idle, Instant::now());
+        assert!(app.store_state(0).0.starts_with('!'));
+        app.tab = 1;
+        let (said, _) = app.store_state(0);
+        assert!(!said.starts_with('!'), "{said}");
+    }
+
+    #[test]
+    fn r_reads_a_version_list_again_after_a_failed_one() {
+        let mut app = azure_only_with(crate::app::secrets::tests::stocked());
+        let versions = |actions: Vec<AppAction>| {
+            actions.into_iter().find_map(|action| match action {
+                AppAction::Azure(request @ worker::Request::Versions { .. }) => Some(request),
+                _ => None,
+            })
+        };
+        let now = Instant::now();
+        assert!(
+            versions(app.tick(now)).is_none(),
+            "the rest has just started"
+        );
+        let Some(worker::Request::Versions { vault, name }) = versions(app.tick(now + REST)) else {
+            panic!("the rested row's versions are asked for");
+        };
+        app.apply_azure(
+            worker::Event::Versions {
+                vault,
+                name,
+                result: Err("throttled".into()),
+            },
+            now,
+        );
+        assert!(versions(app.tick(now + REST * 2)).is_none(), "asked once");
+        press(&mut app, KeyCode::Char('r'));
+        assert!(
+            versions(app.tick(now + REST * 3)).is_some(),
+            "a refresh asks again"
+        );
+    }
+
+    #[test]
+    fn fills_landing_between_frames_leave_the_cursor_on_its_row() {
+        use crate::azure::Repository;
+        use crate::timestamp::ts;
+        let mut app = azure_only_with(crate::app::registries::tests::stocked());
+        press(&mut app, KeyCode::Char('2'));
+        let screen = app.screens[1].registries_mut().unwrap();
+        screen.refilter(&app.store.azure);
+        screen.repositories.cursor.focus(1);
+        let on = |app: &App| {
+            registries(app, 1)
+                .selected_repository(&app.store.azure)
+                .map(|row| row.name.clone())
+        };
+        assert_eq!(on(&app).as_deref(), Some("web-frontend"));
+        let fill = |name: &str, day: u32| worker::Event::Repository {
+            registry: "acrprod".into(),
+            repository: Repository {
+                registry: "acrprod".into(),
+                name: name.to_owned(),
+                tag_count: Some(u64::from(day)),
+                manifest_count: Some(u64::from(day)),
+                created: None,
+                updated: Some(ts(&format!("2026-09-{day:02}T12:00:00Z"))),
+            },
+        };
+        for day in 1..=28 {
+            app.apply_azure(fill("notifications", day), Instant::now());
+            app.apply_azure(fill("payments-api", day), Instant::now());
+        }
+        draw(&mut app);
+        assert_eq!(on(&app).as_deref(), Some("web-frontend"));
+        assert_eq!(
+            registries(&app, 1).repositories.cursor.index,
+            2,
+            "both filled newer, so it sorts after them"
+        );
     }
 
     #[test]
@@ -2165,6 +2274,37 @@ pub(crate) mod tests {
             press(&mut app, KeyCode::Char('p')),
             AppAction::Kube(Request::Showing(0, Kind::Pods))
         );
+    }
+
+    #[test]
+    fn l_does_what_enter_does_on_an_event_and_opens_a_repositorys_tags() {
+        let on_the_second_event = |code| {
+            let mut app = stocked();
+            press(&mut app, KeyCode::Char('m'));
+            press(&mut app, KeyCode::Char('e'));
+            app.screens[0]
+                .scope_mut()
+                .unwrap()
+                .refilter(&app.store.scopes[0]);
+            press(&mut app, KeyCode::Char('j'));
+            let action = press(&mut app, code);
+            (action, app.kind(), selected_pod_name(&app))
+        };
+        let by_l = on_the_second_event(KeyCode::Char('l'));
+        assert_eq!(by_l, on_the_second_event(KeyCode::Enter));
+        assert_eq!(by_l.1, Some(Kind::Pods), "the pod the event is about");
+
+        let mut app = azure_only_with(crate::app::registries::tests::stocked());
+        press(&mut app, KeyCode::Char('2'));
+        app.screens[1]
+            .registries_mut()
+            .unwrap()
+            .refilter(&app.store.azure);
+        press(&mut app, KeyCode::Char('l'));
+        assert!(matches!(
+            registries(&app, 1).level,
+            registries::Level::Tags { .. }
+        ));
     }
 
     #[test]
@@ -2675,7 +2815,7 @@ pub(crate) mod tests {
         assert!(scope(&app, 0).modal.is_some(), "asked, not deleted");
         let drawn = draw(&mut app);
         assert!(
-            drawn.contains("Restart orders-api-7d9f5b-abc12?"),
+            drawn.contains("Restart orders-api-7d9f5b-abc12 in qa/dev?"),
             "{drawn}"
         );
         assert!(

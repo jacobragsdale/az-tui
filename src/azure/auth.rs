@@ -6,9 +6,14 @@
 //! an ARM token — and that trade lives in [`super::acr`], behind the same
 //! [`Audience`] so the client keeps owning the retry policy.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+
+/// The longest one `az` call may take. A token mint is a second or two; one
+/// still going at this is waiting on something that is not coming.
+const AZ_CAP: Duration = Duration::from_secs(30);
 
 /// The audience a token is minted for. The trailing slash on ARM's is part of
 /// it: a token minted for `https://management.azure.com` without it is
@@ -96,9 +101,10 @@ impl TokenSource for AzCli {
     /// belongs, and would go on asking every vault in turn for a token it
     /// cannot get.
     ///
-    /// The one failure that is not a login is `az` not being there at all:
-    /// that one keeps its own words, which say to install it, rather than
-    /// being reduced to "run `az login`" — a program the user does not have.
+    /// The one failure that is not a login is `az` not being there at all —
+    /// the `io::Error` a failed start carries: that one keeps its own words,
+    /// which say it is not installed, rather than being reduced to "run `az
+    /// login`" — a program the user does not have.
     fn token(&self, audience: &Audience) -> Result<String> {
         az(&[
             "account",
@@ -122,22 +128,26 @@ impl TokenSource for AzCli {
 
 /// One `az` call, run without a terminal to talk to, and whatever single
 /// value it printed. A failure ends in "run `az login`", because that is what
-/// it nearly always is.
+/// it nearly always is. One that will not end is killed at [`AZ_CAP`].
 pub fn az(arguments: &[&str]) -> Result<String> {
-    let output = Command::new("az")
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .context("could not run `az`; install the Azure CLI and run `az login`")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut command = Command::new("az");
+    command.args(arguments);
+    let (status, stdout, stderr) = crate::kube::run_until(
+        command,
+        AZ_CAP,
+        &format!(
+            "run `az {}` by hand to see what it waits for",
+            arguments.join(" ")
+        ),
+    )?;
+    if !status.success() {
         bail!(
             "`az {}` failed: {} — run `az login`",
             arguments.join(" "),
             first_line(&stderr)
         );
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let value = stdout.trim().to_owned();
     if value.is_empty() {
         bail!(
             "`az {}` answered with nothing — run `az login`",

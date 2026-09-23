@@ -59,7 +59,15 @@ impl From<anyhow::Error> for Failure {
 }
 
 impl From<std::io::Error> for Failure {
+    /// A reader that went away — `| head -1` — has had all it wanted: that
+    /// is a clean exit with nothing said, code 0.
     fn from(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            return Self {
+                message: String::new(),
+                code: 0,
+            };
+        }
         Self::failed(error.to_string())
     }
 }
@@ -89,7 +97,14 @@ impl Context<'_> {
         {
             return Ok(Inventory { vaults, registries });
         }
-        graph::inventory(self.client, self.azure)
+        // Read without the allowlist: `narrow` applies it, and has to see
+        // what it leaves out to say so.
+        let everything = Azure {
+            vaults: Vec::new(),
+            registries: Vec::new(),
+            ..self.azure.clone()
+        };
+        graph::inventory(self.client, &everything)
     }
 
     /// One tab of the cache, if there is one and it is younger than the
@@ -161,7 +176,10 @@ pub fn secrets(
                 row.vault,
                 row.name,
                 if row.enabled { "enabled" } else { "disabled" },
-                crate::timestamp::age(row.expires, now),
+                // The table's own Expires cell: `expired`, or the age and a
+                // mark inside the window. An age alone loses which side of
+                // now it is on.
+                crate::app::secrets::Expiry::of(row.expires, now).cell(row.expires, now),
                 crate::timestamp::age(row.updated, now),
             )?;
         }
@@ -188,7 +206,7 @@ pub fn secret_get(
         |vault| vault.name.as_str(),
     )?;
     if vaults.is_empty() {
-        return Err(Failure::arguments("the login can reach no vaults"));
+        return Err(none_reachable("vault", &context.azure.vaults));
     }
 
     // Which vaults actually hold it. A name in more than one and no --vault
@@ -319,7 +337,7 @@ pub fn tags(
         |registry| registry.name.as_str(),
     )?;
     if registries.is_empty() {
-        return Err(Failure::arguments("the login can reach no registries"));
+        return Err(none_reachable("registry", &context.azure.registries));
     }
 
     let mut holding = Vec::new();
@@ -477,7 +495,8 @@ fn read_repositories(
 
 /// The vaults or registries a command reads: the configuration's allowlist
 /// first, then the command's own `--vault`/`--registry` on top of it. Naming
-/// one the login cannot reach is an argument error that says what it can.
+/// one the login cannot reach is an argument error that says what it can;
+/// naming one the allowlist leaves out says that instead.
 fn narrow<T: Clone>(
     found: Vec<T>,
     configured: &[String],
@@ -485,8 +504,16 @@ fn narrow<T: Clone>(
     kind: &str,
     name_of: impl Fn(&T) -> &str + Copy,
 ) -> Result<Vec<T>, Failure> {
+    let unknown = missing(&found, only, name_of);
     let reachable = allowed(found, configured, name_of);
     let gone = missing(&reachable, only, name_of);
+    if let Some(name) = gone.iter().find(|name| !unknown.contains(name)) {
+        let (list, flag) = allowlist(kind);
+        return Err(Failure::arguments(format!(
+            "{name} is left out by [azure].{list} / {flag} (allowed: {})",
+            joined(reachable.iter().map(name_of))
+        )));
+    }
     if !gone.is_empty() {
         return Err(Failure::arguments(if reachable.is_empty() {
             format!(
@@ -502,6 +529,29 @@ fn narrow<T: Clone>(
         }));
     }
     Ok(allowed(reachable, only, name_of))
+}
+
+/// The allowlist's key and flag for one kind of resource.
+fn allowlist(kind: &str) -> (&'static str, &'static str) {
+    if kind == "vault" {
+        ("vaults", "--vault")
+    } else {
+        ("registries", "--registry")
+    }
+}
+
+/// Why a command has nothing to read: the login reaches none at all, or none
+/// of the ones the allowlist names.
+fn none_reachable(kind: &str, configured: &[String]) -> Failure {
+    let (list, flag) = allowlist(kind);
+    Failure::arguments(if configured.is_empty() {
+        format!("the login can reach no {list}")
+    } else {
+        format!(
+            "the login can reach none of [azure].{list} / {flag} ({})",
+            configured.join(", ")
+        )
+    })
 }
 
 /// What a listing that printed its rows exits with: a read that failed is
@@ -776,8 +826,83 @@ mod tests {
         let mut out = Vec::new();
         let failure =
             secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
-        assert_eq!(failure.message, "not signed in — run `az login`");
+        assert_eq!(failure.message, "not signed in — run `az login` (stack)");
         assert_eq!(failure.code, FAILED);
+    }
+
+    #[test]
+    fn an_expiry_prints_as_the_table_says_it_expired_or_marked_soon() {
+        let azure = serial();
+        let soon = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3 * 86_400;
+        let (client, _, _) = fake_client([
+            inventory_answer(),
+            Answer::json(json!({
+                "value": [
+                    { "id": "https://kv-dev.vault.azure.net/secrets/gone", "attributes": { "exp": 1_000_000_000 } },
+                    { "id": "https://kv-dev.vault.azure.net/secrets/soon", "attributes": { "exp": soon } },
+                ],
+            })),
+            listing("kv-prod", &[]),
+        ]);
+        let mut out = Vec::new();
+        secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap();
+        let printed = text(out);
+        let gone = printed
+            .lines()
+            .find(|line| line.contains(" gone "))
+            .unwrap();
+        assert!(gone.contains("expired"), "{printed}");
+        let soon = printed
+            .lines()
+            .find(|line| line.contains(" soon "))
+            .unwrap();
+        assert!(soon.contains("⚠"), "{printed}");
+        assert!(!soon.contains("expired"), "{printed}");
+    }
+
+    #[test]
+    fn a_reader_that_went_away_is_a_clean_exit_with_nothing_said() {
+        let failure = Failure::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(failure.code, 0);
+        assert!(failure.message.is_empty());
+        let failure = Failure::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(failure.code, FAILED);
+    }
+
+    #[test]
+    fn a_vault_the_allowlist_leaves_out_says_so_rather_than_that_the_login_cannot_reach_it() {
+        let azure = Azure {
+            vaults: vec!["kv-dev".into()],
+            ..serial()
+        };
+        let (client, _, _) = fake_client([inventory_answer()]);
+        let mut out = Vec::new();
+        let failure = secrets(
+            &mut out,
+            &context(&client, &azure),
+            None,
+            &["kv-prod".to_owned()],
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, BAD_ARGUMENTS);
+        assert!(
+            failure
+                .message
+                .contains("kv-prod is left out by [azure].vaults / --vault (allowed: kv-dev)"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("login can reach"),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]

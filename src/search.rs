@@ -81,7 +81,13 @@ impl Query {
 /// it is an index into the text's characters.
 fn lowered(text: &str) -> Vec<char> {
     text.chars()
-        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .map(|character| {
+            if character.is_ascii() {
+                character.to_ascii_lowercase()
+            } else {
+                character.to_lowercase().next().unwrap_or(character)
+            }
+        })
         .collect()
 }
 

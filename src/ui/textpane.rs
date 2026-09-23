@@ -29,6 +29,7 @@ pub fn render_text_pane(
     let palette = theme();
     let focused = matches!(shell.focus, Focus::Details | Focus::PaneSearch);
     screen.sync_value(data);
+    let key = screen.shown_key(data);
     let (title, lines, empty, refused) = pane_content(screen, data);
 
     // The filter narrows what is painted, never what is held. Indices rather
@@ -36,16 +37,21 @@ pub fn render_text_pane(
     let filter = screen.pane_filter.text().to_owned();
     let (head, tail) = screen.pane_filter.split_at_cursor();
     let (head, tail) = (head.to_owned(), tail.to_owned());
-    let shown: Vec<usize> = if filter.is_empty() {
-        (0..lines.len()).collect()
-    } else {
-        let words: Vec<String> = filter.split_whitespace().map(str::to_owned).collect();
-        let query = crate::search::Query::new(&words);
-        (0..lines.len())
-            .filter(|at| query.matches(&lines[*at]))
-            .collect()
-    };
     let total = lines.len();
+    let fresh = (screen.shown_for.as_ref() != Some(&key)).then(|| {
+        if filter.is_empty() {
+            (0..total).collect()
+        } else {
+            let words: Vec<String> = filter.split_whitespace().map(str::to_owned).collect();
+            let query = crate::search::Query::new(&words);
+            (0..total).filter(|at| query.matches(&lines[*at])).collect()
+        }
+    });
+    if let Some(fresh) = fresh {
+        screen.shown = fresh;
+        screen.shown_for = Some(key);
+    }
+    let shown = &screen.shown;
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -78,6 +84,11 @@ pub fn render_text_pane(
     shell.region(area, Target::TextPane);
 
     if shown.is_empty() {
+        let empty = if total > 0 {
+            "No line matches the filter".to_owned()
+        } else {
+            empty
+        };
         frame.render_widget(
             Paragraph::new(empty).style(Style::default().fg(if refused {
                 palette.error
@@ -280,6 +291,74 @@ fn severity_style(line: &str) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::screen_text;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A pod's log pane with two lines in it.
+    fn log_pane() -> (ScopeScreen, ScopeData) {
+        let mut data = ScopeData::default();
+        data.pods.rows = vec![crate::kube::tests::pod(
+            "qa",
+            "dev",
+            "orders-api-7d9f5b-abc12",
+            "Running",
+        )];
+        let mut screen = ScopeScreen::new(false);
+        screen.refilter(&data);
+        screen.toggle_log();
+        let target = screen.log_target(0, &data).unwrap();
+        screen.begin_follow(Some(target.clone()));
+        screen.append_log(&target, vec!["starting".into(), "listening".into()], false);
+        (screen, data)
+    }
+
+    fn draw(screen: &mut ScopeScreen, data: &ScopeData) -> String {
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_text_pane(frame, &mut shell, screen, data, frame.area());
+            })
+            .unwrap();
+        screen_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn a_filter_that_hides_every_line_says_so_rather_than_no_log_yet() {
+        let (mut screen, data) = log_pane();
+        screen.pane_filter.set_text("panic");
+        let drawn = draw(&mut screen, &data);
+        assert!(drawn.contains("No line matches the filter"), "{drawn}");
+        assert!(!drawn.contains("No log yet"), "{drawn}");
+    }
+
+    #[test]
+    fn the_filters_matches_are_worked_out_again_only_when_the_lines_or_the_filter_change() {
+        let (mut screen, data) = log_pane();
+        screen.pane_filter.set_text("listen");
+        let drawn = draw(&mut screen, &data);
+        assert!(
+            drawn.contains("listening") && !drawn.contains("starting"),
+            "{drawn}"
+        );
+        assert_eq!(screen.shown, [1]);
+
+        // A stale answer planted in the cache is painted: nothing changed,
+        // so nothing was worked out again.
+        screen.shown = vec![0];
+        let drawn = draw(&mut screen, &data);
+        assert!(drawn.contains("starting"), "{drawn}");
+
+        let target = screen.following().cloned().unwrap();
+        screen.append_log(&target, vec!["listening again".into()], false);
+        draw(&mut screen, &data);
+        assert_eq!(screen.shown, [1, 2], "a new line: worked out again");
+        screen.pane_filter.set_text("again");
+        draw(&mut screen, &data);
+        assert_eq!(screen.shown, [2], "a new filter: worked out again");
+    }
 
     #[test]
     fn a_timestamped_line_is_cut_to_its_clock_and_painted_by_its_level() {

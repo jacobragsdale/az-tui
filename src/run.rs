@@ -41,7 +41,11 @@ const CACHE_EVERY: Duration = Duration::from_secs(30);
 pub fn run() -> Result<()> {
     let mut cli = Cli::parse();
     let config_path = paths::config_file(cli.config.as_deref());
-    let config = cli.merge(config::load(&config_path)?);
+    // `setup` is what writes the file, so it is the one command a named file
+    // that is not there yet is not a mistake for.
+    let named = paths::config_named(cli.config.as_deref())
+        && !matches!(cli.command, Some(Command::Setup { .. }));
+    let config = cli.merge(config::load(&config_path, named)?);
     let theme = cli
         .resolve_theme(&config)
         .and_then(|choice| choice.theme(&config))
@@ -49,11 +53,16 @@ pub fn run() -> Result<()> {
     ui::theme::set_theme(theme);
 
     match cli.command.take() {
-        Some(Command::Doctor) => finish(doctor::run(&mut io::stdout().lock(), &config)?),
+        Some(Command::Doctor) => finish(doctor::run(
+            &mut io::stdout().lock(),
+            &config,
+            &config_path,
+        )?),
         Some(Command::Setup { write }) => finish(doctor::setup(
             &mut io::stdout().lock(),
             write,
             &config_path,
+            &config.azure.subscriptions,
         )?),
         Some(command) => shell(&cli, &config, command),
         None => tui(&cli, config),
@@ -126,8 +135,11 @@ fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
             json,
         } => commands::tags(&mut out, &context, &repo, registry.as_deref(), json),
     };
-    out.flush()?;
-    if let Err(failure) = done {
+    let flushed = out.flush().map_err(commands::Failure::from);
+    // Code 0 is a reader that stopped reading, which had all it wanted.
+    if let Err(failure) = done.and(flushed)
+        && failure.code != 0
+    {
         eprintln!("error: {}", failure.message);
         std::process::exit(failure.code);
     }
@@ -181,6 +193,9 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     let mut saved = serde_json::to_string(&app.session()).unwrap_or_default();
     let mut settling: Option<Instant> = None;
     let mut cache_written = Instant::now();
+    // The periodic cache write, off the loop. One at a time: a save falls
+    // due while one is still writing waits for it.
+    let mut cache_writing: Option<std::thread::JoinHandle<Result<()>>> = None;
     let started = Instant::now();
 
     let mut terminal = ratatui::init();
@@ -209,6 +224,11 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
                     // not. A store that has never read anything is not
                     // worth a file, and its snapshot is empty.
                     let _ = app.session().save(&session_path);
+                    // A write still in flight lands first, so this one,
+                    // newer, is what the file ends up holding.
+                    if let Some(writing) = cache_writing.take() {
+                        let _ = writing.join();
+                    }
                     let snapshot = app.store.snapshot(&app.tabs);
                     if !cli.no_cache && !snapshot.tabs.is_empty() {
                         let _ = cache::save(&cache_path, &snapshot);
@@ -246,15 +266,26 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
             act(&mut app, &azure, &kube, action);
         }
 
-        if app.cache_dirty && !cli.no_cache && cache_written.elapsed() >= CACHE_EVERY {
+        if let Some(writing) = cache_writing.take_if(|writing| writing.is_finished())
+            && let Ok(Err(error)) = writing.join()
+        {
+            // A cache that will not save is a slower next start, not a
+            // reason to stop.
+            app.shell
+                .set_error(format!("could not save the cache: {error:#}"));
+        }
+        if app.cache_dirty
+            && !cli.no_cache
+            && cache_written.elapsed() >= CACHE_EVERY
+            && cache_writing.is_none()
+        {
             cache_written = Instant::now();
             app.cache_dirty = false;
-            if let Err(error) = cache::save(&cache_path, &app.store.snapshot(&app.tabs)) {
-                // A cache that will not save is a slower next start, not a
-                // reason to stop.
-                app.shell
-                    .set_error(format!("could not save the cache: {error:#}"));
-            }
+            // The rows are copied here; serialising and writing them, which
+            // is the slow half, happens on its own thread.
+            let snapshot = app.store.snapshot(&app.tabs);
+            let path = cache_path.clone();
+            cache_writing = Some(std::thread::spawn(move || cache::save(&path, &snapshot)));
         }
 
         // The layout, once it has stopped moving.

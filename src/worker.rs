@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 
 use crate::azure::auth::Audience;
-use crate::azure::transport::{Client, SIGNED_OUT, api_error, is_no_login, said};
+use crate::azure::transport::{Client, api_error, is_no_login, said};
 use crate::azure::{
     Inventory, Manifest, Registry, Repository, Secret, SecretRow, SecretVersion, Tag, Vault, acr,
     graph, vault,
@@ -321,7 +321,7 @@ impl Loop {
             && let Err(error) = client.token(&Audience::Vault)
             && is_no_login(&error)
         {
-            return self.stop_signed_out();
+            return self.stop_signed_out(&error);
         }
         self.progress(format!("reading {} vaults…", vaults.len()));
         let done = AtomicUsize::new(0);
@@ -351,7 +351,7 @@ impl Loop {
             && let Err(error) = client.token(&Audience::ContainerRegistry)
             && is_no_login(&error)
         {
-            return self.stop_signed_out();
+            return self.stop_signed_out(&error);
         }
         self.progress(format!("reading {} registries…", registries.len()));
         let catalogs: Mutex<Vec<(usize, Vec<String>)>> = Mutex::new(Vec::new());
@@ -441,9 +441,9 @@ impl Loop {
     }
 
     /// A missing login is not one vault's problem, so the refresh stops and
-    /// says so once.
-    fn stop_signed_out(&self) -> bool {
-        self.send(Event::Inventory(Err(SIGNED_OUT.to_owned()))) && self.send(Event::Idle)
+    /// says so once, with the reason `az` gave.
+    fn stop_signed_out(&self, error: &anyhow::Error) -> bool {
+        self.send(Event::Inventory(Err(said(error)))) && self.send(Event::Idle)
     }
 
     /// One detail, read now. Nothing here is retried and nothing is cached on
@@ -736,10 +736,13 @@ mod tests {
             fake_client([Answer::status(401, "{}"), Answer::status(401, "{}")]);
         let worker = Worker::start(serial(), client, Inventory::default());
         worker.send(Request::Refresh);
-        assert_eq!(
-            until_idle(&worker),
-            ["inventory-err(not signed in — run `az login`)", "idle"]
+        let said = until_idle(&worker);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said[0].starts_with("inventory-err(not signed in — run `az login` (Azure refused"),
+            "the fixed words, then why: {said:?}"
         );
+        assert_eq!(said[1], "idle");
         assert_eq!(transport.sent().len(), 2, "no vault was even asked");
     }
 
@@ -864,7 +867,10 @@ mod tests {
             assert!(Instant::now() < deadline, "no answer");
             std::thread::sleep(Duration::from_millis(2));
         };
-        assert_eq!(message, "not signed in — run `az login`");
+        assert!(
+            message.starts_with("not signed in — run `az login` ("),
+            "{message}"
+        );
     }
 
     #[test]
@@ -957,7 +963,7 @@ mod tests {
             until_idle(&worker),
             [
                 "inventory",
-                "inventory-err(not signed in — run `az login`)",
+                "inventory-err(not signed in — run `az login` (gone))",
                 "idle"
             ],
             "said once, not once per vault"

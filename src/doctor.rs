@@ -15,7 +15,6 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +24,7 @@ use crate::azure::auth::{self, Audience, AzCli, TokenSource};
 use crate::azure::transport::{Client, Https};
 use crate::azure::{Inventory, acr, graph, missing, vault};
 use crate::config::{Azure, Config, Tab};
+use crate::desktop::command;
 use crate::kube::run_capped;
 
 /// The bound on every call the AKS half makes. `az aks list` over a slow
@@ -71,9 +71,10 @@ const SYSTEM_NAMESPACES: &[&str] = &[
     "aks-istio-egress",
 ];
 
-/// Runs every check, printing as it goes: the Azure half, then the AKS
-/// half. Exit 0 when everything answered.
-pub fn run(out: &mut impl Write, config: &Config) -> Result<bool> {
+/// Runs every check, printing as it goes: which file was read, the Azure
+/// half, then the AKS half. Exit 0 when everything answered.
+pub fn run(out: &mut impl Write, config: &Config, config_path: &Path) -> Result<bool> {
+    config_line(out, config_path)?;
     let azure = azure_checks(out, &config.azure)?;
     writeln!(out)?;
     let aks = aks_checks(out, config)?;
@@ -279,6 +280,8 @@ fn probe(tab: &Tab) -> Result<()> {
 pub struct ListedCluster {
     pub name: String,
     pub resource_group: String,
+    /// The subscription it was listed in, when setup was told which.
+    pub subscription: Option<String>,
     pub namespaces: Vec<String>,
 }
 
@@ -304,56 +307,91 @@ pub fn cluster_block(cluster: &ListedCluster) -> String {
     )
 }
 
-/// Fetches credentials for every AKS cluster the login can see, converts
-/// the kubeconfig to borrow the `az login`, and prints a `[[clusters]]`
-/// block per cluster. With `write`, the blocks go to `config_path` when no
-/// file is there yet.
-pub fn setup(out: &mut impl Write, write: bool, config_path: &Path) -> Result<bool> {
-    let raw = run_capped(command("az", &["aks", "list", "-o", "json"]), CALL_CAP)
-        .context("az aks list — is there an `az login`?")?;
-    let listed: Value =
-        serde_json::from_str(&raw).context("az answered with something other than JSON")?;
-    let mut clusters: Vec<ListedCluster> = listed
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
+/// Fetches credentials for every AKS cluster in the current subscription —
+/// or in each of `subscriptions` when any are given — converts the
+/// kubeconfig to borrow the `az login`, and prints a `[[clusters]]` block
+/// per cluster. With `write`, the blocks go to `config_path` when no file is
+/// there yet. A cluster whose credentials will not come is said and left
+/// out; only none at all is an error.
+pub fn setup(
+    out: &mut impl Write,
+    write: bool,
+    config_path: &Path,
+    subscriptions: &[String],
+) -> Result<bool> {
+    let scopes: Vec<Option<&str>> = if subscriptions.is_empty() {
+        vec![None]
+    } else {
+        subscriptions
+            .iter()
+            .map(|held| Some(held.as_str()))
+            .collect()
+    };
+    let mut clusters: Vec<ListedCluster> = Vec::new();
+    for subscription in scopes {
+        let mut arguments = vec!["aks", "list", "-o", "json"];
+        if let Some(subscription) = subscription {
+            arguments.extend(["--subscription", subscription]);
+        }
+        let raw = run_capped(command("az", &arguments), CALL_CAP)
+            .context("az aks list — is there an `az login`?")?;
+        let listed: Value =
+            serde_json::from_str(&raw).context("az answered with something other than JSON")?;
+        clusters.extend(listed.as_array().into_iter().flatten().filter_map(|item| {
             Some(ListedCluster {
                 name: item["name"].as_str()?.to_owned(),
                 resource_group: item["resourceGroup"].as_str()?.to_owned(),
+                subscription: subscription.map(str::to_owned),
                 namespaces: Vec::new(),
             })
-        })
-        .collect();
+        }));
+    }
     if clusters.is_empty() {
+        if subscriptions.is_empty() {
+            bail!(
+                "az aks list found no clusters in the current subscription; `az account set --subscription …` and try again"
+            );
+        }
         bail!(
-            "az aks list found no clusters in the current subscription; `az account set --subscription …` and try again"
+            "az aks list found no clusters in {}",
+            subscriptions.join(", ")
         );
     }
-    for cluster in &clusters {
+    let mut fetched = Vec::new();
+    for cluster in clusters {
         let started = Instant::now();
-        run_capped(
-            command(
-                "az",
-                &[
-                    "aks",
-                    "get-credentials",
-                    "--resource-group",
-                    &cluster.resource_group,
-                    "--name",
-                    &cluster.name,
-                    "--overwrite-existing",
-                ],
-            ),
-            CALL_CAP,
-        )
-        .with_context(|| format!("az aks get-credentials for {}", cluster.name))?;
-        line(
-            out,
+        let mut arguments = vec![
+            "aks",
+            "get-credentials",
+            "--resource-group",
+            &cluster.resource_group,
+            "--name",
             &cluster.name,
-            &format!("credentials written ({})", took(started)),
-        )?;
+            "--overwrite-existing",
+        ];
+        if let Some(subscription) = &cluster.subscription {
+            arguments.extend(["--subscription", subscription]);
+        }
+        match run_capped(command("az", &arguments), CALL_CAP) {
+            Ok(_) => {
+                line(
+                    out,
+                    &cluster.name,
+                    &format!("credentials written ({})", took(started)),
+                )?;
+                fetched.push(cluster);
+            }
+            Err(error) => line(
+                out,
+                &cluster.name,
+                &format!("left out — az aks get-credentials failed: {error:#}"),
+            )?,
+        }
     }
+    if fetched.is_empty() {
+        bail!("az aks get-credentials failed for every cluster");
+    }
+    let mut clusters = fetched;
     match run_capped(
         command("kubelogin", &["convert-kubeconfig", "-l", "azurecli"]),
         CALL_CAP,
@@ -434,12 +472,6 @@ pub fn setup(out: &mut impl Write, write: bool, config_path: &Path) -> Result<bo
     Ok(true)
 }
 
-fn command(program: &str, arguments: &[&str]) -> Command {
-    let mut command = Command::new(program);
-    command.args(arguments);
-    command
-}
-
 /// The tool's own version line, or why it will not answer.
 fn version(program: &str, arguments: &[&str]) -> Result<String> {
     let raw = run_capped(command(program, arguments), CALL_CAP)?;
@@ -480,6 +512,16 @@ fn report_missing(out: &mut impl Write, inventory: &Inventory, azure: &Azure) ->
         &format!("{} (named in config.toml)", gone.join(", ")),
     )?;
     Ok(false)
+}
+
+/// The file this run read, or that it read none and went with the defaults.
+fn config_line(out: &mut impl Write, path: &Path) -> Result<()> {
+    let said = if path.exists() {
+        path.display().to_string()
+    } else {
+        format!("{} (not there — defaults)", path.display())
+    };
+    line(out, "config", &said)
 }
 
 fn subscriptions_line(azure: &Azure) -> Result<String> {
@@ -535,6 +577,22 @@ mod tests {
     }
 
     #[test]
+    fn the_first_line_names_the_file_read_or_that_there_was_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut out = Vec::new();
+        config_line(&mut out, &path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        config_line(&mut out, &path).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        let shown = path.display();
+        assert_eq!(
+            printed,
+            format!("config        {shown} (not there — defaults)\nconfig        {shown}\n")
+        );
+    }
+
+    #[test]
     fn a_configured_subscription_list_is_reported_without_asking_az() {
         let azure = Azure {
             subscriptions: vec!["sub-1".into(), "sub-2".into()],
@@ -576,6 +634,7 @@ mod tests {
         let block = cluster_block(&ListedCluster {
             name: "aks-qa".into(),
             resource_group: "rg-qa".into(),
+            subscription: None,
             namespaces: vec!["dev".into(), "qa".into(), "uat".into()],
         });
         assert_eq!(
@@ -614,7 +673,7 @@ mod tests {
         // names the command; both are a result, never a panic.
         let dir = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
-        let outcome = setup(&mut out, false, &dir.path().join("config.toml"));
+        let outcome = setup(&mut out, false, &dir.path().join("config.toml"), &[]);
         if let Err(error) = outcome {
             assert!(format!("{error:#}").contains("az"), "{error:#}");
         }

@@ -6,12 +6,12 @@
 //! and the base is the vault's `uri` from the inventory, which already ends
 //! in a slash.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use super::auth::Audience;
 use super::graph::text;
-use super::transport::{Client, Request, api_error};
+use super::transport::{Client, Request, api_error, host_under};
 use super::{Secret, SecretRow, SecretVersion, Vault};
 use crate::timestamp::Timestamp;
 
@@ -40,9 +40,7 @@ pub fn secrets(client: &Client, vault: &Vault) -> Result<Vec<SecretRow>> {
     // The listing hands back the next page's whole address — api-version and
     // skip token included — so it is followed rather than rebuilt.
     while let Some(next) = url {
-        let page = client
-            .call(&Audience::Vault, Request::get(&next))
-            .map_err(|error| explain(vault, error))?;
+        let page = get(client, vault, &next)?;
         rows.extend(
             page["value"]
                 .as_array()
@@ -64,9 +62,7 @@ pub fn versions(client: &Client, vault: &Vault, name: &str) -> Result<Vec<Secret
         segment(name)
     ));
     while let Some(next) = url {
-        let page = client
-            .call(&Audience::Vault, Request::get(&next))
-            .map_err(|error| explain(vault, error))?;
+        let page = get(client, vault, &next)?;
         versions.extend(
             page["value"]
                 .as_array()
@@ -106,9 +102,7 @@ pub fn value(
             segment(name)
         ),
     };
-    let answer = client
-        .call(&Audience::Vault, Request::get(&url))
-        .map_err(|error| explain(vault, error))?;
+    let answer = get(client, vault, &url)?;
     let held = answer["value"]
         .as_str()
         .with_context(|| format!("{} did not answer with a value for {name}", vault.name))?;
@@ -118,6 +112,26 @@ pub fn value(
         .and_then(|id| id.rsplit('/').next().map(str::to_owned))
         .unwrap_or_default();
     Ok((Secret::new(held), version))
+}
+
+/// One signed read of one vault. Every call in this file goes through here.
+///
+/// The address comes from Resource Graph or from a listing's `nextLink`, and
+/// the token it carries is good for every vault the login can read, so it
+/// goes nowhere but an `https://` host under `.vault.azure.net`.
+fn get(client: &Client, vault: &Vault, url: &str) -> Result<Value> {
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    if !host.is_some_and(|host| host_under(host, ".vault.azure.net")) {
+        bail!(
+            "{}: {url} is not a Key Vault address; the vault token is not sent there",
+            vault.name
+        );
+    }
+    client
+        .call(&Audience::Vault, Request::get(url))
+        .map_err(|error| explain(vault, error))
 }
 
 /// The two refusals common enough to be worth saying in fewer words than the
@@ -386,6 +400,27 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("Key Vault Secrets User"), "{error}");
+    }
+
+    #[test]
+    fn the_vault_token_goes_to_no_host_but_a_vault() {
+        let mut elsewhere = vault();
+        elsewhere.uri = "https://evil.example/".into();
+        let (client, transport, _) = fake_client([Answer::json(json!({ "value": [] }))]);
+        let error = format!("{:#}", secrets(&client, &elsewhere).unwrap_err());
+        assert!(error.contains("not a Key Vault address"), "{error}");
+        assert!(transport.sent().is_empty(), "nothing went out");
+
+        let (client, transport, _) = fake_client([
+            Answer::json(json!({
+                "value": [{ "id": "https://kv-prod.vault.azure.net/secrets/a" }],
+                "nextLink": "https://evil.example/secrets?api-version=7.4&$skiptoken=XYZ",
+            })),
+            Answer::json(json!({ "value": [] })),
+        ]);
+        let error = format!("{:#}", secrets(&client, &vault()).unwrap_err());
+        assert!(error.contains("evil.example"), "{error}");
+        assert_eq!(transport.sent().len(), 1, "the next page was not asked for");
     }
 
     #[test]

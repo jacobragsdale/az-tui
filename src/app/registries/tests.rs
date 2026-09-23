@@ -319,6 +319,23 @@ fn each_levels_filters_narrow_their_own_table() {
 }
 
 #[test]
+fn updated_filters_by_how_long_ago_rather_than_how_far_ahead() {
+    let now = ts("2026-09-11T20:00:00Z");
+    let recent = repository("acrprod", "recent", None, Some("2026-09-08T20:00:00Z"));
+    let stale = repository("acrprod", "stale", None, Some("2026-06-13T20:00:00Z"));
+    let kept = |raw: &str| -> Vec<&str> {
+        let query = Query::parse(raw, REPOSITORY_SCHEMA);
+        [&recent, &stale]
+            .into_iter()
+            .filter(|row| repository_passes(row, &query, now))
+            .map(|row| row.name.as_str())
+            .collect()
+    };
+    assert_eq!(kept("updated:<30d"), ["recent"]);
+    assert_eq!(kept("updated:>30d"), ["stale"]);
+}
+
+#[test]
 fn a_header_click_on_the_default_column_turns_the_sort_over() {
     let mut screen = RegistriesScreen::default();
     assert_eq!(screen.repositories.sort, ColumnId::Updated);

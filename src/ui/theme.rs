@@ -34,9 +34,6 @@ pub struct Theme {
     /// The text of a selected row where the palette says so; `Reset` keeps
     /// whatever the cell was painted in.
     pub selection_fg: Color,
-    /// A dimmer wash than `selected_background`, laid under a hovered row so
-    /// its colour-coded cells keep their own foregrounds.
-    pub hover_background: Color,
     pub info: Color,
     pub success: Color,
     /// What an expiry inside thirty days paints in. It is deliberately not
@@ -69,7 +66,6 @@ impl Theme {
             border_focused: Color::Cyan,
             selected_background: Color::DarkGray,
             selection_fg: Color::Reset,
-            hover_background: Color::Indexed(237),
             info: Color::Yellow,
             success: Color::Green,
             warning: Color::Yellow,
@@ -90,7 +86,7 @@ impl Theme {
     }
 
     /// The ANSI palette again, with the colours that vanish on a white ground
-    /// — white text, yellow, cyan, a near-black hover — swapped for ones that
+    /// — white text, yellow, cyan — swapped for ones that
     /// do not. Yellow's jobs go to a dark orange from the 256-colour cube.
     #[must_use]
     pub const fn terminal_light() -> Self {
@@ -106,7 +102,6 @@ impl Theme {
             border_focused: Color::Blue,
             selected_background: Color::Indexed(253),
             selection_fg: Color::Reset,
-            hover_background: Color::Indexed(255),
             info: Color::Blue,
             success: Color::Green,
             warning: AMBER,
@@ -143,7 +138,6 @@ impl Theme {
             border_focused: Color::Reset,
             selected_background: Color::Reset,
             selection_fg: Color::Reset,
-            hover_background: Color::Reset,
             info: Color::Reset,
             success: Color::Reset,
             warning: Color::Reset,
@@ -160,13 +154,9 @@ impl Theme {
     ///
     /// The terminal's own background is left alone: the tool has already set
     /// the terminal to `bg`, and painting it again would only fight a
-    /// translucent window. The hover wash is a shade the palette does not
-    /// name, mixed between the ground and the overlay so a hovered row is
-    /// visibly lighter than the ground and visibly dimmer than a selected
-    /// one.
+    /// translucent window.
     #[must_use]
     pub fn from_palette(palette: &Palette) -> Self {
-        let hover = palette.bg.mix(palette.overlay, 0.5);
         Self {
             accent: palette.accent.into(),
             muted: palette.muted.into(),
@@ -178,7 +168,6 @@ impl Theme {
             border_focused: palette.accent.into(),
             selected_background: palette.overlay.into(),
             selection_fg: palette.fg.into(),
-            hover_background: hover.into(),
             info: palette.yellow.into(),
             success: palette.green.into(),
             warning: palette.orange.into(),
@@ -422,11 +411,6 @@ teal = "#1abc9c"
         assert_eq!(theme.border_focused, theme.accent);
         assert_eq!(theme.text, Color::Rgb(0xe1, 0xe1, 0xe1));
         assert_eq!(theme.error, Color::Rgb(0xf7, 0x76, 0x8e));
-        assert_eq!(
-            theme.hover_background,
-            Color::Rgb(0x1c, 0x1c, 0x1c),
-            "hover sits halfway between the ground and the overlay"
-        );
         assert_eq!(theme.border_type, BorderType::Rounded);
         assert!(theme.dim_behind_modals);
     }
@@ -436,7 +420,6 @@ teal = "#1abc9c"
         for theme in [Theme::terminal(), Theme::terminal_light()] {
             assert_ne!(theme.warning, theme.error);
             assert_ne!(theme.warning, theme.muted);
-            assert_ne!(theme.text, theme.hover_background);
             assert_ne!(theme.text, theme.selected_background);
         }
         let mono = Theme::mono();

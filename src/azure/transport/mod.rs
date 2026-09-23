@@ -272,16 +272,46 @@ pub fn is_signed_out(error: &anyhow::Error) -> bool {
 /// with five lines of its own stack, and what a person needs is the two words
 /// that fix it. The worker's events and the subcommands' errors both go
 /// through here, so the status bar and stderr say the same thing.
+///
+/// The reason still follows in brackets, one line of it: an AADSTS code or a
+/// refused connection is what tells an expired login from an MFA prompt or
+/// a proxy.
 #[must_use]
 pub fn said(error: &anyhow::Error) -> String {
-    if is_signed_out(error) {
-        return SIGNED_OUT.to_owned();
+    let signed_out = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SignedOut>()
+            .map(|held| held.0.as_str())
+            .or_else(|| cause.downcast_ref::<NoLogin>().map(|held| held.0.as_str()))
+    });
+    match signed_out {
+        Some(reason) => {
+            let reason = reason.lines().next().unwrap_or_default();
+            let reason = reason.trim().trim_end_matches(" — run `az login`");
+            if reason.is_empty() {
+                SIGNED_OUT.to_owned()
+            } else {
+                format!("{SIGNED_OUT} ({reason})")
+            }
+        }
+        None => format!("{error:#}"),
     }
-    format!("{error:#}")
 }
 
 /// The two words that fix a signed-out login.
 pub const SIGNED_OUT: &str = "not signed in — run `az login`";
+
+/// True when `host` is a plain DNS name under `suffix`, such as
+/// `.vault.azure.net`. Anything else in it — a port, a user, a backslash a
+/// URL parser reads as a slash — is refused rather than reasoned about.
+#[must_use]
+pub fn host_under(host: &str, suffix: &str) -> bool {
+    host.len() > suffix.len()
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        && host.to_ascii_lowercase().ends_with(suffix)
+}
 
 /// A plane refused, and said why in its own words.
 ///

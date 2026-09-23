@@ -120,7 +120,7 @@ pub const KEYS: &[Key] = &[
         tab: Some(Section::Aks),
     },
     Key {
-        keys: "Enter  v",
+        keys: "Enter  l  v",
         does: "show the value for 60 seconds; again hides it",
         tab: Some(Section::Secrets),
     },
@@ -140,7 +140,7 @@ pub const KEYS: &[Key] = &[
         tab: Some(Section::Secrets),
     },
     Key {
-        keys: "Enter",
+        keys: "Enter  l",
         does: "open the repository's tags",
         tab: Some(Section::Registries),
     },

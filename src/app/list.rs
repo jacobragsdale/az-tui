@@ -7,12 +7,11 @@
 use std::cmp::Ordering;
 
 use super::cursor::ListCursor;
-use super::flip;
+use super::{flip, none_last};
 use crate::columns::{ColumnId, TableLayout, columns_for};
 use crate::filter::{self, Query};
 use crate::kube::{ConfigMap, K8sEvent, Kind, Pod, SecretMeta};
 use crate::text_input::TextInput;
-use crate::timestamp::Timestamp;
 
 /// What one kind of row has to say about itself for the list to search,
 /// sort and keep a cursor on it.
@@ -41,17 +40,6 @@ pub fn cmp_ignore_ascii_case(left: &str, right: &str) -> Ordering {
     left.bytes()
         .map(|byte| byte.to_ascii_lowercase())
         .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
-}
-
-/// Newest first: a later stamp sorts before an earlier one, and a missing
-/// one last whichever way the column is turned.
-fn newest_first(left: Option<Timestamp>, right: Option<Timestamp>, descending: bool) -> Ordering {
-    match (left, right) {
-        (Some(left), Some(right)) => flip(right.cmp(&left), descending),
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (None, None) => Ordering::Equal,
-    }
 }
 
 impl Row for Pod {
@@ -90,10 +78,11 @@ impl Row for Pod {
 
     fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
         if by == ColumnId::Age {
-            return newest_first(self.created, other.created, descending);
+            return none_last(self.created, other.created, !descending);
         }
         let text = |left: &str, right: &str| cmp_ignore_ascii_case(left, right);
         let ordering = match by {
+            ColumnId::Name => text(&self.key.name, &other.key.name),
             ColumnId::Namespace => text(&self.key.namespace, &other.key.namespace),
             // How much of a pod is up first, then how big it is: `0/1` before
             // `1/2` before `2/2`.
@@ -146,7 +135,7 @@ impl Row for K8sEvent {
 
     fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
         if by == ColumnId::Age {
-            return newest_first(self.last, other.last, descending);
+            return none_last(self.last, other.last, !descending);
         }
         let text = |left: &str, right: &str| cmp_ignore_ascii_case(left, right);
         let ordering = match by {
@@ -192,9 +181,10 @@ impl Row for ConfigMap {
 
     fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
         if by == ColumnId::Age {
-            return newest_first(self.created, other.created, descending);
+            return none_last(self.created, other.created, !descending);
         }
         let ordering = match by {
+            ColumnId::Name => cmp_ignore_ascii_case(&self.name, &other.name),
             ColumnId::Namespace => cmp_ignore_ascii_case(&self.namespace, &other.namespace),
             ColumnId::Keys => other.data.len().cmp(&self.data.len()),
             _ => Ordering::Equal,
@@ -235,9 +225,10 @@ impl Row for SecretMeta {
 
     fn compare(&self, other: &Self, by: ColumnId, descending: bool) -> Ordering {
         if by == ColumnId::Age {
-            return newest_first(self.created, other.created, descending);
+            return none_last(self.created, other.created, !descending);
         }
         let ordering = match by {
+            ColumnId::Name => cmp_ignore_ascii_case(&self.name, &other.name),
             ColumnId::Namespace => cmp_ignore_ascii_case(&self.namespace, &other.namespace),
             ColumnId::K8sType => cmp_ignore_ascii_case(&self.kind, &other.kind),
             ColumnId::Keys => other.keys.len().cmp(&self.keys.len()),
@@ -349,9 +340,10 @@ impl ListState {
         }
         self.sorted = (0..rows.len()).collect();
         let (by, descending) = (self.sort, self.descending);
+        let ids: Vec<String> = rows.iter().map(Row::identity).collect();
         self.sorted.sort_by(|a, b| {
             let ordering = rows[*a].compare(&rows[*b], by, descending);
-            ordering.then_with(|| cmp_ignore_ascii_case(&rows[*a].identity(), &rows[*b].identity()))
+            ordering.then_with(|| cmp_ignore_ascii_case(&ids[*a], &ids[*b]))
         });
     }
 
@@ -413,18 +405,10 @@ impl ListState {
 
     /// `S`: the next column on screen.
     pub fn next_sort(&mut self) {
-        let columns: Vec<ColumnId> = self
-            .layout
-            .visible_columns(self.available)
-            .into_iter()
-            .map(|column| column.id)
-            .collect();
-        if columns.is_empty() {
-            return;
+        if let Some(next) = self.layout.next_sort(self.sort, self.available) {
+            self.sort = next;
+            self.descending = false;
         }
-        let at = columns.iter().position(|held| *held == self.sort);
-        self.sort = columns[at.map_or(0, |at| (at + 1) % columns.len())];
-        self.descending = false;
     }
 
     /// A header click: the same column cycles ascending, descending, then
@@ -486,17 +470,7 @@ impl ListState {
     /// it rather than being left behind, so what a key acts on is always
     /// something on screen. Says whether the cursor moved.
     pub fn wheel(&mut self, delta: i32) -> bool {
-        let before = self.cursor.index;
-        let count = self.visible.len();
-        self.cursor
-            .scroll
-            .set_viewport(self.cursor.scroll.viewport, count);
-        self.cursor.scroll.scroll_by(delta);
-        let last = (self.cursor.scroll.offset + self.cursor.scroll.viewport.saturating_sub(1))
-            .min(count.saturating_sub(1));
-        let first = self.cursor.scroll.offset.min(last);
-        self.cursor.index = self.cursor.index.clamp(first, last);
-        self.cursor.index != before
+        self.cursor.wheel(delta, self.visible.len())
     }
 }
 
@@ -504,6 +478,7 @@ impl ListState {
 mod tests {
     use super::*;
     use crate::kube::tests::{crashing, pod};
+    use crate::timestamp::Timestamp;
 
     fn pods() -> Vec<Pod> {
         let mut old = pod("qa", "dev", "billing-worker-1a2b3c-old01", "Completed");
@@ -585,6 +560,19 @@ mod tests {
             "orders-api-7d9f5b-k9x2p",
             "1/1 after the 0/1s"
         );
+    }
+
+    #[test]
+    fn name_turned_round_puts_the_last_name_first_in_every_namespace() {
+        let mut rows = pods();
+        rows.push(pod("qa", "zzz", "aardvark-0", "Running"));
+        let mut list = ListState::new(Kind::Pods, ColumnId::Name);
+        list.sort_by(ColumnId::Name, ColumnId::Name);
+        assert!(list.descending);
+        list.refilter(&rows);
+        let shown = names(&list, &rows);
+        assert_eq!(shown[0], "orders-api-7d9f5b-k9x2p");
+        assert_eq!(shown[3], "aardvark-0", "by name, not by namespace");
     }
 
     #[test]

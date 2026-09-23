@@ -52,6 +52,9 @@ pub struct RegistriesScreen {
     /// What the repository rows were last built from.
     built_for: Option<(String, ColumnId, bool, usize)>,
     ordered_for: Option<(ColumnId, bool, usize)>,
+    /// A fill landed since the rows were last sorted. They sort again once,
+    /// at the next `refilter`, rather than once a fill.
+    filled: bool,
     /// Which rows of `store.repositories` are shown, in order.
     visible: Vec<usize>,
     sorted: Vec<usize>,
@@ -102,6 +105,7 @@ impl Default for RegistriesScreen {
             haystacks: Vec::new(),
             built_for: None,
             ordered_for: None,
+            filled: false,
             visible: Vec::new(),
             sorted: Vec::new(),
             tag_visible: Vec::new(),
@@ -194,10 +198,27 @@ impl RegistriesScreen {
         self.ordered_for = None;
         self.tag_built_for = None;
         self.haystacks.clear();
+        // The caller puts the cursor back itself, from before the rows moved.
+        self.filled = false;
+    }
+
+    /// One repository filled in. The haystacks hold only the registry and
+    /// the name, which a fill does not change, so they stand; the sort and
+    /// the filter wait for the next `refilter`.
+    pub const fn on_fill(&mut self) {
+        self.filled = true;
     }
 
     /// Rebuilds whichever table is on screen. Cheap to call every frame.
     pub fn refilter(&mut self, store: &AzureStore) {
+        // A fill keeps every row at its index, so the cursor's row can still
+        // be read off the shown rows as they were before it.
+        if std::mem::take(&mut self.filled) {
+            let was = self.cursor_identity(store);
+            self.ordered_for = None;
+            self.keep_cursor(store, was);
+            return;
+        }
         self.refilter_repositories(store);
         self.refilter_tags(store);
     }
@@ -462,25 +483,13 @@ impl RegistriesScreen {
         }
     }
 
-    /// The sortable columns of whichever table is showing.
-    fn sortable(&self) -> Vec<ColumnId> {
-        self.table()
-            .layout
-            .visible_columns(self.available)
-            .into_iter()
-            .map(|column| column.id)
-            .collect()
-    }
-
     pub fn next_sort(&mut self) {
-        let columns = self.sortable();
-        if columns.is_empty() {
-            return;
-        }
+        let available = self.available;
         let table = self.table_mut();
-        let at = columns.iter().position(|held| *held == table.sort);
-        table.sort = columns[at.map_or(0, |at| (at + 1) % columns.len())];
-        table.descending = false;
+        if let Some(next) = table.layout.next_sort(table.sort, available) {
+            table.sort = next;
+            table.descending = false;
+        }
     }
 
     /// A header click: the same column cycles ascending, descending, then
@@ -568,7 +577,7 @@ impl RegistriesScreen {
     ) -> AppAction {
         use crossterm::event::KeyCode;
         match (key.code, &self.level) {
-            (KeyCode::Enter, Level::Repositories) => self.open_tags(store),
+            (KeyCode::Enter | KeyCode::Char('l'), Level::Repositories) => self.open_tags(store),
             // `Esc` reaches here only once there was no query to clear.
             (KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Esc, Level::Tags { .. }) => {
                 self.close_tags();
@@ -666,21 +675,7 @@ impl RegistriesScreen {
             return;
         }
         let count = self.count();
-        let cursor = &mut self.table_mut().cursor;
-        // Measured against the list as it is now, not as it was last drawn:
-        // a refresh may have shortened it since.
-        cursor.scroll.set_viewport(cursor.scroll.viewport, count);
-        cursor.scroll.scroll_by(delta);
-        let last = (cursor.scroll.offset + cursor.scroll.viewport.saturating_sub(1))
-            .min(count.saturating_sub(1));
-        let first = cursor.scroll.offset.min(last);
-        cursor.index = cursor.index.clamp(first, last);
-    }
-
-    /// Nothing about a registry is urgent, so no badge.
-    #[must_use]
-    pub const fn badge(&self, _store: &AzureStore) -> Option<String> {
-        None
+        self.table_mut().cursor.wheel(delta, count);
     }
 
     #[must_use]
@@ -714,8 +709,8 @@ pub fn repository_passes(row: &Repository, query: &Query, now: Timestamp) -> boo
         "env" => Env::of(value).is_none_or(|want| Env::of(&row.registry) == Some(want)),
         "registry" => filter::contains(&row.registry, value),
         "repo" | "name" => filter::contains(&row.name, value),
-        "updated" => When::parse(value).is_none_or(|when| when.holds(row.updated, now)),
-        "created" => When::parse(value).is_none_or(|when| when.holds(row.created, now)),
+        "updated" => When::parse(value).is_none_or(|when| when.holds_age(row.updated, now)),
+        "created" => When::parse(value).is_none_or(|when| when.holds_age(row.created, now)),
         _ => true,
     })
 }
@@ -725,8 +720,8 @@ pub fn tag_passes(tag: &Tag, query: &Query, now: Timestamp) -> bool {
     query.fields.iter().all(|(key, value)| match key.as_str() {
         "tag" | "name" => filter::contains(&tag.name, value),
         "digest" => filter::contains(&tag.digest, value),
-        "updated" => When::parse(value).is_none_or(|when| when.holds(tag.updated, now)),
-        "created" => When::parse(value).is_none_or(|when| when.holds(tag.created, now)),
+        "updated" => When::parse(value).is_none_or(|when| when.holds_age(tag.updated, now)),
+        "created" => When::parse(value).is_none_or(|when| when.holds_age(tag.created, now)),
         _ => true,
     })
 }

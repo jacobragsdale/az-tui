@@ -140,7 +140,8 @@ def main():
         "COLUMNS": str(COLUMNS),
         "LINES": str(LINES),
     })
-    env.pop("NO_COLOR", None)
+    for name in ("NO_COLOR", "AZ_TUI_CONFIG", "AZ_TUI_CACHE", "AZ_TUI_THEME"):
+        env.pop(name, None)
 
     walk = Walk(options.binary, scratch, env)
     ok = True
@@ -192,7 +193,7 @@ def main():
         walk.send("/worker\r")
         ok &= walk.expect("1/5 · Name")
         walk.send("x")
-        ok &= walk.expect("Restart orders-worker-5c4d3e-q8zt?")
+        ok &= walk.expect("Restart orders-worker-5c4d3e-q8zt in qa/dev?")
         ok &= walk.expect("Deployment orders-worker replaces it")
         walk.send("x")
         ok &= walk.expect("Deleted orders-worker-5c4d3e-q8zt; Deployment orders-worker is putting a new one up")
