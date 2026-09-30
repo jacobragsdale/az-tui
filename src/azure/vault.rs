@@ -81,8 +81,8 @@ pub fn versions(client: &Client, vault: &Vault, name: &str) -> Result<Vec<Secret
 /// One secret's value, and the version it came from.
 ///
 /// **This is the only function in the crate that produces a [`Secret`].** It
-/// is reached from exactly two keys — `v` and `y` — and from `secret get`; a
-/// listing never calls it and neither does a refresh.
+/// is reached from exactly two keys — `v` and `y`; a listing never calls it
+/// and neither does a refresh.
 pub fn value(
     client: &Client,
     vault: &Vault,

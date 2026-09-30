@@ -1,7 +1,6 @@
 //! The pool a refresh fans out over: `std::thread::scope` and one atomic
 //! counter, which is all a bounded walk over a slice needs.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
@@ -46,38 +45,17 @@ pub fn each<T: Sync>(
     !stopped.load(Relaxed)
 }
 
-/// [`each`], collecting one result per item in the items' order.
-pub fn map<T: Sync, R: Send>(items: &[T], limit: usize, read: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let results: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
-    let _ = each(
-        items,
-        limit,
-        || true,
-        |index, item| {
-            let result = read(item);
-            results.lock().unwrap()[index] = Some(result);
-        },
-    );
-    results
-        .into_inner()
-        .unwrap()
-        .into_iter()
-        .map(|result| result.expect("every item was read"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn every_item_is_read_once_and_the_order_is_the_items() {
-        let items: Vec<usize> = (0..50).collect();
-        assert_eq!(
-            map(&items, 4, |n| n * 2),
-            (0..50).map(|n| n * 2).collect::<Vec<_>>()
-        );
-        assert_eq!(map(&Vec::<usize>::new(), 4, |n| n * 2), Vec::<usize>::new());
+    fn every_item_is_read_once_across_threads() {
+        let reads: Vec<AtomicUsize> = (0..50).map(|_| AtomicUsize::new(0)).collect();
+        let read_once = |_, read: &AtomicUsize| _ = read.fetch_add(1, Relaxed);
+        assert!(each(&reads, 4, || true, read_once));
+        assert!(reads.iter().all(|read| read.load(Relaxed) == 1));
+        assert!(each(&reads[..0], 4, || true, |_, _| unreachable!()));
     }
 
     #[test]

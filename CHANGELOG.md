@@ -52,9 +52,10 @@ images, one binary.
   in flight; a refresh that read nothing writes no cache; the cache is
   written in one call rather than one per token; pasting into the search box
   works; `Esc` backs out of a repository; the help wraps and lists the search
-  grammar; a listing with a vault that would not answer exits 1 after the
-  rows that did; naming a vault the login cannot reach exits 2 and says which
-  it can.
+  grammar.
+- The shell reads for scripts and agents — `secrets`, `secret get`, `repos`
+  and `tags` — moved to [agent-cli](https://github.com/jacobragsdale/agent-cli)'s
+  `kv` and `acr`. `setup` and `doctor` stay.
 
 Built without a reachable Azure subscription: every endpoint was verified
 against the published REST reference instead. `plan/CHECKLIST.md` is the live

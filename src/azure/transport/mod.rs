@@ -270,8 +270,8 @@ pub fn is_signed_out(error: &anyhow::Error) -> bool {
 ///
 /// A signed-out login is the one refusal worth rewording: the CLI answers it
 /// with five lines of its own stack, and what a person needs is the two words
-/// that fix it. The worker's events and the subcommands' errors both go
-/// through here, so the status bar and stderr say the same thing.
+/// that fix it. The worker's events go through here, so every status bar
+/// line says it the same way.
 ///
 /// The reason still follows in brackets, one line of it: an AADSTS code or a
 /// refused connection is what tells an expired login from an MFA prompt or

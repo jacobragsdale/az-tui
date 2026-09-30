@@ -19,11 +19,11 @@ use crate::app::App;
 use crate::app::screen::{AppAction, Tab};
 use crate::azure::auth::AzCli;
 use crate::azure::transport::{Client, Https};
-use crate::cli::{Cli, Command, SecretCommand};
+use crate::cli::{Cli, Command};
 use crate::kube::{self, Handle, Kubectl};
 use crate::store::Store;
 use crate::worker::{Request, Worker};
-use crate::{cache, clipboard, commands, config, desktop, doctor, paths, session, ui};
+use crate::{cache, clipboard, config, desktop, doctor, paths, session, ui};
 
 /// How long a settled screen waits for a key before looking at the clock.
 const RESTING: Duration = Duration::from_millis(250);
@@ -64,86 +64,15 @@ pub fn run() -> Result<()> {
             &config_path,
             &config.azure.subscriptions,
         )?),
-        Some(command) => shell(&cli, &config, command),
         None => tui(&cli, config),
     }
 }
 
-/// `Ok` when a check passed, else the shell's failure code — after what was
-/// printed has landed.
+/// `Ok` when a check passed, else exit 1 — after what was printed has
+/// landed.
 fn finish(ok: bool) -> Result<()> {
     io::stdout().flush()?;
-    if ok {
-        Ok(())
-    } else {
-        std::process::exit(commands::FAILED)
-    }
-}
-
-/// One subcommand, on the calling thread. Every failure exits with the code
-/// the plan gives it rather than with an error up the stack, so a script can
-/// tell "nothing matched" from "you asked wrong".
-fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
-    let client = Client::new(Box::new(AzCli), Box::new(Https::new()));
-    let cache_path = paths::cache_file(cli.cache.as_deref());
-    let context = commands::Context {
-        azure: &config.azure,
-        client: &client,
-        cache: (!cli.no_cache).then_some(cache_path.as_path()),
-    };
-    let mut out = io::stdout().lock();
-    let done = match command {
-        Command::Doctor | Command::Setup { .. } => unreachable!("handled above"),
-        Command::Secrets {
-            query,
-            vaults,
-            json,
-            refresh,
-        } => commands::secrets(&mut out, &context, query.as_deref(), &vaults, json, refresh),
-        Command::Secret {
-            command:
-                SecretCommand::Get {
-                    name,
-                    vault,
-                    version,
-                    json,
-                },
-        } => commands::secret_get(
-            &mut out,
-            &context,
-            &name,
-            vault.as_deref(),
-            version.as_deref(),
-            json,
-        ),
-        Command::Repos {
-            query,
-            registries,
-            json,
-            refresh,
-        } => commands::repos(
-            &mut out,
-            &context,
-            query.as_deref(),
-            &registries,
-            json,
-            refresh,
-        ),
-        Command::Tags {
-            repo,
-            registry,
-            json,
-        } => commands::tags(&mut out, &context, &repo, registry.as_deref(), json),
-    };
-    let flushed = out.flush().map_err(commands::Failure::from);
-    // Code 0 is a reader that stopped reading, which had all it wanted.
-    if let Err(failure) = done.and(flushed)
-        && failure.code != 0
-    {
-        eprintln!("error: {}", failure.message);
-        std::process::exit(failure.code);
-    }
-    Ok(())
+    if ok { Ok(()) } else { std::process::exit(1) }
 }
 
 fn tui(cli: &Cli, config: config::Config) -> Result<()> {

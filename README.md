@@ -147,39 +147,13 @@ the exit code is the Azure half's.
 
 ## From a shell
 
-The same reads without the screen, for scripts and agents. Each reads the
-cache when it is younger than the refresh interval and Azure otherwise; with
-`refresh = 0` under `[azure]` the cache is used whatever its age, and
-`--refresh` on the subcommand reads Azure regardless. The global flags
-(`--config`, `--cache`, `--no-cache`, `--subscription`, `--theme`) may come
-before or after the subcommand.
-
 ```console
-az-tui secrets [QUERY] [--vault NAME]... [--json] [--refresh]
-az-tui secret get NAME [--vault NAME] [--version ID] [--json]
-az-tui repos [QUERY] [--registry NAME]... [--json] [--refresh]
-az-tui tags REPO [--registry NAME] [--json]
 az-tui setup [--write]
 az-tui doctor
 ```
 
-`QUERY` is the same grammar as `/` in the TUI.
-
-```console
-$ az-tui secrets 'expires:<30d enabled:yes'
-kv-prod          tls-cert-pem      enabled  12d        3d
-$ az-tui secrets db --json | jq length
-3
-$ az-tui secret get db-password --vault kv-prod | wc -c
-24
-$ az-tui tags payments-api --json | jq -r '.[0].pull'
-acrprod.azurecr.io/payments-api:1.42.0
-```
-
-`secret get` is the one command that prints a value. It writes it to stdout
-with no trailing newline of its own, so `$(az-tui secret get NAME)` is the
-value byte for byte, and a value that ends in a newline keeps it. A name that
-is in more than one vault is an error listing them rather than a guess.
+The global flags (`--config`, `--cache`, `--no-cache`, `--subscription`,
+`--theme`) may come before or after the subcommand.
 
 `setup` fetches credentials for every AKS cluster in the current `az`
 subscription — or in each `--subscription` or `[azure].subscriptions` entry
@@ -188,8 +162,25 @@ block per cluster to trim; a cluster whose credentials fail is said and left
 out. `--write` puts the blocks in `config.toml` when there is no file yet, and
 never overwrites one: with a file already there it prints them and exits 0.
 
-Exit codes: **0** it worked, **1** a read failed (the rows that did answer
-are still printed first), **2** the arguments were wrong.
+Exit codes: **0** it worked, **1** a check or a read failed, **2** the
+arguments were wrong.
+
+## For agents: use agent-cli
+
+The shell reads that were subcommands here — `secrets`, `secret get`,
+`repos` and `tags` — are [agent-cli](https://github.com/jacobragsdale/agent-cli)'s
+`kv` and `acr` domains now: JSON only, a value printed only with `--reveal`,
+and a deadline on every call. It reads `[azure]` from its own `config.toml`.
+
+| az-tui | agent-cli |
+|---|---|
+| `az-tui secrets db` | `agent-cli kv secret list db` |
+| `az-tui secrets 'expires:<30d'` | `agent-cli kv secret list --expires-within 30d` |
+| `az-tui secrets --vault kv-prod --json` | `agent-cli kv secret list --vault kv-prod` |
+| `az-tui secret get db-password --vault kv-prod` | `agent-cli kv secret get kv-prod/db-password --reveal` |
+| `az-tui secret get db-password --version ID` | `agent-cli kv secret get db-password --version ID --reveal` |
+| `az-tui repos payments --json` | `agent-cli acr repo list payments` |
+| `az-tui tags payments-api --registry acrprod` | `agent-cli acr tag list payments-api --registry acrprod` |
 
 ## Keys
 

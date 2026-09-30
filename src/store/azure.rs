@@ -106,10 +106,9 @@ impl AzureStore {
 
     /// What the next save writes: nothing until something has been read —
     /// a first run with no login would otherwise write an empty cache
-    /// stamped now, which the subcommands would then trust for five minutes
-    /// and answer "nothing" from. Rows a failed read left standing are in
-    /// it: yesterday's names beat no names, and the status bar says how old
-    /// they are.
+    /// stamped now, which the next start would paint as a fresh "nothing".
+    /// Rows a failed read left standing are in it: yesterday's names beat no
+    /// names, and the status bar says how old they are.
     #[must_use]
     pub fn snapshot(&self) -> BTreeMap<String, CachedTab> {
         self.read_at.map_or_else(BTreeMap::new, |read_at| {

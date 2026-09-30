@@ -4,7 +4,6 @@ pub mod cache;
 pub mod cli;
 pub mod clipboard;
 pub mod columns;
-pub mod commands;
 pub mod config;
 pub mod desktop;
 pub mod doctor;

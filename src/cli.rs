@@ -1,5 +1,6 @@
-//! The command line: flags that override `config.toml`, and the subcommands
-//! that read the same things from a shell instead of a screen.
+//! The command line: flags that override `config.toml`, and the two
+//! subcommands that set up and check what the screen reads. The reads
+//! themselves, from a shell, are agent-cli's `kv` and `acr`.
 
 use std::path::PathBuf;
 
@@ -67,82 +68,6 @@ pub enum Command {
         /// Write the blocks to config.toml when there is no file yet.
         #[arg(long)]
         write: bool,
-    },
-
-    /// One line per secret: vault, name, enabled, expires, updated.
-    ///
-    /// Never prints a value; `secret get` is the one command that does.
-    Secrets {
-        /// The same grammar as `/` in the TUI.
-        query: Option<String>,
-        /// Only this vault. Repeat for more.
-        #[arg(long = "vault", value_name = "NAME")]
-        vaults: Vec<String>,
-        /// One JSON array: vault, name, enabled, content_type, expires,
-        /// created, updated, managed, tags. Never a value.
-        #[arg(long)]
-        json: bool,
-        /// Read Azure rather than the cache.
-        #[arg(long)]
-        refresh: bool,
-    },
-
-    /// One secret's value. The only command that prints one.
-    Secret {
-        #[command(subcommand)]
-        command: SecretCommand,
-    },
-
-    /// One line per repository: registry, repository, tags, updated.
-    Repos {
-        /// The same grammar as `/` in the TUI.
-        query: Option<String>,
-        /// Only this registry. Repeat for more.
-        #[arg(long = "registry", value_name = "NAME")]
-        registries: Vec<String>,
-        /// One JSON array: registry, repository, tag_count, manifest_count,
-        /// created, updated.
-        #[arg(long)]
-        json: bool,
-        /// Read Azure rather than the cache.
-        #[arg(long)]
-        refresh: bool,
-    },
-
-    /// One line per tag of one repository, newest first.
-    Tags {
-        /// The repository, as the catalog names it.
-        repo: String,
-        /// Which registry, when more than one holds a repository by this
-        /// name.
-        #[arg(long, value_name = "NAME")]
-        registry: Option<String>,
-        /// One JSON array: registry, repository, tag, digest, pull, created,
-        /// updated.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SecretCommand {
-    /// Print one secret's value.
-    ///
-    /// This is the one command in az-tui that prints a value. It goes to
-    /// stdout with no trailing newline of its own, so `$(az-tui secret get
-    /// NAME)` is the value byte for byte.
-    Get {
-        /// The secret's name, as the vault lists it.
-        name: String,
-        /// Which vault, when more than one holds a secret by this name.
-        #[arg(long, value_name = "NAME")]
-        vault: Option<String>,
-        /// A version other than the current one.
-        #[arg(long, value_name = "ID")]
-        version: Option<String>,
-        /// `{"vault","name","version","content_type","value"}`.
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -231,10 +156,10 @@ mod tests {
 
         // The natural order in a script: the command first, then how to run
         // it. Only the flags no subcommand names for itself are global.
-        let cli = Cli::parse_from(["az-tui", "secrets", "--no-cache", "--config", "x.toml"]);
+        let cli = Cli::parse_from(["az-tui", "doctor", "--no-cache", "--cache", "c.json"]);
         assert!(cli.no_cache);
-        assert_eq!(cli.config.as_deref(), Some(std::path::Path::new("x.toml")));
-        assert!(matches!(cli.command, Some(Command::Secrets { .. })));
+        assert_eq!(cli.cache.as_deref(), Some(std::path::Path::new("c.json")));
+        assert!(matches!(cli.command, Some(Command::Doctor)));
     }
 
     #[test]
@@ -247,7 +172,7 @@ mod tests {
             "{said}"
         );
 
-        let cli = Cli::parse_from(["az-tui", "secrets", "--theme", "light"]);
+        let cli = Cli::parse_from(["az-tui", "doctor", "--theme", "light"]);
         assert_eq!(cli.theme.as_deref(), Some("light"), "an alias still reads");
     }
 }
