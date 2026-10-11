@@ -46,18 +46,16 @@ pub fn run() -> Result<()> {
     let named = paths::config_named(cli.config.as_deref())
         && !matches!(cli.command, Some(Command::Setup { .. }));
     let config = cli.merge(config::load(&config_path, named)?);
-    let theme = cli
-        .resolve_theme(&config)
-        .and_then(|choice| choice.theme(&config))
-        .with_context(|| format!("resolving the theme (config: {})", config_path.display()))?;
-    ui::theme::set_theme(theme);
 
     match cli.command.take() {
-        Some(Command::Doctor) => finish(doctor::run(
-            &mut io::stdout().lock(),
-            &config,
-            &config_path,
-        )?),
+        Some(Command::Doctor) => {
+            match doctor::run(&mut io::stdout().lock(), &config, &config_path) {
+                // A reader that stopped reading — `| head -1` — had what it
+                // wanted, which is the clean exit the other commands give it.
+                Err(error) if went_away(&error) => Ok(()),
+                checked => finish(checked?),
+            }
+        }
         Some(Command::Setup { write }) => finish(doctor::setup(
             &mut io::stdout().lock(),
             write,
@@ -65,8 +63,28 @@ pub fn run() -> Result<()> {
             &config.azure.subscriptions,
         )?),
         Some(command) => shell(&cli, &config, command),
-        None => tui(&cli, config),
+        None => {
+            // The theme is how the screen looks; the commands above paint
+            // nothing, so a typo in it is no reason for them to fail.
+            let theme = cli
+                .resolve_theme(&config)
+                .and_then(|choice| choice.theme(&config))
+                .with_context(|| {
+                    format!("resolving the theme (config: {})", config_path.display())
+                })?;
+            ui::theme::set_theme(theme);
+            tui(&cli, config)
+        }
     }
+}
+
+/// Whether this error is stdout's reader having gone away.
+fn went_away(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|held| held.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// `Ok` when a check passed, else the shell's failure code — after what was
@@ -147,6 +165,13 @@ fn shell(cli: &Cli, config: &config::Config, command: Command) -> Result<()> {
 }
 
 fn tui(cli: &Cli, config: config::Config) -> Result<()> {
+    // Before any worker starts: with no terminal to draw on, say so rather
+    // than panic inside the terminal set-up or draw escape codes into a file.
+    if !io::IsTerminal::is_terminal(&io::stdout()) {
+        anyhow::bail!(
+            "the screen needs a terminal on stdout; from a script, use a subcommand (az-tui secrets, repos, tags, secret get)"
+        );
+    }
     let tabs = crate::app::screen::tabs(config.tabs());
     let scopes: Vec<_> = tabs
         .iter()
@@ -158,10 +183,11 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     // The cache is read before the terminal is taken, so the first frame is
     // painted from it rather than after it.
     let cache_path = paths::cache_file(cli.cache.as_deref());
-    let store = match (cli.no_cache, cache::load(&cache_path)) {
+    let mut store = match (cli.no_cache, cache::load(&cache_path)) {
         (false, Some(snapshot)) => Store::from_cache(&snapshot, &tabs),
         _ => Store::new(scopes.len()),
     };
+    store.azure.narrow(&config.azure);
 
     let client = Client::new(Box::new(AzCli), Box::new(Https::new()));
     // The Azure worker starts knowing whatever the cache knew, so a key
@@ -198,7 +224,7 @@ fn tui(cli: &Cli, config: config::Config) -> Result<()> {
     let mut cache_writing: Option<std::thread::JoinHandle<Result<()>>> = None;
     let started = Instant::now();
 
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().context("the screen needs a terminal")?;
     // From here on the terminal is ours, so every way out of this function —
     // an error, a panic, `q` — goes through the guard's `Drop`.
     let _restore = TerminalRestore;
@@ -367,6 +393,10 @@ fn act(app: &mut App, azure: &Worker, kube: &Handle, action: AppAction) -> Outco
                 Ok(status) => app
                     .shell
                     .set_error(format!("kubectl exec on {pod} exited with {status}")),
+                // The words every other kubectl call uses for the same thing.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => app
+                    .shell
+                    .set_error("kubectl is not installed or not on PATH"),
                 Err(error) => app
                     .shell
                     .set_error(format!("kubectl could not be run: {error}")),
@@ -409,7 +439,14 @@ fn released_terminal<T>(body: impl FnOnce() -> T) -> T {
 /// raw mode and the alternate screen. The end of a run and the shell hand-off
 /// both leave this way.
 fn release_terminal() {
-    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
+    // The cursor too: the TUI hides it on every frame, and a shell in a pod
+    // handed a hidden one types blind until it exits.
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
     ratatui::restore();
 }
 
@@ -436,4 +473,19 @@ impl Drop for TerminalRestore {
 fn enable_terminal_input() -> Result<()> {
     execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)
         .context("failed to enable terminal input features")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_pipe_is_told_apart_from_a_failure() {
+        let pipe =
+            anyhow::Error::new(io::Error::from(io::ErrorKind::BrokenPipe)).context("writing");
+        assert!(went_away(&pipe));
+        let denied = anyhow::Error::new(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!went_away(&denied));
+        assert!(!went_away(&anyhow::anyhow!("az said no")));
+    }
 }

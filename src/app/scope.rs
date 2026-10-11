@@ -4,7 +4,7 @@
 //! the question on top of the table, and the one secret value on screen.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::cursor::ScrollState;
 use super::list::{ListState, Row};
@@ -59,6 +59,9 @@ pub enum Modal {
         title: String,
         body: Vec<String>,
         verb: Verb,
+        /// When its own letter was pressed on its own. The answer goes out
+        /// from the tick once [`REPEAT_GAP`] passes with no repeat of it.
+        armed: Option<Instant>,
     },
     Scale {
         object: ObjectRef,
@@ -67,6 +70,33 @@ pub enum Modal {
         input: TextInput,
         current: Option<Replicas>,
     },
+}
+
+/// A key held down reaches the program as the same press over and over,
+/// 25–40 times a second once the terminal starts repeating it. A press of a
+/// confirmation's own letter that another follows within this is part of a
+/// hold, and a hold is not an answer.
+pub const REPEAT_GAP: Duration = Duration::from_millis(120);
+
+/// Where a change lands: the cluster and the namespace it acts in — which,
+/// on a tab over every namespace, the tab's own name does not say.
+fn place(tab: &Tab, namespace: &str) -> String {
+    format!("{}/{namespace}", tab.scope.cluster)
+}
+
+/// One word of a line meant for a shell, as the shell reads it back: bare
+/// when it can be, single-quoted when not. A context is whatever the
+/// kubeconfig calls it, and a pasted `;` in one must not run a second command.
+fn shell_word(raw: &str) -> String {
+    let bare = !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._/:=@%+,-".contains(&byte));
+    if bare {
+        raw.to_owned()
+    } else {
+        format!("'{}'", raw.replace('\'', r"'\''"))
+    }
 }
 
 /// The owner kinds `kubectl scale` takes.
@@ -981,38 +1011,38 @@ impl ScopeScreen {
         let object = self.selected_object(data)?;
         let prefix = format!(
             "kubectl --context {} -n {}",
-            tab.scope.context, object.namespace
+            shell_word(&tab.scope.context),
+            shell_word(&object.namespace)
         );
+        let slash = shell_word(&object.slash());
+        let name = shell_word(&object.name);
         Some(match (self.kind, self.pane_open, self.pane) {
-            (_, true, PaneText::Describe) => format!("{prefix} describe {}", object.slash()),
-            (_, true, PaneText::Yaml) => format!("{prefix} get {} -o yaml", object.slash()),
+            (_, true, PaneText::Describe) => format!("{prefix} describe {slash}"),
+            (_, true, PaneText::Yaml) => format!("{prefix} get {slash} -o yaml"),
             (Kind::Pods, _, _) => {
-                let mut line = format!("{prefix} logs -f {}", object.name);
+                let mut line = format!("{prefix} logs -f {name}");
                 if let Some(container) = self
                     .log_target
                     .as_ref()
                     .filter(|held| held.key.name == object.name)
                     .and_then(|held| held.container.as_deref())
                 {
-                    line.push_str(&format!(" -c {container}"));
+                    line.push_str(&format!(" -c {}", shell_word(container)));
                 }
                 if self.previous {
                     line.push_str(" -p");
                 }
                 line
             }
-            (Kind::Events, _, _) => format!("{prefix} describe {}", object.slash()),
-            (Kind::ConfigMaps, _, _) => format!("{prefix} get {} -o yaml", object.slash()),
+            (Kind::Events, _, _) => format!("{prefix} describe {slash}"),
+            (Kind::ConfigMaps, _, _) => format!("{prefix} get {slash} -o yaml"),
             (Kind::Secrets, _, _) => {
                 // A dot in a key would read as a step down the path.
                 let key = self
                     .selected_key(data)
                     .unwrap_or_default()
                     .replace('.', "\\.");
-                format!(
-                    "{prefix} get secret {} -o jsonpath='{{.data.{key}}}' | base64 -d",
-                    object.name
-                )
+                format!("{prefix} get secret {name} -o jsonpath='{{.data.{key}}}' | base64 -d")
             }
         })
     }
@@ -1085,11 +1115,16 @@ impl ScopeScreen {
         self.modal = Some(Modal::Confirm {
             title: "Restart pod".to_owned(),
             body: vec![
-                format!("Restart {} in {}?", pod.key.name, tab.scope.describe()),
+                format!(
+                    "Restart {} in {}?",
+                    pod.key.name,
+                    place(tab, &pod.key.namespace)
+                ),
                 String::new(),
                 format!("Deletes the pod; {kind} {owner} replaces it."),
             ],
             verb: Verb::Restart(pod.key.clone()),
+            armed: None,
         });
     }
 
@@ -1113,12 +1148,13 @@ impl ScopeScreen {
                 format!(
                     "Restart the rollout of {} in {}?",
                     object.slash(),
-                    tab.scope.describe()
+                    place(tab, &object.namespace)
                 ),
                 String::new(),
                 "Every pod of it is replaced, one at a time.".to_owned(),
             ],
             verb: Verb::Rollout(object),
+            armed: None,
         });
     }
 
@@ -1150,8 +1186,8 @@ impl ScopeScreen {
             TextInput::new(current.map_or_else(String::new, |held| held.desired.to_string()));
         input.move_end();
         self.modal = Some(Modal::Scale {
+            scope: place(tab, &object.namespace),
             object: object.clone(),
-            scope: tab.scope.describe(),
             input,
             current,
         });
@@ -1166,34 +1202,50 @@ impl ScopeScreen {
     /// A key while a modal is open. Answers the request when the modal was
     /// answered yes; closes it on `Esc` and, for a confirmation, on any key
     /// that is not its own.
+    ///
+    /// Enter answers at once. The confirmation's own letter only arms it —
+    /// [`ScopeScreen::tick_modal`] answers once nothing has repeated it — and
+    /// a `repeat` of the last key, as a held or typed-ahead one arrives, is
+    /// never an answer: a held `x` would otherwise open and confirm a restart
+    /// on every second repeat.
     pub fn modal_key(
         &mut self,
         shell: &mut Shell,
         scope: usize,
         key: crossterm::event::KeyEvent,
+        now: Instant,
+        repeat: bool,
     ) -> Option<Request> {
         use crossterm::event::KeyCode;
         match &mut self.modal {
             None => None,
-            Some(Modal::Confirm { verb, .. }) => {
+            Some(Modal::Confirm { verb, armed, .. }) => {
                 // With a modifier it is not the key: Ctrl-X asks nothing.
                 let plain = key
                     .modifiers
                     .difference(crossterm::event::KeyModifiers::SHIFT)
                     .is_empty();
-                let yes = plain
+                let own = plain
                     && matches!(
                         (&*verb, key.code),
-                        (_, KeyCode::Enter)
-                            | (Verb::Restart(_), KeyCode::Char('x'))
+                        (Verb::Restart(_), KeyCode::Char('x'))
                             | (Verb::Rollout(_), KeyCode::Char('X'))
                     );
-                if yes {
-                    self.confirm(shell, scope)
-                } else {
-                    self.dismiss();
-                    None
+                if plain && key.code == KeyCode::Enter {
+                    return self.confirm(shell, scope);
                 }
+                if !own {
+                    self.dismiss();
+                    return None;
+                }
+                match (*armed, repeat) {
+                    // Still held: whatever was armed was part of the hold.
+                    (_, true) => *armed = None,
+                    (None, false) => *armed = Some(now),
+                    // Two presses on their own, the tick not yet come round.
+                    (Some(_), false) => return self.confirm(shell, scope),
+                }
+                None
             }
             Some(Modal::Scale { input, .. }) => match key.code {
                 KeyCode::Enter => self.confirm(shell, scope),
@@ -1207,6 +1259,28 @@ impl ScopeScreen {
                 }
             },
         }
+    }
+
+    /// The armed confirmation's answer, once [`REPEAT_GAP`] has passed with
+    /// no repeat of its letter.
+    pub fn tick_modal(&mut self, shell: &mut Shell, scope: usize, now: Instant) -> Option<Request> {
+        let due = matches!(
+            &self.modal,
+            Some(Modal::Confirm { armed: Some(at), .. })
+                if now.saturating_duration_since(*at) >= REPEAT_GAP
+        );
+        if due {
+            self.confirm(shell, scope)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a confirmation is armed, so the loop comes back in time to
+    /// answer it.
+    #[must_use]
+    pub const fn is_arming(&self) -> bool {
+        matches!(&self.modal, Some(Modal::Confirm { armed: Some(_), .. }))
     }
 
     /// The modal's yes, however it was given: the one place a change is
@@ -1518,6 +1592,16 @@ impl ScopeScreen {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_kubectl_line_quotes_what_a_shell_would_split_or_run() {
+        assert_eq!(shell_word("aks-qa"), "aks-qa");
+        assert_eq!(shell_word("pod/orders-api-7d9f5b"), "pod/orders-api-7d9f5b");
+        assert_eq!(shell_word("aks e2e"), "'aks e2e'");
+        assert_eq!(shell_word("aks-e2e;id"), "'aks-e2e;id'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word(""), "''");
+    }
+
     use super::*;
     use crate::app::secrets::REVEAL_FOR;
     use crate::kube::tests::{crashing, key, pod};
@@ -1903,6 +1987,28 @@ mod tests {
             panic!("the scale modal");
         };
         assert_eq!(scope, "qa/dev");
+
+        // A tab over every namespace is named after the cluster alone; the
+        // question still says which namespace the change lands in.
+        let every = crate::config::parse("[[clusters]]\nname = \"qa\"\n")
+            .unwrap()
+            .tabs()
+            .remove(0);
+        screen.dismiss();
+        screen.rollout_prompt(&mut shell, &every, &data);
+        let Some(Modal::Confirm { body, .. }) = &screen.modal else {
+            panic!("a confirmation");
+        };
+        assert_eq!(
+            body[0],
+            "Restart the rollout of deployment/orders-api in qa/dev?"
+        );
+        screen.dismiss();
+        screen.restart_prompt(&mut shell, &every, &data);
+        let Some(Modal::Confirm { body, .. }) = &screen.modal else {
+            panic!("a confirmation");
+        };
+        assert!(body[0].ends_with(" in qa/dev?"), "{}", body[0]);
     }
 
     #[test]

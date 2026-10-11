@@ -137,6 +137,9 @@ impl When {
 #[must_use]
 pub fn tag_matches(tags: &[(String, String)], filter: &str) -> bool {
     match filter.split_once('=') {
+        // `tag:=prod` names no key: half-typed, so ignored rather than
+        // emptying the table (README: a value that makes no sense is ignored).
+        Some((key, _)) if key.trim().is_empty() => true,
         Some((key, value)) => tags.iter().any(|(held_key, held_value)| {
             held_key.eq_ignore_ascii_case(key) && contains(held_value, value)
         }),
@@ -343,6 +346,14 @@ mod tests {
         assert!(tag_matches(&tags, "env=PROD"));
         assert!(!tag_matches(&tags, "env=qa"));
         assert!(!tag_matches(&tags, "team"));
+        assert!(
+            tag_matches(&tags, "=prod"),
+            "no key named: ignored, not empty"
+        );
+        assert!(
+            tag_matches(&[], "=prod"),
+            "ignored even with no tags at all"
+        );
     }
 
     #[test]

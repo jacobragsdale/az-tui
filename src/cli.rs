@@ -170,7 +170,7 @@ impl Cli {
     pub fn resolve_theme(&self, config: &Config) -> anyhow::Result<ThemeChoice> {
         let env = std::env::var("AZ_TUI_THEME").ok();
         let chosen = crate::ui::theme::chosen_theme(self.theme.as_deref(), env.as_deref())?;
-        ThemeChoice::resolve(std::env::var_os("NO_COLOR").is_some(), chosen, config)
+        ThemeChoice::resolve(crate::ui::theme::no_color(), chosen, config)
     }
 }
 

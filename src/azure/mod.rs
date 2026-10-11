@@ -198,18 +198,28 @@ pub fn portal_url(id: &str) -> String {
 /// without regard to case. An empty allowlist keeps everything; a name the
 /// login cannot reach is simply absent, and `doctor` is what reports it.
 pub fn allowed<T: Clone>(found: Vec<T>, names: &[String], name_of: impl Fn(&T) -> &str) -> Vec<T> {
+    // A blank entry names nothing, as a blank subscription does in `graph`;
+    // an allowlist of only blanks is no allowlist.
+    let names: Vec<&str> = names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
     if names.is_empty() {
         return found;
     }
-    names
-        .iter()
-        .filter_map(|wanted| {
-            found
-                .iter()
-                .find(|held| name_of(held).eq_ignore_ascii_case(wanted.trim()))
-                .cloned()
-        })
-        .collect()
+    let mut kept: Vec<T> = Vec::new();
+    for wanted in names {
+        if let Some(held) = found
+            .iter()
+            .find(|held| name_of(held).eq_ignore_ascii_case(wanted))
+            // The same vault named twice, in two spellings, is read once.
+            && !kept.iter().any(|already| name_of(already) == name_of(held))
+        {
+            kept.push(held.clone());
+        }
+    }
+    kept
 }
 
 /// The allowlist names nothing found, for `doctor` to say so.
@@ -277,6 +287,24 @@ mod tests {
             allowed(found.clone(), &[], String::as_str),
             found,
             "an empty allowlist keeps everything"
+        );
+        assert_eq!(
+            allowed(
+                found.clone(),
+                &["".to_owned(), "  ".to_owned()],
+                String::as_str
+            ),
+            found,
+            "blanks name nothing: no allowlist"
+        );
+        assert_eq!(
+            allowed(
+                found.clone(),
+                &["kv-dev".to_owned(), "KV-DEV".to_owned(), "".to_owned()],
+                String::as_str
+            ),
+            ["kv-dev"],
+            "one vault named twice is kept once"
         );
     }
 }

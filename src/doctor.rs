@@ -256,7 +256,8 @@ fn aks_checks(out: &mut impl Write, config: &Config) -> Result<bool> {
     Ok(ok)
 }
 
-/// One cheap read of the scope: the first pod's name, or nothing.
+/// One read of the scope: its pods' names. `kubectl get` has no flag that
+/// stops at one, and the TUI reads every pod every few seconds anyway.
 fn probe(tab: &Tab) -> Result<()> {
     let mut arguments = vec![
         "--context",
@@ -264,7 +265,6 @@ fn probe(tab: &Tab) -> Result<()> {
         "--request-timeout=10s",
         "get",
         "pods",
-        "--limit=1",
         "-o",
         "name",
     ];
@@ -474,8 +474,26 @@ pub fn setup(
 
 /// The tool's own version line, or why it will not answer.
 fn version(program: &str, arguments: &[&str]) -> Result<String> {
-    let raw = run_capped(command(program, arguments), CALL_CAP)?;
-    Ok(raw.lines().next().unwrap_or_default().trim().to_owned())
+    Ok(version_in(&run_capped(
+        command(program, arguments),
+        CALL_CAP,
+    )?))
+}
+
+/// The version number in a `--version` answer, or its first line when none
+/// is there. kubelogin puts the number on its second line (`git hash:
+/// v0.2.20/…`) under a first that says only `kubelogin version`.
+fn version_in(raw: &str) -> String {
+    raw.split(|c: char| c.is_whitespace() || c == '/')
+        .find(|word| {
+            word.trim_start_matches('v')
+                .starts_with(|c: char| c.is_ascii_digit())
+                && word.contains('.')
+        })
+        .map_or_else(
+            || raw.lines().next().unwrap_or_default().trim().to_owned(),
+            str::to_owned,
+        )
 }
 
 /// One data-plane read, timed: how many `noun` it found, or why it would not
@@ -566,6 +584,14 @@ fn took(started: Instant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_is_read_from_whichever_line_carries_it() {
+        let kubelogin = "kubelogin version \ngit hash: v0.2.20/51be4471f0367039d4f79029f2ead5408199076d\nGo version: go1.26.4\nBuild time: 2026-09-23T17:41:35Z\n";
+        assert_eq!(version_in(kubelogin), "v0.2.20");
+        assert_eq!(version_in("v0.1.4\n"), "v0.1.4");
+        assert_eq!(version_in("something else\n"), "something else");
+    }
 
     #[test]
     fn every_line_lands_in_the_same_column() {

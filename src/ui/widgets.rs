@@ -14,6 +14,7 @@ use crate::app::screen::Target;
 use crate::app::shell::{Focus, Level, Panes, Shell};
 use crate::filter::{ENV_CHOICES, Env};
 use crate::kube::Kind;
+use crate::text_input::display_width;
 use crate::text_input::{TextInput, field_window};
 
 /// The frames of the spinner that turns while a refresh runs.
@@ -147,12 +148,12 @@ pub fn render_tab_bar(
     let pill_label = kind.map(|kind| format!(" {} \u{25be} ", kind.label()));
     let pill_width = pill_label
         .as_ref()
-        .map_or(0, |label| u16::try_from(label.chars().count()).unwrap_or(8));
+        .map_or(0, |label| u16::try_from(display_width(label)).unwrap_or(8));
     let right = pill_width.saturating_add(3);
     let full_width: usize = tabs
         .iter()
         .map(|tab| {
-            tab.label.chars().count() + 4 + tab.badge.as_ref().map_or(0, |b| b.chars().count() + 1)
+            display_width(&tab.label) + 4 + tab.badge.as_ref().map_or(0, |b| display_width(b) + 1)
         })
         .sum();
     let short = full_width + usize::from(right) > usize::from(area.width);
@@ -166,7 +167,7 @@ pub fn render_tab_bar(
         } else {
             format!(" {name}")
         };
-        let width = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+        let width = u16::try_from(display_width(&label)).unwrap_or(u16::MAX);
         let style = if index == active {
             Style::default()
                 .fg(palette.accent)
@@ -178,7 +179,7 @@ pub fn render_tab_bar(
         let mut hit_width = width;
         if let Some(badge) = &tab.badge {
             let badge = format!(" {badge}");
-            hit_width += u16::try_from(badge.chars().count()).unwrap_or(0);
+            hit_width += u16::try_from(display_width(&badge)).unwrap_or(0);
             spans.push(Span::styled(badge, Style::default().fg(palette.warning)));
         }
         if column < tabs_right {
@@ -296,31 +297,42 @@ pub fn render_status_bar(
     right_style: Style,
 ) {
     let palette = theme();
+    let notified = shell.notification().is_some();
     let (left, style) = match shell.notification() {
         Some((said, Level::Error)) => (said.to_owned(), Style::default().fg(palette.error)),
         Some((said, Level::Info)) => (said.to_owned(), Style::default().fg(palette.success)),
         None => (hint.to_owned(), Style::default().fg(palette.muted)),
     };
-    let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
+    let right_width = u16::try_from(right.chars().count()).unwrap_or(u16::MAX);
 
     // The right-hand end is the one that cannot be guessed from the keys, so
     // it keeps its room and the hint is cut to what is left. Two spaces of
     // gap, so the two never read as one sentence.
-    let (left, right) = if right_width + 3 >= area.width {
-        // No room for both: what is happening beats what the keys do.
-        (String::new(), right.to_owned())
+    let (left, right) = if right_width.saturating_add(3) >= area.width && notified {
+        // A notification answers the key just pressed and is gone in
+        // seconds: it keeps its room, and the state is cut to what is left.
+        let left = truncate(&left, usize::from(area.width.saturating_sub(1)));
+        let room = usize::from(area.width).saturating_sub(left.chars().count() + 4);
+        let right = truncate(right, room);
+        (left, right)
+    } else if right_width.saturating_add(3) >= area.width {
+        // No room for both: what is happening beats what the keys do. Cut
+        // rather than dropped: a refusal carries its URL and az's own words,
+        // and is wider than most terminals.
+        (
+            String::new(),
+            truncate(right, usize::from(area.width.saturating_sub(1))),
+        )
     } else {
         let room = usize::from(area.width - right_width - 3);
         (truncate(&left, room), right.to_owned())
     };
 
     frame.render_widget(Paragraph::new(Span::styled(left, style)), area);
-    if right_width < area.width {
-        frame.render_widget(
-            Paragraph::new(Span::styled(right, right_style)).alignment(Alignment::Right),
-            Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(right, right_style)).alignment(Alignment::Right),
+        Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
+    );
 }
 
 /// `text` in at most `room` cells, with an ellipsis where something was cut.
@@ -615,6 +627,36 @@ mod tests {
     }
 
     #[test]
+    fn a_click_lands_on_the_tab_drawn_under_it_whatever_its_width() {
+        let tabs: Vec<TabLabel> = ["本番", "prod🔥", "tail"]
+            .into_iter()
+            .map(|label| TabLabel {
+                label: label.to_owned(),
+                short: label.to_owned(),
+                badge: None,
+            })
+            .collect();
+        let mut shell = Shell::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                shell.begin_frame();
+                render_tab_bar(frame, &mut shell, Rect::new(0, 0, 60, 1), 0, &tabs, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        // The cell the t of "tail" is drawn in, counted in cells.
+        let x = (0..60)
+            .find(|&x| buffer[(x, 0)].symbol() == "t")
+            .expect("drawn");
+        assert_eq!(
+            shell.hit(x + 3, 0),
+            Some(&Target::Tab(2)),
+            "the right half of tail"
+        );
+    }
+
+    #[test]
     fn the_tab_bar_numbers_every_tab_paints_a_badge_and_wears_the_pill_on_a_scope() {
         let mut tabs = tabs();
         tabs[0].badge = Some("✗ 3".into());
@@ -812,6 +854,62 @@ mod tests {
                 !drawn.contains("sor!") && !drawn.contains("movе!"),
                 "the hint is cut rather than written over: {width} {drawn}"
             );
+        }
+    }
+
+    #[test]
+    fn an_error_wider_than_the_bar_is_cut_rather_than_dropped() {
+        // What the no-login start actually says: two hundred columns and more.
+        let right = "! not signed in — run `az login` (could not get a token for arm: `az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv` failed: ERROR: Please run 'az login' to setup account.)";
+        for width in [20, 80, 160, 240] {
+            let drawn = screen(width, 1, |frame, shell| {
+                render_status_bar(
+                    frame,
+                    shell,
+                    Rect::new(0, 0, width, 1),
+                    "↑↓/jk move  / search",
+                    right,
+                    Style::default(),
+                );
+            });
+            assert!(drawn.contains("! not signed"), "{width}: {drawn:?}");
+            if usize::from(width) <= right.chars().count() {
+                assert!(drawn.starts_with("! not signed"), "{width}: {drawn:?}");
+                assert!(drawn.contains('…'), "the cut is marked: {width}: {drawn:?}");
+            } else {
+                assert!(drawn.contains("setup account.)"), "{width}: {drawn:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_notification_is_seen_beside_a_problem_wider_than_the_bar() {
+        let right = "! not signed in — run `az login` (could not get a token for arm: `az account get-access-token --resource https://management.azure.com/ --query accessToken -o tsv` failed: ERROR: Please run 'az login' to setup account.)";
+        for width in [60, 120, 160] {
+            let mut shell = Shell::default();
+            shell.set_status("Copied the name of db-password · sent to the terminal (OSC 52)");
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    shell.begin_frame();
+                    render_status_bar(
+                        frame,
+                        &mut shell,
+                        Rect::new(0, 0, width, 1),
+                        "↑↓ move",
+                        right,
+                        Style::default(),
+                    );
+                })
+                .unwrap();
+            let drawn = screen_text(terminal.backend().buffer());
+            assert!(drawn.starts_with("Copied the name"), "{width}: {drawn:?}");
+            if width >= 120 {
+                assert!(
+                    drawn.contains("! not signed in"),
+                    "and the problem, cut: {width}: {drawn:?}"
+                );
+            }
         }
     }
 

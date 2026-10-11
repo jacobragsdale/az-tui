@@ -135,6 +135,12 @@ pub struct App {
     /// rest interval that gates the owner read.
     /// The pod the cursor is on, by tab and identity, and when it got there.
     rested: Option<(usize, String, Instant)>,
+    /// The last key pressed and when, so a confirmation can tell a held or
+    /// typed-ahead key from a press of its own.
+    last_press: Option<(KeyCode, Instant)>,
+    /// The last frame said only "too small": nothing on screen can be acted
+    /// on, so keys other than quit do nothing.
+    too_small: bool,
 }
 
 impl App {
@@ -165,6 +171,8 @@ impl App {
             cache_dirty: false,
             following: None,
             rested: None,
+            last_press: None,
+            too_small: false,
         }
     }
 
@@ -195,6 +203,12 @@ impl App {
     /// to the tab, except while a box has focus, which takes everything but
     /// `Esc`, `Enter` and `Tab`.
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    /// [`App::handle_key`] at a given moment, which is what tells a key
+    /// pressed on its own from the same key repeating.
+    pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> AppAction {
         if key.kind != KeyEventKind::Press {
             return AppAction::None;
         }
@@ -207,9 +221,22 @@ impl App {
         if key.modifiers.contains(KeyModifiers::ALT)
             && let KeyCode::Char(_) = key.code
         {
-            let _ = self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            return self.handle_key(KeyEvent::new(key.code, key.modifiers - KeyModifiers::ALT));
+            let _ = self.handle_key_at(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now);
+            return self.handle_key_at(
+                KeyEvent::new(key.code, key.modifiers - KeyModifiers::ALT),
+                now,
+            );
         }
+        // Nothing is on screen to act on; x, b or = here would act blind.
+        if self.too_small && key.code != KeyCode::Char('q') {
+            return AppAction::None;
+        }
+        // A terminal repeats a held key as the same press again and again;
+        // only a modal answer cares, and it must not take a repeat for one.
+        let repeat = self.last_press.is_some_and(|(code, at)| {
+            code == key.code && now.saturating_duration_since(at) < scope::REPEAT_GAP
+        });
+        self.last_press = Some((key.code, now));
         if self.shell.help_open {
             // The help takes every key: the one thing it can do is close.
             self.shell.help_open = false;
@@ -222,7 +249,7 @@ impl App {
             // The modal takes every key: its own answer it, any other closes
             // it and is not otherwise acted on.
             return screen
-                .modal_key(&mut self.shell, tab, key)
+                .modal_key(&mut self.shell, tab, key, now, repeat)
                 .map_or(AppAction::None, AppAction::Kube);
         }
         if let Some((menu, at)) = self.shell.menu {
@@ -257,6 +284,9 @@ impl App {
             }
             KeyCode::Char('q') => AppAction::Quit,
             KeyCode::Esc => self.escape(key),
+            // A held r is one refresh: repeated thirty times a second, each
+            // would read the tab again and clear what is read once per row.
+            KeyCode::Char('r') if repeat => AppAction::None,
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('/') if pane_open && self.shell.focus == Focus::Details => {
                 self.shell.focus = Focus::PaneSearch;
@@ -381,6 +411,17 @@ impl App {
                     }
                     Menu::Kind => self.set_kind(Kind::ALL[at]),
                 }
+            }
+            // The letter the menu prints beside each kind picks it here too.
+            KeyCode::Char(letter)
+                if menu == Menu::Kind && Kind::ALL.iter().any(|kind| kind.key() == letter) =>
+            {
+                self.shell.menu = None;
+                let kind = Kind::ALL
+                    .into_iter()
+                    .find(|kind| kind.key() == letter)
+                    .unwrap_or_default();
+                self.set_kind(kind)
             }
             _ => {
                 self.shell.menu = None;
@@ -686,7 +727,7 @@ impl App {
                 }
             };
         }
-        if let MouseEventKind::Down(_) = event.kind
+        if event.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left)
             && let Some((menu, _)) = self.shell.menu.take()
         {
             // The open menu takes the click: one of its lines chooses,
@@ -701,7 +742,9 @@ impl App {
             };
         }
         match event.kind {
-            MouseEventKind::Down(_) => match target {
+            // The left button only: a middle-click paste or a right-click for
+            // the terminal's menu must not open a shell in a pod.
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => match target {
                 Some(Target::Tab(index)) => self.switch_to(index),
                 Some(Target::Header(ColumnId::Env)) => {
                     self.shell.focus = Focus::Table;
@@ -998,6 +1041,12 @@ impl App {
         for screen in self.screens.iter_mut().filter_map(Screen::scope_mut) {
             screen.tick_reveal(now);
         }
+        // An armed confirmation that nothing repeated is the answer.
+        if let Some(screen) = self.screens.get_mut(tab).and_then(Screen::scope_mut)
+            && let Some(request) = screen.tick_modal(&mut self.shell, tab, now)
+        {
+            actions.push(AppAction::Kube(request));
+        }
         {
             let store = &self.store.azure;
             match self.screens.get_mut(tab) {
@@ -1069,7 +1118,12 @@ impl App {
     /// just landed somewhere; and whatever the caller wanted otherwise.
     #[must_use]
     pub fn poll_for(&self, settled: Duration) -> Duration {
-        if self.store.azure.refreshing || self.store.reading() {
+        let arming = self
+            .screens
+            .get(self.tab)
+            .and_then(Screen::scope)
+            .is_some_and(ScopeScreen::is_arming);
+        if self.store.azure.refreshing || self.store.reading() || arming {
             return Duration::from_millis(100);
         }
         let ticking = match self.screens.get(self.tab) {
@@ -1261,11 +1315,12 @@ impl App {
     /// One frame.
     pub fn render(&mut self, frame: &mut Frame, millis: u128) {
         let area = frame.area();
-        if area.width < ui::MIN_WIDTH || area.height < ui::MIN_HEIGHT {
+        self.shell.begin_frame();
+        self.too_small = area.width < ui::MIN_WIDTH || area.height < ui::MIN_HEIGHT;
+        if self.too_small {
             ui::render_too_small(frame, area);
             return;
         }
-        self.shell.begin_frame();
         let [tabs, body, status] = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1545,6 +1600,24 @@ pub(crate) mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> AppAction {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// A confirmation's own letter pressed on its own, a second after the
+    /// last key, and the change the tick sends once nothing repeated it.
+    fn answer(app: &mut App, code: KeyCode) -> AppAction {
+        let last = app.last_press.map_or_else(Instant::now, |(_, at)| at);
+        let at = last.max(Instant::now()) + Duration::from_secs(1);
+        let pressed = app.handle_key_at(KeyEvent::new(code, KeyModifiers::NONE), at);
+        assert_eq!(pressed, AppAction::None, "armed, not yet answered");
+        app.tick(at + scope::REPEAT_GAP)
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    AppAction::Kube(Request::Delete { .. } | Request::RolloutRestart { .. })
+                )
+            })
+            .unwrap_or(AppAction::None)
     }
 
     /// What the tick says about the follow, the owner reads left aside.
@@ -2809,6 +2882,143 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn only_the_left_button_acts_on_what_it_lands_on() {
+        let mut app = stocked();
+        draw(&mut app);
+        let bash = app
+            .shell
+            .find(&Target::Button(Button::Bash))
+            .expect("the toolbar's Bash");
+        for button in [
+            crossterm::event::MouseButton::Middle,
+            crossterm::event::MouseButton::Right,
+        ] {
+            let pressed = app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: bash.x,
+                row: bash.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(pressed, AppAction::None, "{button:?} opened nothing");
+        }
+        assert_ne!(
+            click(&mut app, bash.x, bash.y),
+            AppAction::None,
+            "the left does"
+        );
+    }
+
+    #[test]
+    fn a_screen_too_small_to_show_anything_takes_no_key_but_quit() {
+        let mut app = stocked();
+        draw(&mut app);
+        let bash = app
+            .shell
+            .find(&Target::Button(Button::Bash))
+            .expect("drawn");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|frame| app.render(frame, 0)).unwrap();
+        for code in [KeyCode::Char('x'), KeyCode::Char('b'), KeyCode::Char('=')] {
+            assert_eq!(
+                press(&mut app, code),
+                AppAction::None,
+                "{code:?} acted blind"
+            );
+        }
+        assert!(scope(&app, 0).modal.is_none(), "no question opened unseen");
+        assert_eq!(
+            click(&mut app, bash.x, bash.y),
+            AppAction::None,
+            "a stale click"
+        );
+        assert_eq!(press(&mut app, KeyCode::Char('q')), AppAction::Quit);
+    }
+
+    #[test]
+    fn the_kind_menu_takes_the_letters_it_prints() {
+        let mut app = stocked();
+        app.shell.menu = Some((Menu::Kind, 0));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.shell.menu, None);
+        assert_eq!(app.kind(), Some(Kind::ConfigMaps));
+        app.shell.menu = Some((Menu::Kind, 0));
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.shell.menu, None, "any other key closes it");
+        assert_eq!(app.kind(), Some(Kind::ConfigMaps), "and changes nothing");
+    }
+
+    #[test]
+    fn a_held_r_is_one_refresh() {
+        let mut app = stocked();
+        let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+        let t0 = Instant::now();
+        assert_ne!(
+            app.handle_key_at(r, t0),
+            AppAction::None,
+            "the press refreshes"
+        );
+        // The terminal's first repeat comes after its repeat delay and reads
+        // like a press of its own; the stream behind it does not.
+        let mut at = t0 + Duration::from_millis(500);
+        let mut refreshes = 0;
+        for _ in 0..30 {
+            if app.handle_key_at(r, at) != AppAction::None {
+                refreshes += 1;
+            }
+            at += Duration::from_millis(33);
+        }
+        assert!(refreshes <= 1, "{refreshes} refreshes from one hold");
+        assert_ne!(
+            app.handle_key_at(r, at + Duration::from_secs(1)),
+            AppAction::None,
+            "let go and pressed again, it does"
+        );
+    }
+
+    #[test]
+    fn a_held_or_typed_ahead_key_never_answers_its_own_question() {
+        let mut app = stocked();
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let deletes = |actions: &[AppAction]| {
+            actions
+                .iter()
+                .filter(|action| matches!(action, AppAction::Kube(Request::Delete { .. })))
+                .count()
+        };
+        // Held: the press that asks, then the terminal repeating it thirty
+        // times a second from its repeat delay on.
+        let t0 = Instant::now();
+        assert_eq!(app.handle_key_at(x, t0), AppAction::None);
+        let mut at = t0 + Duration::from_millis(500);
+        for _ in 0..60 {
+            assert_eq!(
+                app.handle_key_at(x, at),
+                AppAction::None,
+                "a repeat sends nothing"
+            );
+            at += Duration::from_millis(33);
+        }
+        assert_eq!(deletes(&app.tick(at + Duration::from_secs(1))), 0);
+        assert!(scope(&app, 0).modal.is_some(), "still asking");
+
+        // Let go, then pressed on its own: that is the answer, once nothing
+        // has repeated it.
+        let own = at + Duration::from_secs(1);
+        assert_eq!(app.handle_key_at(x, own), AppAction::None);
+        assert_eq!(deletes(&app.tick(own + Duration::from_millis(50))), 0);
+        assert_eq!(deletes(&app.tick(own + scope::REPEAT_GAP)), 1);
+        assert!(scope(&app, 0).modal.is_none());
+
+        // Typed ahead, both in one read: the question stays open.
+        let t1 = own + Duration::from_secs(2);
+        app.handle_key_at(x, t1);
+        assert_eq!(app.handle_key_at(x, t1), AppAction::None);
+        assert_eq!(deletes(&app.tick(t1 + Duration::from_secs(1))), 0);
+        assert!(scope(&app, 0).modal.is_some());
+    }
+
+    #[test]
     fn x_asks_first_and_the_second_x_is_the_one_delete_while_a_bare_pod_is_refused() {
         let mut app = stocked();
         assert_eq!(press(&mut app, KeyCode::Char('x')), AppAction::None);
@@ -2833,7 +3043,7 @@ pub(crate) mod tests {
         );
 
         press(&mut app, KeyCode::Char('x'));
-        let action = press(&mut app, KeyCode::Char('x'));
+        let action = answer(&mut app, KeyCode::Char('x'));
         let AppAction::Kube(Request::Delete { scope: 0, key }) = action else {
             panic!("the delete, got {action:?}");
         };
@@ -2985,7 +3195,7 @@ pub(crate) mod tests {
         // X: the rollout, confirmed with X.
         press(&mut app, KeyCode::Char('X'));
         assert_eq!(
-            press(&mut app, KeyCode::Char('X')),
+            answer(&mut app, KeyCode::Char('X')),
             AppAction::Kube(Request::RolloutRestart {
                 scope: 0,
                 object: deployment

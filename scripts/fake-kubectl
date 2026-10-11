@@ -130,7 +130,11 @@ if args[:2] == ["get", "namespaces"]:
     sys.exit(0)
 
 if args[:2] == ["get", "pods"]:
-    args[:] = [a for a in args if not a.startswith("--limit")]
+    # As kubectl itself does: `get` has no --limit, and a fake that took it
+    # hid a doctor that failed every scope on a real cluster.
+    if any(a.startswith("--limit") for a in args):
+        sys.stderr.write("error: unknown flag: --limit\nSee 'kubectl get --help' for usage.\n")
+        sys.exit(1)
     if "name" in args and "-o" in args:
         items = [p for (c, n), pods in FIX.items() if c == cluster and (all_ns or n == ns) for p in pods]
         print("\n".join(f"pod/{p['metadata']['name']}" for p in items[:1]))

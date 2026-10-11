@@ -9,9 +9,11 @@
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::azure::{Inventory, Manifest, Repository, Secret, SecretRow, SecretVersion, Tag};
+use crate::azure::{
+    Inventory, Manifest, Repository, Secret, SecretRow, SecretVersion, Tag, allowed,
+};
 use crate::cache::{CachedTab, Snapshot};
-use crate::config::{REGISTRIES_TAB, SECRETS_TAB};
+use crate::config::{Azure, REGISTRIES_TAB, SECRETS_TAB};
 use crate::timestamp::Timestamp;
 use crate::worker::Event;
 
@@ -102,6 +104,40 @@ impl AzureStore {
             store.read_at = store.read_at.max(Some(*read_at));
         }
         store
+    }
+
+    /// Only the vaults and registries this run was told to read, in the
+    /// order it was told: a cache written by a run with a wider allowlist
+    /// must not paint the rows this one leaves out until a refresh lands —
+    /// which, with no login, is never. The refresh narrows its own answer the
+    /// same way.
+    pub fn narrow(&mut self, azure: &Azure) {
+        self.inventory.vaults = allowed(
+            std::mem::take(&mut self.inventory.vaults),
+            &azure.vaults,
+            |vault| vault.name.as_str(),
+        );
+        self.inventory.registries = allowed(
+            std::mem::take(&mut self.inventory.registries),
+            &azure.registries,
+            |registry| registry.name.as_str(),
+        );
+        let vaults: HashSet<&str> = self
+            .inventory
+            .vaults
+            .iter()
+            .map(|vault| vault.name.as_str())
+            .collect();
+        self.secrets
+            .retain(|row| vaults.contains(row.vault.as_str()));
+        let registries: HashSet<&str> = self
+            .inventory
+            .registries
+            .iter()
+            .map(|registry| registry.name.as_str())
+            .collect();
+        self.repositories
+            .retain(|row| registries.contains(row.registry.as_str()));
     }
 
     /// What the next save writes: nothing until something has been read —
@@ -421,6 +457,48 @@ mod tests {
             result: Ok(vec![secret("kv-b", "three")]),
         });
         store
+    }
+
+    #[test]
+    fn a_cache_painted_under_an_allowlist_keeps_only_what_it_names_in_its_order() {
+        let mut store = stocked();
+        store.apply(Event::Repositories {
+            registry: "acra".into(),
+            result: Ok(vec![Repository::unfilled("acra", "api")]),
+        });
+        let azure = Azure {
+            vaults: vec!["KV-B".into(), "kv-gone".into()],
+            ..Azure::default()
+        };
+        store.narrow(&azure);
+        let names: Vec<&str> = store
+            .inventory
+            .vaults
+            .iter()
+            .map(|vault| vault.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["kv-b"],
+            "named, matched without case; a name not there is absent"
+        );
+        assert!(
+            store.secrets.iter().all(|row| row.vault == "kv-b"),
+            "{:?}",
+            store.secrets
+        );
+        assert_eq!(store.secrets.len(), 1);
+        assert_eq!(
+            store.repositories.len(),
+            1,
+            "no registry allowlist keeps every registry"
+        );
+
+        // No allowlist at all: everything stays.
+        let mut store = stocked();
+        store.narrow(&Azure::default());
+        assert_eq!(store.inventory.vaults.len(), 2);
+        assert_eq!(store.secrets.len(), 3);
     }
 
     #[test]

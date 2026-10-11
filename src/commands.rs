@@ -223,7 +223,7 @@ pub fn secret_get(
                     holding.push((vault.clone(), row));
                 }
             }
-            Err(error) => failed.push(format!("{error:#}")),
+            Err(error) => failed.push(said(&error)),
         }
     }
     // A vault that would not answer cannot be ruled in or out: with nothing
@@ -349,7 +349,7 @@ pub fn tags(
         match catalog {
             Ok(names) if names.iter().any(|held| held == repo) => holding.push(registry.clone()),
             Ok(_) => {}
-            Err(error) => failed.push(format!("{error:#}")),
+            Err(error) => failed.push(said(&error)),
         }
     }
     if holding.is_empty() {
@@ -414,6 +414,9 @@ fn read_secrets(
         }) = context.cached(SECRETS_TAB)
     {
         let vaults = narrow(vaults, &context.azure.vaults, only, "vault", vault_name)?;
+        if vaults.is_empty() && !context.azure.vaults.is_empty() {
+            return Err(none_reachable("vault", &context.azure.vaults));
+        }
         let all = only.is_empty() && context.azure.vaults.is_empty();
         let rows = secrets
             .into_iter()
@@ -428,6 +431,11 @@ fn read_secrets(
         "vault",
         vault_name,
     )?;
+    // An allowlist that reaches nothing is a mistake to name, as `secret get`
+    // names it, not an empty listing that exits 0.
+    if vaults.is_empty() && !context.azure.vaults.is_empty() {
+        return Err(none_reachable("vault", &context.azure.vaults));
+    }
     let mut rows = Vec::new();
     let mut failed = Vec::new();
     let listed = parallel::map(&vaults, context.azure.threads(), |vault| {
@@ -436,7 +444,7 @@ fn read_secrets(
     for listing in listed {
         match listing {
             Ok(found) => rows.extend(found),
-            Err(error) => failed.push(format!("{error:#}")),
+            Err(error) => failed.push(said(&error)),
         }
     }
     Ok((rows, failed))
@@ -461,6 +469,9 @@ fn read_repositories(
             "registry",
             registry_name,
         )?;
+        if registries.is_empty() && !context.azure.registries.is_empty() {
+            return Err(none_reachable("registry", &context.azure.registries));
+        }
         let all = only.is_empty() && context.azure.registries.is_empty();
         let rows = repositories
             .into_iter()
@@ -475,6 +486,9 @@ fn read_repositories(
         "registry",
         registry_name,
     )?;
+    if registries.is_empty() && !context.azure.registries.is_empty() {
+        return Err(none_reachable("registry", &context.azure.registries));
+    }
     let mut rows = Vec::new();
     let mut failed = Vec::new();
     let catalogs = parallel::map(&registries, context.azure.threads(), |registry| {
@@ -487,7 +501,7 @@ fn read_repositories(
                     .iter()
                     .map(|name| Repository::unfilled(&registry.name, name)),
             ),
-            Err(error) => failed.push(format!("{error:#}")),
+            Err(error) => failed.push(said(&error)),
         }
     }
     Ok((rows, failed))
@@ -556,7 +570,10 @@ fn none_reachable(kind: &str, configured: &[String]) -> Failure {
 
 /// What a listing that printed its rows exits with: a read that failed is
 /// the exit code, however many rows the others answered with.
-fn partial(failed: Vec<String>) -> Result<(), Failure> {
+fn partial(mut failed: Vec<String>) -> Result<(), Failure> {
+    // With no login every vault says the same words; once is the answer.
+    let mut seen = std::collections::HashSet::new();
+    failed.retain(|said| seen.insert(said.clone()));
     if failed.is_empty() {
         Ok(())
     } else {
@@ -828,6 +845,55 @@ mod tests {
             secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
         assert_eq!(failure.message, "not signed in — run `az login` (stack)");
         assert_eq!(failure.code, FAILED);
+    }
+
+    #[test]
+    fn a_vault_refusing_for_want_of_a_login_says_so_once_like_the_screen_does() {
+        use crate::azure::auth::FixedTokens;
+        use crate::azure::transport::NoLogin;
+
+        // The ARM token comes; each vault's does not.
+        let tokens = FixedTokens::new();
+        {
+            let mut answers = tokens.answers.lock().unwrap();
+            answers.push_back(Ok("arm".to_owned()));
+            for _ in 0..2 {
+                answers.push_back(Err(anyhow::Error::new(NoLogin("stack".to_owned()))));
+            }
+        }
+        let (_, transport, _) = fake_client([inventory_answer()]);
+        let client = Client::new(Box::new(tokens), Box::new(transport));
+        let azure = serial();
+        let mut out = Vec::new();
+        let failure =
+            secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
+        assert_eq!(failure.message, "not signed in — run `az login` (stack)");
+        assert_eq!(failure.code, FAILED);
+    }
+
+    #[test]
+    fn an_allowlist_that_reaches_nothing_is_named_not_listed_as_empty() {
+        let azure = Azure {
+            vaults: vec!["kv-typo".to_owned()],
+            registries: vec!["acrtypo".to_owned()],
+            ..serial()
+        };
+        let (client, _, _) = fake_client([inventory_answer(), inventory_answer()]);
+        let mut out = Vec::new();
+        let failure =
+            secrets(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
+        assert_eq!(failure.code, BAD_ARGUMENTS);
+        assert!(
+            failure
+                .message
+                .contains("none of [azure].vaults / --vault (kv-typo)"),
+            "{}",
+            failure.message
+        );
+        let failure =
+            repos(&mut out, &context(&client, &azure), None, &[], false, true).unwrap_err();
+        assert_eq!(failure.code, BAD_ARGUMENTS);
+        assert!(out.is_empty(), "and nothing was printed");
     }
 
     #[test]

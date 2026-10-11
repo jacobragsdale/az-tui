@@ -55,6 +55,8 @@ class Walk:
         # mid-walk. Every expectation after that fails at once rather than
         # spinning out its timeout.
         self.dead = False
+        # Every byte the binary wrote, for what pyte does not keep.
+        self.raw = bytearray()
 
     def pump(self, seconds):
         deadline = time.time() + seconds
@@ -74,6 +76,7 @@ class Walk:
             # end would leave it waiting.
             if b"\x1b[6n" in data:
                 os.write(self.fd, b"\x1b[1;1R")
+            self.raw += data
             self.stream.feed(data)
 
     def text(self):
@@ -195,6 +198,9 @@ def main():
         walk.send("x")
         ok &= walk.expect("Restart orders-worker-5c4d3e-q8zt in qa/dev?")
         ok &= walk.expect("Deployment orders-worker replaces it")
+        # A person reads the question first: the answer is a press of its
+        # own, not the tail of the first (a held or typed-ahead x is refused).
+        walk.pump(0.3)
         walk.send("x")
         ok &= walk.expect("Deleted orders-worker-5c4d3e-q8zt; Deployment orders-worker is putting a new one up")
         # Scale: the owner's count fills the box, Enter sends it.
@@ -204,9 +210,19 @@ def main():
         ok &= walk.expect("deployment/orders-worker scale sent")
         # b hands the terminal to kubectl exec; the fake shell exits at once
         # and the TUI repaints.
+        handed = len(walk.raw)
         walk.send("b")
         ok &= walk.expect("1 qa/dev", seconds=6)
         ok &= walk.expect("orders-worker-5c4d3e-q8zt", seconds=6)
+        # The shell got a cursor it could see: shown on the way out, before
+        # the TUI took the alternate screen back.
+        deadline = time.time() + 6
+        while b"\x1b[?1049h" not in walk.raw[handed:] and time.time() < deadline and not walk.dead:
+            walk.pump(0.1)
+        away = bytes(walk.raw[handed:]).split(b"\x1b[?1049h", 1)[0]
+        if b"\x1b[?25h" not in away:
+            print("--- the shell was handed a hidden cursor", file=sys.stderr)
+            ok = False
         # e on the pod: its events, narrowed to it; Enter goes back to it.
         walk.send("e")
         ok &= walk.expect("Events ▾")
@@ -285,6 +301,27 @@ def main():
             if absent in written:
                 print(f"--- {absent!r} reached the cache", file=sys.stderr)
                 ok = False
+    # doctor over the same fake: the Azure half fails without a login, which
+    # is not what this checks; every scope must answer.
+    import subprocess
+    said = subprocess.run([options.binary, "doctor"], env=env, capture_output=True, text=True, timeout=120).stdout
+    for scope in ("qa/dev", "qa/qa", "qa/uat", "prod/prod"):
+        line = next((l for l in said.splitlines() if l.startswith(scope + " ")), "")
+        if "ok (" not in line:
+            print(f"--- doctor: expected {scope} ok, got {line!r} in:\n{said}", file=sys.stderr)
+            ok = False
+    # The screen with nowhere to draw: a clear error, never a panic.
+    said = subprocess.run([options.binary], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    if said.returncode == 101 or "panicked" in said.stderr or "needs a terminal" not in said.stderr:
+        print(f"--- no terminal: exit {said.returncode}, {said.stderr.strip()[:200]}", file=sys.stderr)
+        ok = False
+    # The theme is the screen's: a typo in it must not stop a command that
+    # paints nothing.
+    said = subprocess.run([options.binary, "doctor"], env={**env, "AZ_TUI_THEME": "dracula"},
+                          capture_output=True, text=True, timeout=120)
+    if "resolving the theme" in said.stderr:
+        print(f"--- a bad AZ_TUI_THEME stopped doctor: {said.stderr.strip()}", file=sys.stderr)
+        ok = False
     print("ok" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

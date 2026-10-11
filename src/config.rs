@@ -246,7 +246,11 @@ impl Rgb {
     pub fn parse(raw: &str) -> Result<Self> {
         let digits = raw
             .strip_prefix('#')
-            .filter(|digits| digits.len() == 6)
+            // Six hex digits and nothing else: from_str_radix would also
+            // take a sign, reading `#+12345` as a colour.
+            .filter(|digits| {
+                digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
             .with_context(|| format!("expected #rrggbb, got {raw:?}"))?;
         let value = u32::from_str_radix(digits, 16)
             .with_context(|| format!("expected #rrggbb, got {raw:?}"))?;
@@ -309,6 +313,29 @@ pub fn parse(source: &str) -> Result<Config> {
         // is the shortest way to point at the mistake.
         anyhow::anyhow!("{error}")
     })?;
+    // An empty context is not a left-out one: `kubectl --context ""` reads
+    // whatever cluster is current, under this tab's name, with x, X and =
+    // live there. An empty namespace does the same with the default one.
+    for (number, cluster) in config.clusters.iter().enumerate() {
+        let name = cluster.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("[[clusters]] number {}: name is empty", number + 1);
+        }
+        if cluster
+            .context
+            .as_deref()
+            .is_some_and(|context| context.trim().is_empty())
+        {
+            anyhow::bail!("[[clusters]] {name}: context is empty; leave it out to use the name");
+        }
+        if cluster
+            .namespaces
+            .iter()
+            .any(|namespace| namespace.trim().is_empty())
+        {
+            anyhow::bail!("[[clusters]] {name}: a namespace is empty; each one is a tab");
+        }
+    }
     Ok(config)
 }
 
@@ -391,6 +418,32 @@ namespaces = "prod"
     }
 
     #[test]
+    fn a_blank_name_context_or_namespace_is_refused_rather_than_read_as_the_current_one() {
+        for (source, said) in [
+            (
+                "[[clusters]]\nname = \"lab\"\ncontext = \"\"\n",
+                "lab: context is empty",
+            ),
+            (
+                "[[clusters]]\nname = \"lab\"\ncontext = \" \"\n",
+                "lab: context is empty",
+            ),
+            ("[[clusters]]\nname = \"\"\n", "number 1: name is empty"),
+            (
+                "[[clusters]]\nname = \"lab\"\nnamespaces = [\"\", \"a\"]\n",
+                "lab: a namespace is empty",
+            ),
+        ] {
+            let error = parse(source).expect_err(source);
+            assert!(format!("{error:#}").contains(said), "{source:?}: {error:#}");
+        }
+        assert!(
+            parse("[[clusters]]\nname = \"lab\"\n").is_ok(),
+            "a left-out context is the name"
+        );
+    }
+
+    #[test]
     fn the_example_file_parses_to_four_aks_tabs() {
         let config = parse(include_str!("../config.example.toml")).unwrap();
         assert_eq!(config.tabs().len(), 4);
@@ -447,5 +500,7 @@ namespaces = "prod"
         assert!(Rgb::parse("bb9af7").is_err());
         assert!(Rgb::parse("#bb9").is_err());
         assert!(Rgb::parse("#gggggg").is_err());
+        assert!(Rgb::parse("#+12345").is_err(), "a sign is not a hex digit");
+        assert!(Rgb::parse("#-12345").is_err());
     }
 }

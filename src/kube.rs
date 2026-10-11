@@ -1226,7 +1226,13 @@ impl Cadence {
     pub fn polled(&mut self, now: Instant, failed: bool) {
         self.asked = false;
         if failed {
-            self.current = (self.current * 2).min(MAX_CADENCE).max(self.base);
+            // Saturating: a base too far off to double (`--refresh` near
+            // u64::MAX, which means never) would otherwise panic the worker.
+            self.current = self
+                .current
+                .saturating_mul(2)
+                .min(MAX_CADENCE)
+                .max(self.base);
         } else {
             self.current = self.base;
         }
@@ -3064,6 +3070,24 @@ pub(crate) mod tests {
             watcher.until_due(start + Duration::from_secs(7)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn a_cadence_too_far_off_to_double_backs_off_without_a_panic() {
+        let never = Duration::from_secs(u64::MAX);
+        let mut cadence = Cadence::new(never);
+        let now = Instant::now();
+        cadence.polled(now, true);
+        cadence.polled(now, true);
+        assert!(
+            !cadence.is_due(now + Duration::from_secs(3600)),
+            "still never"
+        );
+
+        let mut cadence = Cadence::new(Duration::from_secs(5));
+        cadence.polled(now, true);
+        assert!(!cadence.is_due(now + Duration::from_secs(9)));
+        assert!(cadence.is_due(now + Duration::from_secs(10)), "doubled");
     }
 
     #[test]

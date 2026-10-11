@@ -197,7 +197,7 @@ impl Theme {
     /// `terminal`.
     #[must_use]
     pub fn from_env() -> Self {
-        if std::env::var_os("NO_COLOR").is_some() {
+        if no_color() {
             return Self::mono();
         }
         match std::env::var("AZ_TUI_THEME").ok().as_deref().map(str::trim) {
@@ -300,6 +300,17 @@ pub fn set_theme(theme: Theme) {
 // Under test each thread paints with its own theme, so a test that switches
 // themes cannot change what a renderer test on another thread is comparing
 // against.
+/// Whether `NO_COLOR` asks for no colour: present *and not empty*, as
+/// no-color.org has it — `NO_COLOR=` asks for nothing.
+#[must_use]
+pub fn no_color() -> bool {
+    no_color_in(std::env::var_os("NO_COLOR").as_deref())
+}
+
+fn no_color_in(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|held| !held.is_empty())
+}
+
 #[cfg(test)]
 thread_local! {
     static THEME: std::cell::Cell<Theme> = std::cell::Cell::new(Theme::from_env());
@@ -318,6 +329,15 @@ pub fn set_theme(theme: Theme) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_no_color_asks_for_nothing() {
+        use std::ffi::OsStr;
+        assert!(!no_color_in(None));
+        assert!(!no_color_in(Some(OsStr::new(""))));
+        assert!(no_color_in(Some(OsStr::new("1"))));
+        assert!(no_color_in(Some(OsStr::new("0"))), "any non-empty value");
+    }
+
     use super::*;
     use crate::config;
 
